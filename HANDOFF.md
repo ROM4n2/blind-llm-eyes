@@ -1,7 +1,7 @@
 # 交接文档 — blind-llm-eyes 视觉代理
 
-> **最近更新**：2026-08-12（P1 配置化：concurrency_limit 可配置 + description_cap 降至 1000）
-> **状态**：核心功能完成，性能优化已完成三轮（MiMo thinking 关闭 + errgroup 并行 + singleflight 去重），P1 配置化任务已完成，可端到端使用
+> **最近更新**：2026-08-13（P2 自适应限流 AIMD 控制器完成并验证）
+> **状态**：核心功能完成，性能优化已完成四轮（MiMo thinking 关闭 + errgroup 并行 + singleflight 去重 + AIMD 自适应限流），P1 配置化 + P2 自适应限流均已完成，可端到端使用
 
 ---
 
@@ -52,25 +52,33 @@
 9. **设计文档** (commit `b092fb6`)
    - CONCURRENCY_DESIGN.md：errgroup + concurrency_limit + singleflight 设计
 
-10. **P1 配置化任务** (未提交)
+10. **P1 配置化任务** (commit `ac5b1f9`, `69e8639`)
     - `concurrency_limit` 从 handler.go 硬编码改为 config.yaml 读取（Config + HandlerDeps + main 全链路打通，NewHandler 兜底默认 4 保证向后兼容）
     - `description_cap` 默认值 2000 → 1000（thinking 已禁用，实测只生成 1000-1300 chars，旧注释「MiMo 是推理模型需要足够预算」已过时）
     - 新增测试 `TestHandler_ConcurrencyLimit_CustomValue`（limit=2 + 3 图 × 1s，验证配置真实生效，offsets `[14, 15, 1015]ms`）
     - `go test -race ./...` 全绿
 
+11. **P2 自适应限流 AIMD 控制器** (commit `f6f58dc`, `e60e098`)
+    - 新增 `proxy/adaptive.go`：基于 P90 反馈的 AIMD 控制器（加性增 +1 / 乘性减 ×0.75）
+    - 滚动窗口（sample_window=20）+ cooldown（3s）+ 滞回区（8s ≤ P90 ≤ 15s 不调整）
+    - 仅 singleflight executor（`shared=false`）上报样本，避免 N 等待者放大 1 次 MiMo 调用
+    - 3 个 Prometheus 指标：`current` / `adjustments_total{direction}` / `vision_p90_seconds`
+    - 5 个单元测试 + 1 个跨请求集成测试 + 2 个端到端验证脚本（test-adaptive-prod.py / test-adaptive.ps1）
+    - 生产配置三阶段验证全 PASS：Phase 1 (3s) limit 4→9 / Phase 2 (11s) 滞回稳住 10 / Phase 3 (16s) limit 10→1
+
 ### 当前状态
-- **P1 配置化代码已完成但未提交**（5 文件变更 + 1 新测试，工作区有改动）
-- **go test -race ./... 全绿**
+- **P1 配置化 + P2 自适应限流均已提交**（commit `f6f58dc`, `e60e098`）
+- **go test -race ./... 全绿**，`go build` / `go vet` 零警告
 - **服务可运行**：`.\blind-llm-eyes.exe` 启动后监听 127.0.0.1:8790
 - **端到端验证通过**：2 图请求 19.8s，MiMo 阶段 14.2s，DeepSeek 阶段 5.5s
-- **用户已手动把 config.yaml 的 `description_cap` 改为 1000**
+- **自适应限流生产验证通过**：mock MiMo 三阶段测试，AIMD 升降逻辑符合预期
 
 ### 下一步建议（按优先级）
 | 优先级 | 任务 | 说明 |
 |--------|------|------|
 | ✅ P1 | ~~`concurrency_limit` 配置化~~ | **已完成**：Config + HandlerDeps + main 全链路打通，NewHandler 兜底默认 4 |
 | ✅ P1 | ~~调小 `description_cap: 2000 → 1000`~~ | **已完成**：loader 默认值 + config.example.yaml 同步更新，用户 config.yaml 已改 |
-| P2 | 自适应限流 | 根据 MiMo 响应时间动态调整并发度 |
+| ✅ P2 | ~~自适应限流~~ | **已完成**：AIMD 控制器 + 5 单测 + 跨请求集成测试 + 端到端验证脚本，三阶段生产验证全 PASS |
 | P3 | 多 vision provider | 抽象为 provider 池，支持故障转移 |
 
 ---
@@ -104,6 +112,7 @@ Claude Code ──POST /v1/messages──▶ blind-llm-eyes (127.0.0.1:8790)
 | 重复请求去重 | singleflight (进程级) | 同 hash in-flight 调用合并为 1 次 |
 | 缓存写入时机 | singleflight fn 内部 | 避免等待者比执行者更早 return 导致下批 miss |
 | ctx 隔离 | fn 用 context.Background + 120s | 调用者取消不影响其他等待者 |
+| 自适应限流 | AIMD + P90 反馈 | 静态并发度无法应对 MiMo 延迟波动（8s~38s），动态调整防打爆 / 提吞吐 |
 
 ## 3. 代码结构
 
@@ -123,6 +132,7 @@ blind-llm-eyes/
 │   └── provider.go             # VisionProvider 接口
 ├── proxy/
 │   ├── handler.go              # 核心代理逻辑（errgroup + singleflight）
+│   ├── adaptive.go             # AIMD 自适应限流控制器
 │   └── passthrough.go          # 流式响应透传
 ├── cache/
 │   ├── lru.go                  # LRU 缓存
@@ -161,6 +171,16 @@ blind-llm-eyes/
 | 单请求 5 张相同图 | 4 次调用 | **1 次** |
 | 10 个并发请求带同一张图 | 10 次调用 | **1 次** |
 
+### 第四轮：AIMD 自适应限流 (commit `f6f58dc`)
+
+| 场景 | 静态 limit=4 | 自适应 [1, 16] |
+|------|------|------|
+| MiMo 快 (P90=3s) | 限并发，浪费吞吐 | **limit 自动升到 9**（+5） |
+| MiMo 正常 (P90=11s) | 可能打爆 | **滞回区稳住 10**（不降） |
+| MiMo 慢 (P90=16s) | 4 路并发全堆 MiMo | **limit 自动降到 1**（×0.75^5） |
+
+控制器：`proxy/adaptive.go`，基于 singleflight executor 的 `fn_exec_ms` 滚动窗口 P90，AIMD 决策（加性增 +1 / 乘性减 ×0.75），滞回区防抖动，cooldown 3s 防震荡。
+
 ### 日志可观测性
 
 三层日志体系（全部通过 `request_id` 关联）：
@@ -189,6 +209,17 @@ cache:
 concurrency_limit: 4
 fail_open: true
 log_level: "debug"
+adaptive_concurrency:
+  enabled: true                # 默认 false，开启后根据 MiMo 延迟动态调整 concurrency_limit
+  min_limit: 1
+  max_limit: 16
+  fast_threshold_ms: 8000      # P90 < 8s → 加性增 +1
+  slow_threshold_ms: 15000     # P90 > 15s → 乘性减 ×0.75
+  sample_window: 20             # 滚动窗口样本数
+  cooldown_ms: 3000             # 两次调整最小间隔
+  increase_step: 1
+  decrease_ratio: 0.75
+  error_threshold: 0.10        # 错误率 > 10% → 触发降并发
 ```
 
 ## 6. 使用方式
@@ -220,33 +251,35 @@ go test -race -v -run TestHandler_ ./proxy/
 
 测试覆盖：
 - `proxy/handler_test.go` — 基础代理逻辑
-- `proxy/handler_concurrency_test.go` — errgroup 并行（5 图 × 2s mock，验证 4+1 批次）+ concurrency_limit 配置化（limit=2 + 3 图 × 1s，验证配置真实生效）
+- `proxy/handler_concurrency_test.go` — errgroup 并行（5 图 × 2s mock，验证 4+1 批次）+ concurrency_limit 配置化 + 自适应限流跨请求集成测试
 - `proxy/handler_singleflight_test.go` — singleflight 去重（stampede / cross-request / ctx 隔离）
+- `proxy/adaptive_test.go` — AIMD 控制器单元测试（increase / decrease / error-trigger / hysteresis / disabled-is-static）
 - `vision/client_test.go` — MiMo Anthropic API 调用
 - `messages/*_test.go` — 请求解析/改写/校验
 - `cache/lru_test.go` — LRU 缓存
 - `logging/logging_test.go` — 异步日志
 - `metrics/metrics_test.go` — Prometheus 指标
+- `test-adaptive-prod.py` / `test-adaptive.ps1` — 自适应限流端到端验证脚本（mock MiMo + 三阶段 AIMD 验证）
 
 ## 8. 最近 6 个 commit
 
 ```
-b092fb6 docs: add concurrency design doc for errgroup optimization
-9ec798c feat(observability): add singleflight wait/exec duration breakdown logs
-4cdae70 feat(proxy): add singleflight to dedup in-flight vision calls
-b25ec2a test(proxy): add concurrency test for parallel image processing
-c130070 feat(observability): add per-goroutine and errgroup-level logs
-9bfe130 perf(proxy): parallelize image processing with errgroup
+e60e098 test: add adaptive concurrency end-to-end validation scripts
+f6f58dc feat(proxy): implement adaptive concurrency limiter with AIMD control
+1990954 feat(proxy): add adaptive concurrency limiter based on MiMo latency
+6ac49ae docs: update git commit message convention and add concurrency task plan
+69e8639 docs: mark p1 config tasks as completed in handoff
+ac5b1f9 feat(config): externalize hard-coded vision tuning parameters
 ```
 
 ## 9. 已知限制 & 后续方向
 
 | 优先级 | 方向 | 说明 |
 |--------|------|------|
-| ✅ 完成 | ~~`concurrency_limit` 配置化~~ | 已从 config.yaml 读取，NewHandler 兜底默认 4（commit 待提交） |
-| ✅ 完成 | ~~调小 `description_cap`~~ | 默认值已降至 1000，config.example.yaml 同步更新，用户 config.yaml 已改 |
-| P2 | 自适应限流 | 根据 MiMo 响应时间动态调整并发度 |
-| P2 | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
+| ✅ 完成 | ~~`concurrency_limit` 配置化~~ | 已从 config.yaml 读取，NewHandler 兜底默认 4 |
+| ✅ 完成 | ~~调小 `description_cap`~~ | 默认值已降至 1000，config.example.yaml 同步更新 |
+| ✅ 完成 | ~~P2 自适应限流~~ | AIMD 控制器 + 5 单测 + 跨请求集成测试 + 端到端验证脚本，三阶段生产验证全 PASS |
+| — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P3 | 多 vision provider 支持 | 当前硬编码 MiMo，可抽象为 provider 池 |
 
 ## 10. 环境事实
