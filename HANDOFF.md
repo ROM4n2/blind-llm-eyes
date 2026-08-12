@@ -1,7 +1,7 @@
 # 交接文档 — blind-llm-eyes 视觉代理
 
-> **最近更新**：2026-08-13（P2 自适应限流 AIMD 控制器完成并验证）
-> **状态**：核心功能完成，性能优化已完成四轮（MiMo thinking 关闭 + errgroup 并行 + singleflight 去重 + AIMD 自适应限流），P1 配置化 + P2 自适应限流均已完成，可端到端使用
+> **最近更新**：2026-08-13（生产冒烟测试 + 配置调优 + 已推送远程）
+> **状态**：核心功能完成，性能优化已完成四轮（MiMo thinking 关闭 + errgroup 并行 + singleflight 去重 + AIMD 自适应限流），P1 配置化 + P2 自适应限流均已完成并通过生产冒烟测试，配置已基于实测数据调优，已推送到 origin/master
 
 ---
 
@@ -66,19 +66,37 @@
     - 5 个单元测试 + 1 个跨请求集成测试 + 2 个端到端验证脚本（test-adaptive-prod.py / test-adaptive.ps1）
     - 生产配置三阶段验证全 PASS：Phase 1 (3s) limit 4→9 / Phase 2 (11s) 滞回稳住 10 / Phase 3 (16s) limit 10→1
 
+12. **生产冒烟测试** (commit `b651276`)
+    - 20 次真实 MiMo vision 调用，成功率 100%，零错误
+    - P90 = 11837ms (11.8s)，落在滞回区 [8s, 15s]
+    - AIMD 首次评估决策正确：`no change (hysteresis band)`，limit 保持 4
+    - MiMo 延迟范围 4.25s – 20.60s（波动 4.8 倍），DeepSeek 仅占 16.5%
+    - 完整测试报告见 `SMOKE_TEST_REPORT.md`
+
+13. **配置参数调优** (commit `ccd5249`)
+    - 基于冒烟测试 20 样本数据调整默认参数：
+      - `concurrency_limit`: 4 → 6（MiMo 均值 7.7s < fast_threshold 8s，有升并发空间）
+      - `max_limit`: 16 → 12（MiMo 最差 20.6s，12 路已足够避免压垮）
+      - `sample_window`: 20 → 10（评估周期 4min → 2min，响应更快）
+      - `cooldown_ms`: 3000 → 2000（适应 MiMo 4-20s 高波动）
+    - 同步更新 config.example.yaml / config/loader.go / proxy/adaptive.go 兜底默认值
+    - `go build` / `go vet` / `go test -race ./proxy/` 全绿
+
 ### 当前状态
-- **P1 配置化 + P2 自适应限流均已提交**（commit `f6f58dc`, `e60e098`）
+- **P1 配置化 + P2 自适应限流 + 冒烟测试 + 配置调优均已完成并推送**（origin/master 同步）
 - **go test -race ./... 全绿**，`go build` / `go vet` 零警告
 - **服务可运行**：`.\blind-llm-eyes.exe` 启动后监听 127.0.0.1:8790
 - **端到端验证通过**：2 图请求 19.8s，MiMo 阶段 14.2s，DeepSeek 阶段 5.5s
-- **自适应限流生产验证通过**：mock MiMo 三阶段测试，AIMD 升降逻辑符合预期
+- **自适应限流双重验证通过**：mock MiMo 三阶段 + 真实 MiMo 20 样本冒烟
+- **配置已调优**：基于 20 样本实测数据，参数已从保守值调整为最优值
 
 ### 下一步建议（按优先级）
 | 优先级 | 任务 | 说明 |
 |--------|------|------|
-| ✅ P1 | ~~`concurrency_limit` 配置化~~ | **已完成**：Config + HandlerDeps + main 全链路打通，NewHandler 兜底默认 4 |
-| ✅ P1 | ~~调小 `description_cap: 2000 → 1000`~~ | **已完成**：loader 默认值 + config.example.yaml 同步更新，用户 config.yaml 已改 |
-| ✅ P2 | ~~自适应限流~~ | **已完成**：AIMD 控制器 + 5 单测 + 跨请求集成测试 + 端到端验证脚本，三阶段生产验证全 PASS |
+| ✅ P1 | ~~`concurrency_limit` 配置化~~ | **已完成**：Config + HandlerDeps + main 全链路打通 |
+| ✅ P1 | ~~调小 `description_cap: 2000 → 1000`~~ | **已完成**：loader 默认值 + config.example.yaml 同步更新 |
+| ✅ P2 | ~~自适应限流~~ | **已完成**：AIMD + 单测 + 集成测试 + 端到端验证 + 冒烟测试 + 配置调优 |
+| ✅ | ~~git push~~ | **已完成**：5 个提交已推送到 origin/master |
 | P3 | 多 vision provider | 抽象为 provider 池，支持故障转移 |
 
 ---
@@ -98,7 +116,7 @@ Claude Code ──POST /v1/messages──▶ blind-llm-eyes (127.0.0.1:8790)
                                     │   └─ miss → singleflight.Do(hash)
                                     │              ├─ 首个调用者 → MiMo vision API → 写缓存
                                     │              └─ 等待者 → 共享结果
-                                    ├─ errgroup 并行处理多图 (concurrency_limit=4)
+                                    ├─ errgroup 并行处理多图 (concurrency_limit=6, adaptive [1,12])
                                     ├─ 替换 image block → text block
                                     └─ 转发给 DeepSeek (anthropic 端点) ──▶ 流式响应透传
 ```
@@ -260,27 +278,29 @@ go test -race -v -run TestHandler_ ./proxy/
 - `logging/logging_test.go` — 异步日志
 - `metrics/metrics_test.go` — Prometheus 指标
 - `test-adaptive-prod.py` / `test-adaptive.ps1` — 自适应限流端到端验证脚本（mock MiMo + 三阶段 AIMD 验证）
+- `smoke-fill-samples.py` — 生产冒烟测试脚本（9 请求 × 2 唯一图 = 18 样本填窗口）
+- `SMOKE_TEST_REPORT.md` — 生产冒烟测试报告（20 样本完整延迟数据 + AIMD 决策日志）
 
 ## 8. 最近 6 个 commit
 
 ```
+ccd5249 chore(config): tune adaptive parameters based on smoke test data
+b651276 docs: add adaptive concurrency smoke test report
+fb9d585 docs: update handoff with P2 adaptive concurrency completion
 e60e098 test: add adaptive concurrency end-to-end validation scripts
 f6f58dc feat(proxy): implement adaptive concurrency limiter with AIMD control
 1990954 feat(proxy): add adaptive concurrency limiter based on MiMo latency
-6ac49ae docs: update git commit message convention and add concurrency task plan
-69e8639 docs: mark p1 config tasks as completed in handoff
-ac5b1f9 feat(config): externalize hard-coded vision tuning parameters
 ```
 
 ## 9. 已知限制 & 后续方向
 
 | 优先级 | 方向 | 说明 |
 |--------|------|------|
-| ✅ 完成 | ~~`concurrency_limit` 配置化~~ | 已从 config.yaml 读取，NewHandler 兜底默认 4 |
+| ✅ 完成 | ~~`concurrency_limit` 配置化~~ | 已从 config.yaml 读取，兜底默认 6 |
 | ✅ 完成 | ~~调小 `description_cap`~~ | 默认值已降至 1000，config.example.yaml 同步更新 |
-| ✅ 完成 | ~~P2 自适应限流~~ | AIMD 控制器 + 5 单测 + 跨请求集成测试 + 端到端验证脚本，三阶段生产验证全 PASS |
+| ✅ 完成 | ~~P2 自适应限流~~ | AIMD 控制器 + 5 单测 + 跨请求集成测试 + 端到端验证 + 冒烟测试 + 配置调优，均已推送 |
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
-| P3 | 多 vision provider 支持 | 当前硬编码 MiMo，可抽象为 provider 池 |
+| P3 | 多 vision provider 支持 | 当前硬编码 MiMo，可抽象为 provider 池。`VisionProvider` 接口已就绪，P3 主要是加池层 + 多 provider config + 健康检查/熔断 |
 
 ## 10. 环境事实
 
