@@ -10,6 +10,21 @@ vision:
   description_cap: 1000                            # max_tokens；thinking 已禁用，实测生成 1000-1300 chars，1000 足够
 cache:
   max_entries: 500                                  # 纯内存 LRU 容量
-concurrency_limit: 4                                # 单请求内并发 vision 调用上限（errgroup.SetLimit），覆盖典型 2-4 图场景
+concurrency_limit: 4                                # 单请求内并发 vision 调用上限（errgroup.SetLimit），覆盖典型 2-4 图场景；也作为 adaptive 的初始值
+# 自适应并发控制（默认关闭）。开启后会根据 MiMo 实际响应时间在 [min_limit, max_limit]
+# 区间内动态调整 concurrency_limit。关闭时完全使用上面的静态 concurrency_limit 值。
+# 算法：AIMD 风格 — P90 延迟低于 fast_threshold 时 +increase_step；高于 slow_threshold
+# 或错误率 > error_threshold 时 ×decrease_ratio；中间滞回区不调整。
+adaptive_concurrency:
+  enabled: false                      # 生产验证后再改为 true
+  min_limit: 1                        # 降并发地板（至少 1 路）
+  max_limit: 16                       # 升并发天花板（4× 默认值）
+  fast_threshold_ms: 8000             # P90 < 8s → 认为有升并发空间
+  slow_threshold_ms: 15000            # P90 > 15s → 认为过载，降并发
+  sample_window: 20                   # 滚动窗口样本数（~20 次 vision 调用评一次）
+  cooldown_ms: 3000                   # 两次调整之间的最小间隔（防抖动）
+  increase_step: 1                    # 每次升并发 +N
+  decrease_ratio: 0.75                # 每次降并发 ×ratio（0.75 = 降 25%）
+  error_threshold: 0.10               # 错误率 > 10% → 触发降并发
 fail_open: true                                     # 视觉失败 → 替换为占位文字，不阻塞主链路
 log_level: "info"                                   # debug / info / warn / error

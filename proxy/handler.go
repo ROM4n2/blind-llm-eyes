@@ -34,6 +34,7 @@ type HandlerDeps struct {
 	FailOpen            bool
 	LargeImageThreshold int64
 	ConcurrencyLimit    int // 单请求并发 vision 上限，<=0 时 NewHandler 兜底为 4
+	AdaptiveConcurrency *AdaptiveConcurrency // 自适应限流控制器；nil 等价于 static 行为
 	Log                 *slog.Logger
 	WG                  *sync.WaitGroup
 	Metrics             *metrics.Metrics // 可选：Prometheus 指标
@@ -46,6 +47,14 @@ func NewHandler(deps HandlerDeps) http.Handler {
 	}
 	if deps.ConcurrencyLimit <= 0 {
 		deps.ConcurrencyLimit = 4
+	}
+	if deps.AdaptiveConcurrency == nil {
+		deps.AdaptiveConcurrency = NewAdaptiveConcurrency(AdaptiveConcurrencyCfg{
+			Enabled:      false,
+			InitialLimit: deps.ConcurrencyLimit,
+			MinLimit:     deps.ConcurrencyLimit,
+			MaxLimit:     deps.ConcurrencyLimit,
+		}, deps.Metrics, deps.Log)
 	}
 	mux := http.NewServeMux()
 	h := &requestHandler{deps: deps}
@@ -156,14 +165,16 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		// 用 errgroup 并发执行。singleflight fn 内部用独立 ctx，不依赖 gctx，
 		// 所以用普通 errgroup.Group 即可（无需 WithContext 的 cancel 语义）。
 		g := new(errgroup.Group)
-		g.SetLimit(h.deps.ConcurrencyLimit) // 限制并发，避免一次请求里大量图片打爆 MiMo
+		effectiveLimit := h.deps.AdaptiveConcurrency.CurrentLimit()
+		g.SetLimit(effectiveLimit) // 限制并发，避免一次请求里大量图片打爆 MiMo
 
 		parallelStart := time.Now()
 		log.Info("parallel image processing started",
 			"stage", "parallel_images_start",
 			"status", "info",
 			"image_count", len(imgs),
-			"concurrency_limit", h.deps.ConcurrencyLimit,
+			"concurrency_limit", h.deps.ConcurrencyLimit, // 静态配置值（参考）
+			"effective_limit", effectiveLimit,            // 实际生效值（自适应）
 			"total_image_bytes", totalImageBytes,
 		)
 
@@ -274,6 +285,13 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 					"fn_exec_ms", fnExecMs,
 					"sf_wait_ms", sfWaitMs,
 				)
+
+				// 只让 singleflight executor（非等待者）上报 fn_exec_ms 样本，
+				// 避免 1 次真实 vision 调用被 N 个等待者重复放大
+				if !shared {
+					isVisionErr := verr != nil
+					h.deps.AdaptiveConcurrency.RecordSample(fnExecMs, isVisionErr)
+				}
 
 				if verr != nil {
 					if !h.deps.FailOpen {

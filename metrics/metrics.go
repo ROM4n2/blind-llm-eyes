@@ -25,6 +25,11 @@ type Metrics struct {
 	// 上游转发指标
 	UpstreamRequestsTotal   *prometheus.CounterVec
 	UpstreamRequestDuration *prometheus.HistogramVec
+
+	// 自适应限流指标
+	AdaptiveConcurrencyCurrent     prometheus.Gauge
+	AdaptiveConcurrencyAdjustments *prometheus.CounterVec
+	AdaptiveVisionP90Seconds       prometheus.Gauge
 }
 
 // NewMetrics 创建并注册所有指标。
@@ -98,6 +103,28 @@ func NewMetrics() *Metrics {
 				Buckets: prometheus.DefBuckets,
 			},
 			[]string{"status"},
+		),
+
+		AdaptiveConcurrencyCurrent: promauto.With(reg).NewGauge(
+			prometheus.GaugeOpts{
+				Name: "blind_llm_eyes_adaptive_concurrency_current",
+				Help: "Current effective concurrency limit. Equals static value when adaptive disabled.",
+			},
+		),
+
+		AdaptiveConcurrencyAdjustments: promauto.With(reg).NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "blind_llm_eyes_adaptive_concurrency_adjustments_total",
+				Help: "Total adaptive concurrency adjustments, labeled by direction.",
+			},
+			[]string{"direction"},
+		),
+
+		AdaptiveVisionP90Seconds: promauto.With(reg).NewGauge(
+			prometheus.GaugeOpts{
+				Name: "blind_llm_eyes_adaptive_vision_p90_seconds",
+				Help: "P90 vision latency (seconds) from the most recent evaluation window.",
+			},
 		),
 	}
 

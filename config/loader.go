@@ -9,13 +9,27 @@ import (
 )
 
 type Config struct {
-	Listen            string      `yaml:"listen"`
-	Upstream          UpstreamCfg `yaml:"upstream"`
-	Vision            VisionCfg   `yaml:"vision"`
-	Cache             CacheCfg    `yaml:"cache"`
-	FailOpen          bool        `yaml:"fail_open"`
-	LogLevel          string      `yaml:"log_level"` // debug|info|warn|error
-	ConcurrencyLimit  int         `yaml:"concurrency_limit"` // 单请求内并发 vision 调用上限
+	Listen              string                 `yaml:"listen"`
+	Upstream            UpstreamCfg            `yaml:"upstream"`
+	Vision              VisionCfg              `yaml:"vision"`
+	Cache               CacheCfg               `yaml:"cache"`
+	FailOpen            bool                   `yaml:"fail_open"`
+	LogLevel            string                 `yaml:"log_level"` // debug|info|warn|error
+	ConcurrencyLimit    int                    `yaml:"concurrency_limit"` // 单请求内并发 vision 调用上限
+	AdaptiveConcurrency AdaptiveConcurrencyCfg `yaml:"adaptive_concurrency"`
+}
+
+type AdaptiveConcurrencyCfg struct {
+	Enabled          bool    `yaml:"enabled"`
+	MinLimit         int     `yaml:"min_limit"`
+	MaxLimit         int     `yaml:"max_limit"`
+	FastThresholdMs  int     `yaml:"fast_threshold_ms"`
+	SlowThresholdMs  int     `yaml:"slow_threshold_ms"`
+	SampleWindow     int     `yaml:"sample_window"`
+	CooldownMs       int     `yaml:"cooldown_ms"`
+	IncreaseStep     int     `yaml:"increase_step"`
+	DecreaseRatio    float64 `yaml:"decrease_ratio"` // 0.0~1.0，乘以 limit
+	ErrorThreshold   float64 `yaml:"error_threshold"`  // 0.0~1.0
 }
 
 type UpstreamCfg struct {
@@ -101,6 +115,45 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("BLIND_UPSTREAM_API_KEY"); v != "" {
 		c.Upstream.APIKey = v
 	}
+
+	// ── adaptive_concurrency 默认值（即使用户只写 enabled: true 也能跑） ──
+	if c.AdaptiveConcurrency.MinLimit <= 0 {
+		c.AdaptiveConcurrency.MinLimit = 1
+	}
+	if c.AdaptiveConcurrency.MaxLimit <= 0 {
+		c.AdaptiveConcurrency.MaxLimit = 16
+	}
+	if c.AdaptiveConcurrency.FastThresholdMs <= 0 {
+		c.AdaptiveConcurrency.FastThresholdMs = 8000
+	}
+	if c.AdaptiveConcurrency.SlowThresholdMs <= 0 {
+		c.AdaptiveConcurrency.SlowThresholdMs = 15000
+	}
+	if c.AdaptiveConcurrency.SampleWindow <= 0 {
+		c.AdaptiveConcurrency.SampleWindow = 20
+	}
+	if c.AdaptiveConcurrency.CooldownMs <= 0 {
+		c.AdaptiveConcurrency.CooldownMs = 3000
+	}
+	if c.AdaptiveConcurrency.IncreaseStep <= 0 {
+		c.AdaptiveConcurrency.IncreaseStep = 1
+	}
+	if c.AdaptiveConcurrency.DecreaseRatio <= 0 || c.AdaptiveConcurrency.DecreaseRatio >= 1 {
+		c.AdaptiveConcurrency.DecreaseRatio = 0.75
+	}
+	if c.AdaptiveConcurrency.ErrorThreshold <= 0 || c.AdaptiveConcurrency.ErrorThreshold >= 1 {
+		c.AdaptiveConcurrency.ErrorThreshold = 0.10
+	}
+	// 参数合理性校验（防止用户配错）
+	if c.AdaptiveConcurrency.MinLimit > c.AdaptiveConcurrency.MaxLimit {
+		return nil, fmt.Errorf("adaptive_concurrency: min_limit(%d) > max_limit(%d)",
+			c.AdaptiveConcurrency.MinLimit, c.AdaptiveConcurrency.MaxLimit)
+	}
+	if c.AdaptiveConcurrency.FastThresholdMs >= c.AdaptiveConcurrency.SlowThresholdMs {
+		return nil, fmt.Errorf("adaptive_concurrency: fast_threshold_ms(%d) must be < slow_threshold_ms(%d)",
+			c.AdaptiveConcurrency.FastThresholdMs, c.AdaptiveConcurrency.SlowThresholdMs)
+	}
+
 	if c.Upstream.BaseURL == "" || c.Vision.BaseURL == "" {
 		return nil, fmt.Errorf("upstream.base_url and vision.base_url are required")
 	}

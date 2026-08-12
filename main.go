@@ -47,6 +47,10 @@ func main() {
 		"fail_open", cfg.FailOpen,
 		"cache_max", cfg.Cache.MaxEntries,
 		"concurrency_limit", cfg.ConcurrencyLimit,
+		"adaptive_enabled", cfg.AdaptiveConcurrency.Enabled,
+		"adaptive_range", fmt.Sprintf("[%d, %d]", cfg.AdaptiveConcurrency.MinLimit, cfg.AdaptiveConcurrency.MaxLimit),
+		"adaptive_threshold_ms", fmt.Sprintf("fast=%d slow=%d",
+			cfg.AdaptiveConcurrency.FastThresholdMs, cfg.AdaptiveConcurrency.SlowThresholdMs),
 	)
 
 	// 初始化 Prometheus Metrics
@@ -57,6 +61,22 @@ func main() {
 
 	// WaitGroup for graceful shutdown
 	var wg sync.WaitGroup
+
+	// 构造自适应并发控制器
+	acCfg := proxy.AdaptiveConcurrencyCfg{
+		Enabled:         cfg.AdaptiveConcurrency.Enabled,
+		MinLimit:        cfg.AdaptiveConcurrency.MinLimit,
+		MaxLimit:        cfg.AdaptiveConcurrency.MaxLimit,
+		InitialLimit:    cfg.ConcurrencyLimit,
+		FastThresholdMs: cfg.AdaptiveConcurrency.FastThresholdMs,
+		SlowThresholdMs: cfg.AdaptiveConcurrency.SlowThresholdMs,
+		SampleWindow:    cfg.AdaptiveConcurrency.SampleWindow,
+		CooldownMs:      cfg.AdaptiveConcurrency.CooldownMs,
+		IncreaseStep:    cfg.AdaptiveConcurrency.IncreaseStep,
+		DecreaseRatio:   cfg.AdaptiveConcurrency.DecreaseRatio,
+		ErrorThreshold:  cfg.AdaptiveConcurrency.ErrorThreshold,
+	}
+	ac := proxy.NewAdaptiveConcurrency(acCfg, m, logger)
 
 	deps := proxy.HandlerDeps{
 		UpstreamBaseURL: strings.TrimRight(cfg.Upstream.BaseURL, "/"),
@@ -76,6 +96,7 @@ func main() {
 		FailOpen:            cfg.FailOpen,
 		LargeImageThreshold: cfg.Vision.LargeImageThreshold,
 		ConcurrencyLimit:    cfg.ConcurrencyLimit,
+		AdaptiveConcurrency: ac,
 		Log:                 logger,
 		WG:                  &wg,
 		Metrics:             m,
