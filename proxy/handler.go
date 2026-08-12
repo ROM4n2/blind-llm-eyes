@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ROM4n2/blind-llm-eyes/cache"
+	"github.com/ROM4n2/blind-llm-eyes/logging"
 	"github.com/ROM4n2/blind-llm-eyes/messages"
 	"github.com/ROM4n2/blind-llm-eyes/metrics"
 	"github.com/ROM4n2/blind-llm-eyes/vision"
@@ -62,7 +63,8 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	}
 
 	requestStart := time.Now()
-	log := h.deps.Log
+	requestID := logging.NewRequestID()
+	log := h.deps.Log.With("node_name", "proxy", "request_id", requestID)
 	route := "/v1/messages"
 
 	// 用于记录最终状态码的闭包
@@ -186,7 +188,8 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			)
 
 			vStart := time.Now()
-			desc, verr := h.deps.VisionProvider.DescribeImage(r.Context(), blk.Source.Data, blk.Source.MediaType, imageSize)
+			visionCtx := logging.WithRequestID(r.Context(), requestID)
+			desc, verr := h.deps.VisionProvider.DescribeImage(visionCtx, blk.Source.Data, blk.Source.MediaType, imageSize)
 			visionElapsed := time.Since(vStart)
 
 			if verr != nil {
@@ -276,20 +279,29 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		)
 	}
 
-	// 6) 转发给上游
+	// 6) 转发给上游 (DeepSeek)
 	upstreamURL := h.deps.UpstreamBaseURL + "/v1/messages"
-	log.Debug("forwarding request to upstream",
+
+	// ── stage: upstream_request_start ──
+	log.Info("forwarding request to upstream",
+		"stage", "upstream_request_start",
+		"status", "info",
 		"url", upstreamURL,
 		"body_bytes", len(rawBody),
 		"rewritten", rewritten.Load(),
 		"cached", cached.Load(),
+		"failed", failed.Load(),
 	)
 
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
 	if err != nil {
 		log.Error("build upstream request failed",
-			"err", err,
+			"stage", "upstream_request_start",
+			"status", "error",
+			"error_code", "upstream_req_build_failed",
+			"error_message", err.Error(),
 			"url", upstreamURL,
+			"stack", logging.StackTrace(500),
 		)
 		statusCode = http.StatusInternalServerError
 		http.Error(w, "build upstream req: "+err.Error(), http.StatusInternalServerError)
@@ -313,14 +325,20 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 
 	upstreamStart := time.Now()
 	upstreamResp, err := http.DefaultClient.Do(upstreamReq)
+	upstreamElapsed := time.Since(upstreamStart)
+	upstreamMs := upstreamElapsed.Milliseconds()
 	if err != nil {
 		log.Error("upstream request failed",
-			"err", err,
+			"stage", "upstream_error",
+			"status", "error",
+			"error_code", "upstream_request_failed",
+			"error_message", err.Error(),
 			"url", upstreamURL,
-			"upstream_elapsed", time.Since(upstreamStart).String(),
+			"duration_ms", upstreamMs,
+			"stack", logging.StackTrace(500),
 		)
 		statusCode = http.StatusBadGateway
-		h.recordUpstreamMetric(strconv.Itoa(statusCode), time.Since(upstreamStart))
+		h.recordUpstreamMetric(strconv.Itoa(statusCode), upstreamElapsed)
 		http.Error(w, "upstream do: "+err.Error(), http.StatusBadGateway)
 		h.recordRequestMetrics(r.Method, route, statusCode, requestStart)
 		return
@@ -328,14 +346,16 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	defer upstreamResp.Body.Close()
 
 	statusCode = upstreamResp.StatusCode
-	h.recordUpstreamMetric(strconv.Itoa(statusCode), time.Since(upstreamStart))
+	h.recordUpstreamMetric(strconv.Itoa(statusCode), upstreamElapsed)
 
+	// ── stage: upstream_response_received ──
+	respContentLength := upstreamResp.ContentLength
 	log.Info("upstream response received",
-		"status_code", upstreamResp.StatusCode,
-		"upstream_elapsed", time.Since(upstreamStart).String(),
-		"total_elapsed", time.Since(requestStart).String(),
-		"rewritten", rewritten.Load(),
-		"cached", cached.Load(),
+		"stage", "upstream_response_received",
+		"status", "ok",
+		"http_status_code", upstreamResp.StatusCode,
+		"response_content_length", respContentLength,
+		"duration_ms", upstreamMs,
 	)
 
 	// 7) 加改写结果头
@@ -343,10 +363,31 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		formatCountHeader(rewritten.Load(), cached.Load()))
 
 	// 8) SSE 原样透传
+	streamStart := time.Now()
 	if err := CopyResponse(w, upstreamResp); err != nil {
+		streamMs := time.Since(streamStart).Milliseconds()
 		log.Error("copy response to client failed",
-			"err", err,
-			"total_elapsed", time.Since(requestStart).String(),
+			"stage", "upstream_error",
+			"status", "error",
+			"error_code", "stream_copy_failed",
+			"error_message", err.Error(),
+			"stream_duration_ms", streamMs,
+			"total_duration_ms", time.Since(requestStart).Milliseconds(),
+		)
+	} else {
+		streamMs := time.Since(streamStart).Milliseconds()
+		totalMs := time.Since(requestStart).Milliseconds()
+		// ── stage: upstream_complete ──
+		log.Info("upstream response streamed to client",
+			"stage", "upstream_complete",
+			"status", "ok",
+			"http_status_code", statusCode,
+			"stream_duration_ms", streamMs,
+			"upstream_duration_ms", upstreamMs,
+			"total_duration_ms", totalMs,
+			"rewritten", rewritten.Load(),
+			"cached", cached.Load(),
+			"failed", failed.Load(),
 		)
 	}
 

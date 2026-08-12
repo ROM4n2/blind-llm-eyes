@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/ROM4n2/blind-llm-eyes/cache"
 	"github.com/ROM4n2/blind-llm-eyes/config"
+	"github.com/ROM4n2/blind-llm-eyes/logging"
 	"github.com/ROM4n2/blind-llm-eyes/metrics"
 	"github.com/ROM4n2/blind-llm-eyes/proxy"
 	"github.com/ROM4n2/blind-llm-eyes/vision"
@@ -31,7 +31,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger := buildLogger(cfg.LogLevel)
+	// 使用 JSON 结构化异步日志
+	logger, logWriter := logging.NewLogger(cfg.LogLevel)
+	defer logWriter.Close()
+
 	logger.Info("blind-llm-eyes starting",
 		"listen", cfg.Listen,
 		"upstream", cfg.Upstream.BaseURL,
@@ -55,8 +58,8 @@ func main() {
 	var wg sync.WaitGroup
 
 	deps := proxy.HandlerDeps{
-		UpstreamBaseURL:     strings.TrimRight(cfg.Upstream.BaseURL, "/"),
-		UpstreamAPIKey:      cfg.Upstream.APIKey,
+		UpstreamBaseURL: strings.TrimRight(cfg.Upstream.BaseURL, "/"),
+		UpstreamAPIKey:  cfg.Upstream.APIKey,
 		VisionProvider: vision.NewClient(
 			strings.TrimRight(cfg.Vision.BaseURL, "/"),
 			cfg.Vision.APIKey,
@@ -108,6 +111,7 @@ func main() {
 	select {
 	case err := <-errCh:
 		logger.Error("server failed", "err", err)
+		logWriter.Close()
 		os.Exit(1)
 	case sig := <-sigCh:
 		logger.Info("shutting down gracefully",
@@ -126,20 +130,8 @@ func main() {
 		logger.Info("waiting for in-flight requests to complete...")
 		wg.Wait()
 		logger.Info("all in-flight requests completed, shutting down")
-	}
-}
 
-func buildLogger(level string) *slog.Logger {
-	var lvl slog.Level
-	switch strings.ToLower(level) {
-	case "debug":
-		lvl = slog.LevelDebug
-	case "warn":
-		lvl = slog.LevelWarn
-	case "error":
-		lvl = slog.LevelError
-	default:
-		lvl = slog.LevelInfo
+		// 3) 刷新日志缓冲
+		logWriter.Close()
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
 }
