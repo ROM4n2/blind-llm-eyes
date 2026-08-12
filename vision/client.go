@@ -3,6 +3,7 @@ package vision
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptrace"
 	"time"
 
 	_ "image/gif"
@@ -155,7 +157,10 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 		"temperature": 0.0,
 	}
 
+	// ── stage: request_build (marshal) ──
+	marshalStart := time.Now()
 	bodyBytes, err := json.Marshal(reqBody)
+	marshalMs := time.Since(marshalStart).Milliseconds()
 	if err != nil {
 		log.Error("marshal vision request failed",
 			"stage", "request_build",
@@ -166,6 +171,12 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 		)
 		return "", fmt.Errorf("marshal vision req: %w", err)
 	}
+	log.Debug("request body marshaled",
+		"stage", "request_build_marshal",
+		"status", "ok",
+		"payload_bytes", len(bodyBytes),
+		"duration_ms", marshalMs,
+	)
 
 	// ── stage: http_request_start ──
 	log.Info("vision HTTP request sending",
@@ -182,10 +193,13 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 		httpClient = &http.Client{Timeout: timeout}
 	}
 
+	// ── stage: request_build (http.Request) ──
+	reqBuildStart := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(bodyBytes))
+	reqBuildMs := time.Since(reqBuildStart).Milliseconds()
 	if err != nil {
 		log.Error("build vision HTTP request failed",
-			"stage", "http_request_start",
+			"stage", "request_build_httpreq",
 			"status", "error",
 			"error_code", "http_req_build_failed",
 			"error_message", err.Error(),
@@ -195,6 +209,105 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	log.Debug("http.Request object built",
+		"stage", "request_build_httpreq",
+		"status", "ok",
+		"duration_ms", reqBuildMs,
+	)
+
+	// ── httptrace: 捕获连接各阶段耗时 ──
+	var dnsStart, connectStart, tlsStart, gotConnTime, wroteReqTime time.Time
+
+	trace := &httptrace.ClientTrace{
+		DNSStart: func(info httptrace.DNSStartInfo) {
+			dnsStart = time.Now()
+			log.Debug("DNS lookup started",
+				"stage", "dns_lookup",
+				"host", info.Host,
+			)
+		},
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			var ms int64
+			if !dnsStart.IsZero() {
+				ms = time.Since(dnsStart).Milliseconds()
+			}
+			log.Info("DNS lookup completed",
+				"stage", "dns_lookup",
+				"status", "ok",
+				"addrs", len(info.Addrs),
+				"duration_ms", ms,
+			)
+		},
+		ConnectStart: func(network, addr string) {
+			connectStart = time.Now()
+			log.Debug("TCP connect started",
+				"stage", "tcp_connect",
+				"addr", addr,
+			)
+		},
+		ConnectDone: func(network, addr string, err error) {
+			var ms int64
+			if !connectStart.IsZero() {
+				ms = time.Since(connectStart).Milliseconds()
+			}
+			log.Info("TCP connect completed",
+				"stage", "tcp_connect",
+				"status", "ok",
+				"addr", addr,
+				"duration_ms", ms,
+			)
+		},
+		TLSHandshakeStart: func() {
+			tlsStart = time.Now()
+			log.Debug("TLS handshake started",
+				"stage", "tls_handshake",
+			)
+		},
+		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
+			var ms int64
+			if !tlsStart.IsZero() {
+				ms = time.Since(tlsStart).Milliseconds()
+			}
+			log.Info("TLS handshake completed",
+				"stage", "tls_handshake",
+				"status", "ok",
+				"duration_ms", ms,
+				"tls_version", state.Version,
+			)
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			gotConnTime = time.Now()
+			log.Info("connection established",
+				"stage", "got_conn",
+				"status", "ok",
+				"reused", info.Reused,
+				"was_idle", info.WasIdle,
+				"remote_addr", info.Conn.RemoteAddr().String(),
+			)
+		},
+		WroteRequest: func(wr httptrace.WroteRequestInfo) {
+			wroteReqTime = time.Now()
+			log.Debug("request body fully sent",
+				"stage", "wrote_request",
+				"err", wr.Err,
+			)
+		},
+		GotFirstResponseByte: func() {
+			firstByte := time.Now()
+			var ttfbMs int64
+			if !wroteReqTime.IsZero() {
+				ttfbMs = firstByte.Sub(wroteReqTime).Milliseconds()
+			}
+			log.Info("first response byte received",
+				"stage", "first_byte",
+				"status", "ok",
+				"ttfb_ms", ttfbMs,
+			)
+		},
+	}
+
+	traceCtx := httptrace.WithClientTrace(req.Context(), trace)
+	req = req.WithContext(traceCtx)
 
 	httpStart := time.Now()
 	resp, err := httpClient.Do(req)
@@ -214,7 +327,9 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 	}
 	defer resp.Body.Close()
 
+	bodyReadStart := time.Now()
 	respBytes, err := io.ReadAll(resp.Body)
+	bodyReadMs := time.Since(bodyReadStart).Milliseconds()
 	if err != nil {
 		log.Error("read vision response body failed",
 			"stage", "http_response_received",
@@ -222,18 +337,22 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 			"error_code", "read_body_failed",
 			"error_message", err.Error(),
 			"http_status", resp.StatusCode,
-			"duration_ms", httpMs,
+			"headers_duration_ms", httpMs,
+			"body_read_duration_ms", bodyReadMs,
 		)
 		return "", fmt.Errorf("read vision resp: %w", err)
 	}
 
 	// ── stage: http_response_received ──
+	totalHttpMs := httpMs + bodyReadMs
 	log.Info("vision HTTP response received",
 		"stage", "http_response_received",
 		"status", "ok",
 		"http_status_code", resp.StatusCode,
 		"response_bytes", len(respBytes),
-		"duration_ms", httpMs,
+		"headers_duration_ms", httpMs,
+		"body_read_duration_ms", bodyReadMs,
+		"total_http_duration_ms", totalHttpMs,
 	)
 
 	// 处理错误响应
@@ -244,7 +363,8 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 			"error_code", "api_error",
 			"error_message", truncate(string(respBytes), 300),
 			"http_status_code", resp.StatusCode,
-			"duration_ms", httpMs,
+			"headers_duration_ms", httpMs,
+			"body_read_duration_ms", bodyReadMs,
 		)
 		return "", fmt.Errorf("vision resp %d: %s", resp.StatusCode, truncate(string(respBytes), 500))
 	}
@@ -337,6 +457,10 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 
 	// ── stage: node_complete ──
 	totalMs := time.Since(nodeStart).Milliseconds()
+	var connReadyMs int64
+	if !gotConnTime.IsZero() {
+		connReadyMs = gotConnTime.Sub(httpStart).Milliseconds()
+	}
 	log.Info("DescribeImage completed",
 		"stage", "node_complete",
 		"status", "ok",
@@ -344,7 +468,12 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 		"image_size_bytes", imageSize,
 		"is_large_image", isLarge,
 		"timeout_used", timeout.String(),
-		"http_duration_ms", httpMs,
+		"marshal_duration_ms", marshalMs,
+		"req_build_duration_ms", reqBuildMs,
+		"conn_ready_ms", connReadyMs,
+		"headers_duration_ms", httpMs,
+		"body_read_duration_ms", bodyReadMs,
+		"total_http_duration_ms", httpMs+bodyReadMs,
 		"parse_duration_ms", parseMs,
 		"total_duration_ms", totalMs,
 		"description_len", len(content),
