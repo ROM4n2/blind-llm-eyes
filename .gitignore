@@ -6,6 +6,7 @@
 # Logs / debug artifacts
 debug.log
 *.log
+/testdata
 
 # Config with secrets
 config.yaml

@@ -3,7 +3,7 @@ upstream:
   base_url: "https://api.deepseek.com/anthropic"   # 纯文本上游 Anthropic 兼容端点
   api_key: "sk-deepseek-placeholder"               # 可选：填了就用这个 key 转发，覆盖客户端传来的 Authorization
 vision:
-  base_url: "https://api.xiaomimimo.com/v1"         # MiMo OpenAI 兼容端点
+  base_url: "https://api.xiaomimimo.com/anthropic"  # MiMo Anthropic 兼容端点根路径（客户端会追加 /v1/messages）
   api_key: "sk-mimo-placeholder"
   model: "mimo-v2.5"                                # 有视觉的那个（opus 等级）
   timeout: "60s"
