@@ -1,0 +1,14 @@
+# Binaries
+/blind-llm-eyes
+/blind-llm-eyes.exe
+/blind-llm-eyes-*
+
+# Config with secrets
+config.yaml
+config.*.yaml
+!config.example.yaml
+
+# Go workspace
+*.test
+*.out
+vendor/
