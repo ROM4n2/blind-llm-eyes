@@ -50,13 +50,13 @@ type AdaptiveConcurrency struct {
 // log 可为 nil，此时跳过日志输出。
 func NewAdaptiveConcurrency(cfg AdaptiveConcurrencyCfg, m *metrics.Metrics, log *slog.Logger) *AdaptiveConcurrency {
 	if cfg.InitialLimit <= 0 {
-		cfg.InitialLimit = 4
+		cfg.InitialLimit = 6
 	}
 	if cfg.MinLimit <= 0 {
 		cfg.MinLimit = 1
 	}
 	if cfg.MaxLimit <= 0 {
-		cfg.MaxLimit = 16
+		cfg.MaxLimit = 12
 	}
 	if cfg.FastThresholdMs <= 0 {
 		cfg.FastThresholdMs = 8000
@@ -65,7 +65,7 @@ func NewAdaptiveConcurrency(cfg AdaptiveConcurrencyCfg, m *metrics.Metrics, log 
 		cfg.SlowThresholdMs = 15000
 	}
 	if cfg.SampleWindow <= 0 {
-		cfg.SampleWindow = 20
+		cfg.SampleWindow = 10
 	}
 	if cfg.IncreaseStep <= 0 {
 		cfg.IncreaseStep = 1
@@ -78,7 +78,7 @@ func NewAdaptiveConcurrency(cfg AdaptiveConcurrencyCfg, m *metrics.Metrics, log 
 	}
 	// Min/Max 钳位
 	if cfg.MinLimit > cfg.MaxLimit {
-		cfg.MinLimit, cfg.MaxLimit = 1, 16
+		cfg.MinLimit, cfg.MaxLimit = 1, 12
 	}
 	if cfg.InitialLimit < cfg.MinLimit {
 		cfg.InitialLimit = cfg.MinLimit

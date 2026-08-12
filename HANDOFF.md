@@ -206,17 +206,17 @@ vision:
   description_cap: 1000
 cache:
   max_entries: 500
-concurrency_limit: 4
+concurrency_limit: 6
 fail_open: true
 log_level: "debug"
 adaptive_concurrency:
   enabled: true                # 默认 false，开启后根据 MiMo 延迟动态调整 concurrency_limit
   min_limit: 1
-  max_limit: 16
+  max_limit: 12                # 基于冒烟测试：MiMo 最差 20.6s，12 路已足够
   fast_threshold_ms: 8000      # P90 < 8s → 加性增 +1
   slow_threshold_ms: 15000     # P90 > 15s → 乘性减 ×0.75
-  sample_window: 20             # 滚动窗口样本数
-  cooldown_ms: 3000             # 两次调整最小间隔
+  sample_window: 10            # 10 样本约 2 分钟评一次
+  cooldown_ms: 2000            # 两次调整最小间隔
   increase_step: 1
   decrease_ratio: 0.75
   error_threshold: 0.10        # 错误率 > 10% → 触发降并发

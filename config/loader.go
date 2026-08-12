@@ -121,7 +121,7 @@ func Load(path string) (*Config, error) {
 		c.AdaptiveConcurrency.MinLimit = 1
 	}
 	if c.AdaptiveConcurrency.MaxLimit <= 0 {
-		c.AdaptiveConcurrency.MaxLimit = 16
+		c.AdaptiveConcurrency.MaxLimit = 12
 	}
 	if c.AdaptiveConcurrency.FastThresholdMs <= 0 {
 		c.AdaptiveConcurrency.FastThresholdMs = 8000
@@ -130,10 +130,10 @@ func Load(path string) (*Config, error) {
 		c.AdaptiveConcurrency.SlowThresholdMs = 15000
 	}
 	if c.AdaptiveConcurrency.SampleWindow <= 0 {
-		c.AdaptiveConcurrency.SampleWindow = 20
+		c.AdaptiveConcurrency.SampleWindow = 10
 	}
 	if c.AdaptiveConcurrency.CooldownMs <= 0 {
-		c.AdaptiveConcurrency.CooldownMs = 3000
+		c.AdaptiveConcurrency.CooldownMs = 2000
 	}
 	if c.AdaptiveConcurrency.IncreaseStep <= 0 {
 		c.AdaptiveConcurrency.IncreaseStep = 1
