@@ -43,7 +43,8 @@ func GetRequestID(ctx context.Context) string {
 type AsyncWriter struct {
 	ch     chan []byte
 	out    io.Writer
-	mu     sync.Mutex
+	outMu  sync.Mutex // 保护 out 的并发写入（writeLoop 与同步回退路径竞争）
+	mu     sync.Mutex // 保护 closed 标志
 	closed bool
 	done   chan struct{}
 }
@@ -61,7 +62,9 @@ func NewAsyncWriter(out io.Writer, bufSize int) *AsyncWriter {
 
 func (w *AsyncWriter) writeLoop() {
 	for entry := range w.ch {
+		w.outMu.Lock()
 		w.out.Write(entry)
+		w.outMu.Unlock()
 	}
 	close(w.done)
 }
@@ -71,6 +74,8 @@ func (w *AsyncWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
+		w.outMu.Lock()
+		defer w.outMu.Unlock()
 		return w.out.Write(p)
 	}
 	w.mu.Unlock()
@@ -81,6 +86,8 @@ func (w *AsyncWriter) Write(p []byte) (int, error) {
 	case w.ch <- cp:
 		return len(p), nil
 	default:
+		w.outMu.Lock()
+		defer w.outMu.Unlock()
 		return w.out.Write(p)
 	}
 }
@@ -112,8 +119,15 @@ func replaceAttr(_ []string, a slog.Attr) slog.Attr {
 }
 
 // NewLogger 创建 JSON 结构化日志器，带异步写入。
+// 输出到 os.Stderr，缓冲区容量 4096。
 // 返回 logger 和 AsyncWriter（调用方在 shutdown 时需调用 Close）。
 func NewLogger(level string) (*slog.Logger, *AsyncWriter) {
+	return NewLoggerWithWriter(os.Stderr, 4096, level)
+}
+
+// NewLoggerWithWriter 创建 JSON 结构化日志器，输出到指定 writer。
+// 适用于测试和自定义输出目标（如文件、网络流）。
+func NewLoggerWithWriter(out io.Writer, bufSize int, level string) (*slog.Logger, *AsyncWriter) {
 	var lvl slog.Level
 	switch strings.ToLower(level) {
 	case "debug":
@@ -126,7 +140,7 @@ func NewLogger(level string) (*slog.Logger, *AsyncWriter) {
 		lvl = slog.LevelInfo
 	}
 
-	writer := NewAsyncWriter(os.Stderr, 4096)
+	writer := NewAsyncWriter(out, bufSize)
 	handler := slog.NewJSONHandler(writer, &slog.HandlerOptions{
 		Level:       lvl,
 		ReplaceAttr: replaceAttr,
