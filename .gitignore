@@ -3,6 +3,10 @@
 /blind-llm-eyes.exe
 /blind-llm-eyes-*
 
+# Logs / debug artifacts
+debug.log
+*.log
+
 # Config with secrets
 config.yaml
 config.*.yaml

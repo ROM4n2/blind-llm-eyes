@@ -1,6 +1,7 @@
 listen: "127.0.0.1:8790"
 upstream:
   base_url: "https://api.deepseek.com/anthropic"   # 纯文本上游 Anthropic 兼容端点
+  api_key: "sk-deepseek-placeholder"               # 可选：填了就用这个 key 转发，覆盖客户端传来的 Authorization
 vision:
   base_url: "https://api.xiaomimimo.com/v1"         # MiMo OpenAI 兼容端点
   api_key: "sk-mimo-placeholder"

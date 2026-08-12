@@ -32,6 +32,7 @@ func main() {
 	logger.Info("blind-llm-eyes starting",
 		"listen", cfg.Listen,
 		"upstream", cfg.Upstream.BaseURL,
+		"upstream_key_set", cfg.Upstream.APIKey != "",
 		"vision_model", cfg.Vision.Model,
 		"fail_open", cfg.FailOpen,
 		"cache_max", cfg.Cache.MaxEntries,
@@ -39,6 +40,7 @@ func main() {
 
 	deps := proxy.HandlerDeps{
 		UpstreamBaseURL: strings.TrimRight(cfg.Upstream.BaseURL, "/"),
+		UpstreamAPIKey:  cfg.Upstream.APIKey,
 		VisionClient: &vision.Client{
 			BaseURL:        strings.TrimRight(cfg.Vision.BaseURL, "/"),
 			APIKey:         cfg.Vision.APIKey,

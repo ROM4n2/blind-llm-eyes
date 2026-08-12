@@ -19,6 +19,7 @@ type Config struct {
 
 type UpstreamCfg struct {
 	BaseURL string `yaml:"base_url"`
+	APIKey  string `yaml:"api_key"` // 可选：如果填了就用这个 key 转发，不依赖客户端传来的 Authorization
 }
 
 type VisionCfg struct {
@@ -72,6 +73,9 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("BLIND_UPSTREAM_BASE_URL"); v != "" {
 		c.Upstream.BaseURL = v
+	}
+	if v := os.Getenv("BLIND_UPSTREAM_API_KEY"); v != "" {
+		c.Upstream.APIKey = v
 	}
 	if c.Upstream.BaseURL == "" || c.Vision.BaseURL == "" {
 		return nil, fmt.Errorf("upstream.base_url and vision.base_url are required")

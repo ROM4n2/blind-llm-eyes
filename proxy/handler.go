@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 // HandlerDeps 是 Handler 的依赖（用 struct 注入，方便测试替换 mock）。
 type HandlerDeps struct {
 	UpstreamBaseURL string
+	UpstreamAPIKey  string // 可选：填了就用这个 key 覆盖 Authorization 头
 	VisionClient    *vision.Client
 	Cache           *cache.LRU
 	FailOpen        bool
@@ -55,17 +57,28 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	var cached atomic.Int64
 
 	if parseErr == nil {
+		h.deps.Log.Debug("parsed request",
+			"messages", len(req.Messages),
+			"body_bytes", len(rawBody),
+		)
 		// 3) 找图
 		imgs := messages.FindImageBlocks(&req)
+		h.deps.Log.Debug("found image blocks", "count", len(imgs))
 
 		// 4) 逐个图：查缓存 → 未命中调视觉
 		for _, blk := range imgs {
 			hash, herr := cache.HashFromBase64Data(blk.Source.Data)
+			h.deps.Log.Debug("processing image block",
+				"data_len", len(blk.Source.Data),
+				"media_type", blk.Source.MediaType,
+				"hash_err", fmt.Sprintf("%v", herr),
+			)
 			if herr == nil {
 				if desc, ok := h.deps.Cache.Get(hash); ok {
 					messages.ReplaceImageWithDescription(blk, desc)
 					rewritten.Add(1)
 					cached.Add(1)
+					h.deps.Log.Debug("cache hit", "hash", hash)
 					continue
 				}
 			}
@@ -110,7 +123,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Header 透传：除 Host 外全拷贝
+	// Header 处理
 	for k, vs := range r.Header {
 		if k == "Host" {
 			continue
@@ -118,6 +131,10 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		for _, v := range vs {
 			upstreamReq.Header.Add(k, v)
 		}
+	}
+	// 如果配置了上游 API key，覆盖 Authorization 头（最常用场景）
+	if h.deps.UpstreamAPIKey != "" {
+		upstreamReq.Header.Set("Authorization", "Bearer "+h.deps.UpstreamAPIKey)
 	}
 	upstreamReq.ContentLength = int64(len(rawBody))
 
