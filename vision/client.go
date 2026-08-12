@@ -137,24 +137,36 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// ── stage: 构造请求 ──
+	// ── stage: 构造请求 (Anthropic Messages API 格式) ──
 	systemPrompt := "You are a visual description assistant. Describe the provided image in detail in Chinese. Focus on objects, layout, colors, text visible in the image, and any code snippets or UI elements. Keep the description under 400 words but be precise."
 
 	reqBody := map[string]any{
-		"model": c.Model,
+		"model":  c.Model,
+		"system": systemPrompt,
 		"messages": []map[string]any{
-			{"role": "system", "content": systemPrompt},
-			{"role": "user", "content": []map[string]any{
-				{
-					"type": "image_url",
-					"image_url": map[string]string{
-						"url": fmt.Sprintf("data:%s;base64,%s", actualMediaType, actualData),
+			{
+				"role": "user",
+				"content": []map[string]any{
+					{
+						"type": "image",
+						"source": map[string]string{
+							"type":       "base64",
+							"media_type": actualMediaType,
+							"data":       actualData,
+						},
+					},
+					{
+						"type": "text",
+						"text": "Describe this image in detail.",
 					},
 				},
-			}},
+			},
 		},
 		"max_tokens":  c.DescriptionCap,
 		"temperature": 0.0,
+		"thinking": map[string]string{
+			"type": "disabled", // 关闭 MiMo 思考模式，跳过 reasoning_content 生成
+		},
 	}
 
 	// ── stage: request_build (marshal) ──
@@ -182,7 +194,7 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 	log.Info("vision HTTP request sending",
 		"stage", "http_request_start",
 		"status", "info",
-		"url", c.BaseURL+"/chat/completions",
+		"url", c.BaseURL+"/v1/messages",
 		"timeout", timeout.String(),
 		"payload_bytes", len(bodyBytes),
 		"max_tokens", c.DescriptionCap,
@@ -195,7 +207,7 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 
 	// ── stage: request_build (http.Request) ──
 	reqBuildStart := time.Now()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/messages", bytes.NewReader(bodyBytes))
 	reqBuildMs := time.Since(reqBuildStart).Milliseconds()
 	if err != nil {
 		log.Error("build vision HTTP request failed",
@@ -378,13 +390,12 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 	)
 
 	var parsed struct {
-		Choices []struct {
-			Message struct {
-				Content          string `json:"content"`
-				ReasoningContent string `json:"reasoning_content"`
-			} `json:"message"`
-			FinishReason string `json:"finish_reason"`
-		} `json:"choices"`
+		Content []struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			Thinking string `json:"thinking"`
+		} `json:"content"`
+		StopReason string `json:"stop_reason"`
 	}
 	if err := json.Unmarshal(respBytes, &parsed); err != nil {
 		parseMs := time.Since(parseStart).Milliseconds()
@@ -399,50 +410,63 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 		)
 		return "", fmt.Errorf("unmarshal vision resp: %w (raw=%s)", err, truncate(string(respBytes), 300))
 	}
-	if len(parsed.Choices) == 0 {
+	if len(parsed.Content) == 0 {
 		parseMs := time.Since(parseStart).Milliseconds()
-		log.Error("vision response has no choices",
+		log.Error("vision response has no content blocks",
 			"stage", "response_parsing",
 			"status", "error",
-			"error_code", "empty_choices",
-			"error_message", "vision response returned 0 choices",
+			"error_code", "empty_content",
+			"error_message", "vision response returned 0 content blocks",
 			"raw_preview", truncate(string(respBytes), 200),
 			"duration_ms", parseMs,
 		)
-		return "", fmt.Errorf("vision resp empty choices")
+		return "", fmt.Errorf("vision resp empty content")
 	}
 
 	parseMs := time.Since(parseStart).Milliseconds()
 
-	// 提取描述（含 reasoning_content fallback）
-	content := parsed.Choices[0].Message.Content
-	finishReason := parsed.Choices[0].FinishReason
-	usedReasoningFallback := false
-
-	if content == "" {
-		content = parsed.Choices[0].Message.ReasoningContent
-		if content != "" {
-			usedReasoningFallback = true
-			content = truncate(content, c.DescriptionCap*2)
-			log.Warn("vision content empty, using reasoning_content fallback",
-				"stage", "response_parsing",
-				"status", "warning",
-				"reasoning_len", len(parsed.Choices[0].Message.ReasoningContent),
-				"finish_reason", finishReason,
-				"duration_ms", parseMs,
-			)
+	// 提取描述（从 Anthropic content blocks 中聚合 text 和 thinking）
+	var content, reasoningContent string
+	for _, block := range parsed.Content {
+		switch block.Type {
+		case "text":
+			content += block.Text
+		case "thinking":
+			reasoningContent += block.Thinking
 		}
 	}
-	if content == "" {
-		log.Error("vision response: both content and reasoning_content empty",
+	finishReason := parsed.StopReason
+	usedReasoningFallback := false
+
+	log.Debug("response fields extracted",
+		"stage", "response_parsed",
+		"content_len", len(content),
+		"reasoning_content_len", len(reasoningContent),
+		"finish_reason", finishReason,
+	)
+
+	if content == "" && reasoningContent != "" {
+		content = reasoningContent
+		usedReasoningFallback = true
+		content = truncate(content, c.DescriptionCap*2)
+		log.Warn("vision text empty, using thinking fallback",
 			"stage", "response_parsing",
-			"status", "error",
-			"error_code", "empty_content",
-			"error_message", "both content and reasoning_content are empty",
+			"status", "warning",
+			"reasoning_len", len(reasoningContent),
 			"finish_reason", finishReason,
 			"duration_ms", parseMs,
 		)
-		return "", fmt.Errorf("vision resp empty choices (finish_reason=%s)", finishReason)
+	}
+	if content == "" {
+		log.Error("vision response: both text and thinking empty",
+			"stage", "response_parsing",
+			"status", "error",
+			"error_code", "empty_content",
+			"error_message", "both text and thinking blocks are empty",
+			"finish_reason", finishReason,
+			"duration_ms", parseMs,
+		)
+		return "", fmt.Errorf("vision resp empty content (stop_reason=%s)", finishReason)
 	}
 
 	// ── stage: response_parsed ──
@@ -477,6 +501,7 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 		"parse_duration_ms", parseMs,
 		"total_duration_ms", totalMs,
 		"description_len", len(content),
+		"reasoning_content_len", len(reasoningContent),
 		"finish_reason", finishReason,
 		"description_preview", truncate(content, 80),
 	)

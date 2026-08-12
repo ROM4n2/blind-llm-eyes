@@ -21,10 +21,12 @@ func TestDescribeImage_OK(t *testing.T) {
 		if req["model"] != "mimo-v2.5" {
 			t.Errorf("model wrong: %v", req["model"])
 		}
+		// Anthropic Messages API 响应格式
 		json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{
-				{"message": map[string]any{"content": "一张蓝色背景的测试图片，左上角有 Logo"}},
+			"content": []map[string]any{
+				{"type": "text", "text": "一张蓝色背景的测试图片，左上角有 Logo"},
 			},
+			"stop_reason": "end_turn",
 		})
 	}))
 	defer srv.Close()
@@ -61,18 +63,13 @@ func TestDescribeImage_500Fail(t *testing.T) {
 }
 
 func TestDescribeImage_ReasoningFallback(t *testing.T) {
-	// MiMo 有时只返回 reasoning_content，content 为空
+	// MiMo 思考模式下可能只返回 thinking block，text 为空
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{
-				{
-					"message": map[string]any{
-						"content":           "",
-						"reasoning_content": "图片中是一个红色方块",
-					},
-					"finish_reason": "length",
-				},
+			"content": []map[string]any{
+				{"type": "thinking", "thinking": "图片中是一个红色方块"},
 			},
+			"stop_reason": "max_tokens",
 		})
 	}))
 	defer srv.Close()
@@ -90,15 +87,10 @@ func TestDescribeImage_ReasoningFallback(t *testing.T) {
 func TestDescribeImage_BothEmpty(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{
-				{
-					"message": map[string]any{
-						"content":           "",
-						"reasoning_content": "",
-					},
-					"finish_reason": "length",
-				},
+			"content": []map[string]any{
+				{"type": "text", "text": ""},
 			},
+			"stop_reason": "max_tokens",
 		})
 	}))
 	defer srv.Close()
@@ -106,6 +98,6 @@ func TestDescribeImage_BothEmpty(t *testing.T) {
 	c := &Client{BaseURL: srv.URL, APIKey: "x", Model: "m", DescriptionCap: 300, Timeout: 5 * time.Second}
 	_, err := c.DescribeImage(context.Background(), "abc", "image/png", 10)
 	if err == nil {
-		t.Errorf("expected error when both content and reasoning_content are empty")
+		t.Errorf("expected error when both text and thinking are empty")
 	}
 }
