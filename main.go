@@ -9,13 +9,16 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/ROM4n2/blind-llm-eyes/cache"
 	"github.com/ROM4n2/blind-llm-eyes/config"
+	"github.com/ROM4n2/blind-llm-eyes/metrics"
 	"github.com/ROM4n2/blind-llm-eyes/proxy"
 	"github.com/ROM4n2/blind-llm-eyes/vision"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -42,10 +45,19 @@ func main() {
 		"cache_max", cfg.Cache.MaxEntries,
 	)
 
+	// 初始化 Prometheus Metrics
+	m := metrics.NewMetrics()
+	logger.Info("prometheus metrics initialized",
+		"endpoints", "/metrics",
+	)
+
+	// WaitGroup for graceful shutdown
+	var wg sync.WaitGroup
+
 	deps := proxy.HandlerDeps{
-		UpstreamBaseURL: strings.TrimRight(cfg.Upstream.BaseURL, "/"),
-		UpstreamAPIKey:  cfg.Upstream.APIKey,
-		VisionClient: vision.NewClient(
+		UpstreamBaseURL:     strings.TrimRight(cfg.Upstream.BaseURL, "/"),
+		UpstreamAPIKey:      cfg.Upstream.APIKey,
+		VisionProvider: vision.NewClient(
 			strings.TrimRight(cfg.Vision.BaseURL, "/"),
 			cfg.Vision.APIKey,
 			cfg.Vision.Model,
@@ -56,16 +68,30 @@ func main() {
 			cfg.Vision.SupportedFormats,
 			logger,
 		),
-		Cache:    cache.NewLRU(cfg.Cache.MaxEntries),
-		FailOpen: cfg.FailOpen,
-		Log:      logger,
+		Cache:               cache.NewLRU(cfg.Cache.MaxEntries),
+		FailOpen:            cfg.FailOpen,
+		LargeImageThreshold: cfg.Vision.LargeImageThreshold,
+		Log:                 logger,
+		WG:                  &wg,
+		Metrics:             m,
 	}
+
+	// 主路由：代理 + metrics
+	mux := http.NewServeMux()
+	mux.Handle("/v1/messages", proxy.NewHandler(deps))
+	mux.Handle("/metrics", promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{
+		EnableOpenMetrics: true,
+	}))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
 
 	srv := &http.Server{
 		Addr:         cfg.Listen,
-		Handler:      proxy.NewHandler(deps),
+		Handler:      mux,
 		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 10 * time.Minute, // 长 SSE 响应
+		WriteTimeout: 10 * time.Minute,
 	}
 
 	errCh := make(chan error, 1)
@@ -84,12 +110,22 @@ func main() {
 		logger.Error("server failed", "err", err)
 		os.Exit(1)
 	case sig := <-sigCh:
-		logger.Info("shutting down", "signal", sig)
+		logger.Info("shutting down gracefully",
+			"signal", sig,
+			"waiting_for_inflight_requests", true,
+		)
+
+		// 1) 停止接受新请求（给在途请求 15s 时间完成）
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
-			logger.Error("shutdown error", "err", err)
+			logger.Error("server shutdown error", "err", err)
 		}
+
+		// 2) 等待所有在途请求完成
+		logger.Info("waiting for in-flight requests to complete...")
+		wg.Wait()
+		logger.Info("all in-flight requests completed, shutting down")
 	}
 }
 
