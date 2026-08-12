@@ -37,4 +37,48 @@ func TestReplaceImageWithDescription(t *testing.T) {
 	if blk.Source != nil {
 		t.Errorf("source should be nil after replace")
 	}
+
+	// 关键断言：Marshal 后输出的是新的 text 块（不是旧的 image 块 JSON）
+	out, err := json.Marshal(&req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	outStr := string(out)
+	if !strings.Contains(outStr, `"type":"text"`) {
+		t.Errorf("marshaled output should contain text block, got: %s", outStr[:min(len(outStr), 200)])
+	}
+	if strings.Contains(outStr, `"type":"image"`) {
+		t.Errorf("marshaled output should NOT contain image block, got: %s", outStr[:min(len(outStr), 200)])
+	}
+	if strings.Contains(outStr, `"media_type"`) {
+		t.Errorf("marshaled output should NOT contain original image metadata")
+	}
+}
+
+func TestPreserveUnknownFields(t *testing.T) {
+	// 模拟真实请求：包含 thinking 块（上游 CC Switch / deepseek 所需字段）
+	body := `{
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "hi"}]},
+			{"role": "assistant", "content": [{"type": "thinking", "thinking": "let me think..."}]},
+			{"role": "user", "content": [{"type": "text", "text": "ok"}]}
+		]
+	}`
+	var req Request
+	if err := json.NewDecoder(strings.NewReader(body)).Decode(&req); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Marshal → 验证 thinking 字段被保留
+	out, err := json.Marshal(&req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(out), `"thinking":"let me think..."`) {
+		t.Errorf("thinking field lost after round-trip: %s", string(out)[:300])
+	}
+	// 其他字段也被保留
+	if !strings.Contains(string(out), `"role":"assistant"`) {
+		t.Errorf("role field lost: %s", string(out)[:300])
+	}
 }

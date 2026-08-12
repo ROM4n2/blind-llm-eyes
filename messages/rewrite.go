@@ -1,5 +1,7 @@
 package messages
 
+import "encoding/json"
+
 // ImageDescriptionMarker 包裹被替换的图像描述，让上游纯文本模型把它当作"自己看到的图像"。
 // 选择 XML 风格是因为主流 LLM 对 XML 指令块的服从度远高于方括号或纯自然语言。
 const ImageDescriptionMarker = "BLIND_LLM_EYES_IMAGE"
@@ -15,4 +17,16 @@ func ReplaceImageWithDescription(blk *ContentBlock, description string) {
 	blk.Type = "text"
 	blk.Text = WrapImageDescription(description)
 	blk.Source = nil
+
+	// 重建 raw JSON，确保 Marshal 时输出的是新的 text block（不是旧的 image block）
+	newRaw, err := json.Marshal(struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}{
+		Type: "text",
+		Text: blk.Text,
+	})
+	if err == nil {
+		blk.raw = newRaw
+	}
 }
