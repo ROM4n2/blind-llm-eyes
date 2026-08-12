@@ -2,12 +2,14 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -293,10 +295,12 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		"failed", failed.Load(),
 	)
 
+	// ── stage: upstream_request_build ──
+	reqBuildStart := time.Now()
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
 	if err != nil {
 		log.Error("build upstream request failed",
-			"stage", "upstream_request_start",
+			"stage", "upstream_request_build",
 			"status", "error",
 			"error_code", "upstream_req_build_failed",
 			"error_message", err.Error(),
@@ -322,6 +326,106 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		upstreamReq.Header.Set("Authorization", "Bearer "+h.deps.UpstreamAPIKey)
 	}
 	upstreamReq.ContentLength = int64(len(rawBody))
+	reqBuildMs := time.Since(reqBuildStart).Milliseconds()
+	log.Debug("upstream request built",
+		"stage", "upstream_request_build",
+		"status", "ok",
+		"duration_ms", reqBuildMs,
+	)
+
+	// ── httptrace: 捕获 DeepSeek 连接各阶段耗时 ──
+	var dnsStart, connectStart, tlsStart, gotConnTime, wroteReqTime time.Time
+
+	trace := &httptrace.ClientTrace{
+		DNSStart: func(info httptrace.DNSStartInfo) {
+			dnsStart = time.Now()
+			log.Debug("upstream DNS lookup started",
+				"stage", "upstream_dns_lookup",
+				"host", info.Host,
+			)
+		},
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			var ms int64
+			if !dnsStart.IsZero() {
+				ms = time.Since(dnsStart).Milliseconds()
+			}
+			log.Info("upstream DNS lookup completed",
+				"stage", "upstream_dns_lookup",
+				"status", "ok",
+				"addrs", len(info.Addrs),
+				"duration_ms", ms,
+			)
+		},
+		ConnectStart: func(network, addr string) {
+			connectStart = time.Now()
+			log.Debug("upstream TCP connect started",
+				"stage", "upstream_tcp_connect",
+				"addr", addr,
+			)
+		},
+		ConnectDone: func(network, addr string, err error) {
+			var ms int64
+			if !connectStart.IsZero() {
+				ms = time.Since(connectStart).Milliseconds()
+			}
+			log.Info("upstream TCP connect completed",
+				"stage", "upstream_tcp_connect",
+				"status", "ok",
+				"addr", addr,
+				"duration_ms", ms,
+			)
+		},
+		TLSHandshakeStart: func() {
+			tlsStart = time.Now()
+			log.Debug("upstream TLS handshake started",
+				"stage", "upstream_tls_handshake",
+			)
+		},
+		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
+			var ms int64
+			if !tlsStart.IsZero() {
+				ms = time.Since(tlsStart).Milliseconds()
+			}
+			log.Info("upstream TLS handshake completed",
+				"stage", "upstream_tls_handshake",
+				"status", "ok",
+				"duration_ms", ms,
+				"tls_version", state.Version,
+			)
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			gotConnTime = time.Now()
+			log.Info("upstream connection established",
+				"stage", "upstream_got_conn",
+				"status", "ok",
+				"reused", info.Reused,
+				"was_idle", info.WasIdle,
+				"remote_addr", info.Conn.RemoteAddr().String(),
+			)
+		},
+		WroteRequest: func(wr httptrace.WroteRequestInfo) {
+			wroteReqTime = time.Now()
+			log.Debug("upstream request body fully sent",
+				"stage", "upstream_wrote_request",
+				"err", wr.Err,
+			)
+		},
+		GotFirstResponseByte: func() {
+			firstByte := time.Now()
+			var ttfbMs int64
+			if !wroteReqTime.IsZero() {
+				ttfbMs = firstByte.Sub(wroteReqTime).Milliseconds()
+			}
+			log.Info("upstream first response byte received",
+				"stage", "upstream_first_byte",
+				"status", "ok",
+				"ttfb_ms", ttfbMs,
+			)
+		},
+	}
+
+	traceCtx := httptrace.WithClientTrace(upstreamReq.Context(), trace)
+	upstreamReq = upstreamReq.WithContext(traceCtx)
 
 	upstreamStart := time.Now()
 	upstreamResp, err := http.DefaultClient.Do(upstreamReq)
@@ -334,7 +438,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			"error_code", "upstream_request_failed",
 			"error_message", err.Error(),
 			"url", upstreamURL,
-			"duration_ms", upstreamMs,
+			"headers_duration_ms", upstreamMs,
 			"stack", logging.StackTrace(500),
 		)
 		statusCode = http.StatusBadGateway
@@ -348,6 +452,11 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	statusCode = upstreamResp.StatusCode
 	h.recordUpstreamMetric(strconv.Itoa(statusCode), upstreamElapsed)
 
+	var connReadyMs int64
+	if !gotConnTime.IsZero() {
+		connReadyMs = gotConnTime.Sub(upstreamStart).Milliseconds()
+	}
+
 	// ── stage: upstream_response_received ──
 	respContentLength := upstreamResp.ContentLength
 	log.Info("upstream response received",
@@ -355,7 +464,9 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		"status", "ok",
 		"http_status_code", upstreamResp.StatusCode,
 		"response_content_length", respContentLength,
-		"duration_ms", upstreamMs,
+		"req_build_duration_ms", reqBuildMs,
+		"conn_ready_ms", connReadyMs,
+		"headers_duration_ms", upstreamMs,
 	)
 
 	// 7) 加改写结果头
@@ -382,8 +493,11 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			"stage", "upstream_complete",
 			"status", "ok",
 			"http_status_code", statusCode,
+			"req_build_duration_ms", reqBuildMs,
+			"conn_ready_ms", connReadyMs,
+			"headers_duration_ms", upstreamMs,
 			"stream_duration_ms", streamMs,
-			"upstream_duration_ms", upstreamMs,
+			"total_http_duration_ms", upstreamMs+streamMs,
 			"total_duration_ms", totalMs,
 			"rewritten", rewritten.Load(),
 			"cached", cached.Load(),
