@@ -150,10 +150,38 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		g, gctx := errgroup.WithContext(r.Context())
 		g.SetLimit(4) // 限制并发，避免一次请求里大量图片打爆 MiMo
 
+		parallelStart := time.Now()
+		log.Info("parallel image processing started",
+			"stage", "parallel_images_start",
+			"status", "info",
+			"image_count", len(imgs),
+			"concurrency_limit", 4,
+			"total_image_bytes", totalImageBytes,
+		)
+
 		for i, blk := range imgs {
 			i, blk := i, blk // 闭包捕获
 			g.Go(func() error {
 				imgStart := time.Now()
+				// outcome / retErr 由 defer 读取，用于在每个 return 点统一记录 goroutine 结束日志
+				var outcome string
+				var retErr error
+				defer func() {
+					log.Info("image goroutine finished",
+						"stage", "image_goroutine_complete",
+						"index", i,
+						"outcome", outcome,
+						"duration_ms", time.Since(imgStart).Milliseconds(),
+						"err", retErr,
+					)
+				}()
+
+				log.Info("image goroutine started",
+					"stage", "image_goroutine_start",
+					"index", i,
+					"total_images", len(imgs),
+				)
+
 				hash, herr := cache.HashFromBase64Data(blk.Source.Data)
 				rawBytes, _ := base64.StdEncoding.DecodeString(blk.Source.Data)
 				imageSize := int64(len(rawBytes))
@@ -184,6 +212,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 							"desc_len", len(desc),
 							"cache_elapsed", time.Since(imgStart).String(),
 						)
+						outcome = "cache_hit"
 						return nil
 					}
 				}
@@ -200,6 +229,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 				visionCtx := logging.WithRequestID(gctx, requestID)
 				desc, verr := h.deps.VisionProvider.DescribeImage(visionCtx, blk.Source.Data, blk.Source.MediaType, imageSize)
 				visionElapsed := time.Since(vStart)
+				visionMs := visionElapsed.Milliseconds()
 
 				if verr != nil {
 					if !h.deps.FailOpen {
@@ -207,22 +237,27 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 							"index", i,
 							"err", verr,
 							"vision_elapsed", visionElapsed.String(),
+							"vision_duration_ms", visionMs,
 						)
 						h.recordVisionMetric("error", visionElapsed)
 						failed.Add(1)
 						h.recordImageMetric("failed")
-						return fmt.Errorf("vision call failed (index=%d): %w", i, verr)
+						outcome = "vision_fail"
+						retErr = fmt.Errorf("vision call failed (index=%d): %w", i, verr)
+						return retErr
 					}
 					log.Warn("vision call failed, replacing with placeholder",
 						"index", i,
 						"err", verr,
 						"vision_elapsed", visionElapsed.String(),
+						"vision_duration_ms", visionMs,
 						"image_size_bytes", imageSize,
 					)
 					messages.ReplaceImageWithDescription(blk, "[Image could not be described by vision model]")
 					rewritten.Add(1)
 					h.recordVisionMetric("fail_open", visionElapsed)
 					h.recordImageMetric("rewritten")
+					outcome = "vision_fail_open"
 					return nil
 				}
 
@@ -244,15 +279,20 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 					"image_size_bytes", imageSize,
 					"is_large", isLarge,
 					"vision_elapsed", visionElapsed.String(),
+					"vision_duration_ms", visionMs,
 					"desc_len", len(desc),
 					"desc_preview", truncate(desc, 80),
 				)
+				outcome = "vision_success"
 				return nil
 			})
 		}
 
 		if err := g.Wait(); err != nil {
-			log.Error("image processing failed, returning 502",
+			log.Error("parallel image processing failed, returning 502",
+				"stage", "parallel_images_complete",
+				"status", "error",
+				"duration_ms", time.Since(parallelStart).Milliseconds(),
 				"err", err,
 				"rewritten", rewritten.Load(),
 				"cached", cached.Load(),
@@ -263,6 +303,16 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			h.recordRequestMetrics(r.Method, route, statusCode, requestStart)
 			return
 		}
+
+		log.Info("parallel image processing completed",
+			"stage", "parallel_images_complete",
+			"status", "ok",
+			"duration_ms", time.Since(parallelStart).Milliseconds(),
+			"image_count", len(imgs),
+			"rewritten", rewritten.Load(),
+			"cached", cached.Load(),
+			"failed", failed.Load(),
+		)
 
 		// 计算缓存命中率
 		if totalLookups.Load() > 0 && h.deps.Metrics != nil {
