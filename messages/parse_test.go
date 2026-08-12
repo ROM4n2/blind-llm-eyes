@@ -51,3 +51,24 @@ func TestFindImageBlocks_NoImages(t *testing.T) {
 		t.Errorf("want 0, got %d", len(FindImageBlocks(&req)))
 	}
 }
+
+func TestFindImageBlocks_StringContent(t *testing.T) {
+	// Claude Code 有时把 content 发成纯字符串
+	body := `{"messages":[{"role":"user","content":"hello world"}]}`
+	var req Request
+	if err := json.NewDecoder(strings.NewReader(body)).Decode(&req); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(req.Messages[0].Content) != 1 {
+		t.Fatalf("want 1 content block, got %d", len(req.Messages[0].Content))
+	}
+	if req.Messages[0].Content[0].Type != "text" {
+		t.Errorf("want type=text, got %s", req.Messages[0].Content[0].Type)
+	}
+	if req.Messages[0].Content[0].Text != "hello world" {
+		t.Errorf("text mismatch: %s", req.Messages[0].Content[0].Text)
+	}
+	if len(FindImageBlocks(&req)) != 0 {
+		t.Errorf("want 0 images, got %d", len(FindImageBlocks(&req)))
+	}
+}

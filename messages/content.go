@@ -41,7 +41,33 @@ type Request struct {
 
 type Message struct {
 	Role    string         `json:"role"` // "user" | "assistant"
-	Content []ContentBlock `json:"content"`
+	Content MessageContent `json:"content"`
+}
+
+// MessageContent 兼容 content 字段的两种形态：
+//   1) 数组：[{"type":"text","text":"..."}, {"type":"image",...}]
+//   2) 字符串："hello" (简写，等价于 [{"type":"text","text":"hello"}])
+type MessageContent []ContentBlock
+
+// UnmarshalJSON 让 MessageContent 同时接受 array 和 string。
+func (m *MessageContent) UnmarshalJSON(b []byte) error {
+	// 尝试按数组解析
+	var blocks []ContentBlock
+	if err := json.Unmarshal(b, &blocks); err == nil {
+		*m = MessageContent(blocks)
+		return nil
+	}
+	// 回退：按字符串解析
+	var text string
+	if err := json.Unmarshal(b, &text); err != nil {
+		return err
+	}
+	if text == "" {
+		*m = nil
+		return nil
+	}
+	*m = MessageContent{{Type: "text", Text: text}}
+	return nil
 }
 
 type ContentBlock struct {

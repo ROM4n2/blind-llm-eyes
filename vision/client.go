@@ -85,17 +85,32 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 	var parsed struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(respBytes, &parsed); err != nil {
 		return "", fmt.Errorf("unmarshal vision resp: %w (raw=%s)", err, truncate(string(respBytes), 300))
 	}
-	if len(parsed.Choices) == 0 || parsed.Choices[0].Message.Content == "" {
+	if len(parsed.Choices) == 0 {
 		return "", fmt.Errorf("vision resp empty choices")
 	}
-	return parsed.Choices[0].Message.Content, nil
+	// MiMo 是推理模型，复杂图片下 reasoning_tokens 可能吃满预算导致 content 为空。
+	// 此时用 reasoning_content 作为 fallback（虽然质量稍差，但远好于返回空）。
+	content := parsed.Choices[0].Message.Content
+	if content == "" {
+		content = parsed.Choices[0].Message.ReasoningContent
+		if content != "" {
+			// 截取 reasoning_content 里实际有意义的部分（去掉思考链前缀）
+			content = truncate(content, c.DescriptionCap*2)
+		}
+	}
+	if content == "" {
+		return "", fmt.Errorf("vision resp empty choices (finish_reason=%s)", parsed.Choices[0].FinishReason)
+	}
+	return content, nil
 }
 
 func truncate(s string, n int) string {

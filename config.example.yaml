@@ -6,9 +6,9 @@ vision:
   base_url: "https://api.xiaomimimo.com/v1"         # MiMo OpenAI 兼容端点
   api_key: "sk-mimo-placeholder"
   model: "mimo-v2.5"                                # 有视觉的那个（opus 等级）
-  timeout: "30s"
-  description_cap: 500                              # max_tokens，描述占用纯文本上游上下文，必须限长
+  timeout: "60s"
+  description_cap: 2000                             # max_tokens，MiMo 是推理模型需要足够预算
 cache:
   max_entries: 500                                  # 纯内存 LRU 容量
-fail_open: true                                     # 视觉失败 → 原样转发，不阻塞主链路
+fail_open: true                                     # 视觉失败 → 替换为占位文字，不阻塞主链路
 log_level: "info"                                   # debug / info / warn / error

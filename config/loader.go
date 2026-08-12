@@ -57,7 +57,7 @@ func Load(path string) (*Config, error) {
 	}
 	c.Vision.Timeout = d
 	if c.Vision.DescriptionCap <= 0 {
-		c.Vision.DescriptionCap = 500
+		c.Vision.DescriptionCap = 2000
 	}
 	if c.Cache.MaxEntries <= 0 {
 		c.Cache.MaxEntries = 500
