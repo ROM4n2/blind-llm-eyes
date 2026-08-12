@@ -233,7 +233,10 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 				// singleflight：同 hash 并发调用合并为一次 vision 请求
 				// fn 内部用独立 ctx（context.Background + 120s timeout），避免某个调用者
 				// 取消请求导致其他等待者也失败
+				var fnStart, fnEnd time.Time
 				v, verr, shared := h.sf.Do(hash, func() (any, error) {
+					fnStart = time.Now()
+					defer func() { fnEnd = time.Now() }()
 					dedupCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 					defer cancel()
 					dedupCtx = logging.WithRequestID(dedupCtx, requestID)
@@ -249,13 +252,24 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 				visionElapsed := time.Since(vStart)
 				visionMs := visionElapsed.Milliseconds()
 
+				// singleflight 耗时分解：
+				// - fn_exec_ms: fn 实际执行 vision 调用的耗时（对所有 goroutine 可见，作为参考）
+				// - sf_wait_ms: 该 goroutine 在 SF.Do 内的等待时间（执行者≈0，等待者=sf_total）
+				fnExecMs := fnEnd.Sub(fnStart).Milliseconds()
+				sfWaitMs := int64(0)
 				if shared {
-					log.Debug("vision call deduplicated by singleflight",
-						"index", i,
-						"hash", hash,
-						"vision_duration_ms", visionMs,
-					)
+					sfWaitMs = visionMs // 等待者全程在等待
 				}
+
+				log.Info("singleflight Do completed",
+					"stage", "singleflight_complete",
+					"index", i,
+					"hash", hash,
+					"deduplicated", shared,
+					"sf_total_ms", visionMs,
+					"fn_exec_ms", fnExecMs,
+					"sf_wait_ms", sfWaitMs,
+				)
 
 				if verr != nil {
 					if !h.deps.FailOpen {
@@ -265,6 +279,8 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 							"vision_elapsed", visionElapsed.String(),
 							"vision_duration_ms", visionMs,
 							"deduplicated", shared,
+							"fn_exec_ms", fnExecMs,
+							"sf_wait_ms", sfWaitMs,
 						)
 						h.recordVisionMetric("error", visionElapsed)
 						failed.Add(1)
@@ -280,6 +296,8 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 						"vision_duration_ms", visionMs,
 						"image_size_bytes", imageSize,
 						"deduplicated", shared,
+						"fn_exec_ms", fnExecMs,
+						"sf_wait_ms", sfWaitMs,
 					)
 					messages.ReplaceImageWithDescription(blk, "[Image could not be described by vision model]")
 					rewritten.Add(1)
@@ -300,6 +318,8 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 					"is_large", isLarge,
 					"vision_elapsed", visionElapsed.String(),
 					"vision_duration_ms", visionMs,
+					"fn_exec_ms", fnExecMs,
+					"sf_wait_ms", sfWaitMs,
 					"desc_len", len(desc),
 					"desc_preview", truncate(desc, 80),
 				)
