@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -21,19 +22,20 @@ import (
 	"github.com/ROM4n2/blind-llm-eyes/metrics"
 	"github.com/ROM4n2/blind-llm-eyes/vision"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 // HandlerDeps 是 Handler 的依赖（用 struct 注入，方便测试替换 mock）。
 type HandlerDeps struct {
-	UpstreamBaseURL      string
-	UpstreamAPIKey       string
-	VisionProvider       vision.VisionProvider
-	Cache                *cache.LRU
-	FailOpen             bool
-	LargeImageThreshold  int64
-	Log                  *slog.Logger
-	WG                   *sync.WaitGroup
-	Metrics              *metrics.Metrics // 可选：Prometheus 指标
+	UpstreamBaseURL     string
+	UpstreamAPIKey      string
+	VisionProvider      vision.VisionProvider
+	Cache               *cache.LRU
+	FailOpen            bool
+	LargeImageThreshold int64
+	Log                 *slog.Logger
+	WG                  *sync.WaitGroup
+	Metrics             *metrics.Metrics // 可选：Prometheus 指标
 }
 
 // NewHandler 返回一个标准 http.Handler，处理 /v1/messages 所有请求。
@@ -56,6 +58,7 @@ func Shutdown(deps HandlerDeps) {
 
 type requestHandler struct {
 	deps HandlerDeps
+	sf   singleflight.Group // 进程级 in-flight 去重，跨请求合并同 hash vision 调用
 }
 
 func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -146,8 +149,9 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		)
 
 		// 4) 并行处理图片：查缓存 → 未命中调视觉
-		// 用 errgroup 并发执行，fail_open=false 时首个 vision 失败会 cancel 其他 in-flight 调用。
-		g, gctx := errgroup.WithContext(r.Context())
+		// 用 errgroup 并发执行。singleflight fn 内部用独立 ctx，不依赖 gctx，
+		// 所以用普通 errgroup.Group 即可（无需 WithContext 的 cancel 语义）。
+		g := new(errgroup.Group)
 		g.SetLimit(4) // 限制并发，避免一次请求里大量图片打爆 MiMo
 
 		parallelStart := time.Now()
@@ -226,10 +230,32 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 				)
 
 				vStart := time.Now()
-				visionCtx := logging.WithRequestID(gctx, requestID)
-				desc, verr := h.deps.VisionProvider.DescribeImage(visionCtx, blk.Source.Data, blk.Source.MediaType, imageSize)
+				// singleflight：同 hash 并发调用合并为一次 vision 请求
+				// fn 内部用独立 ctx（context.Background + 120s timeout），避免某个调用者
+				// 取消请求导致其他等待者也失败
+				v, verr, shared := h.sf.Do(hash, func() (any, error) {
+					dedupCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+					defer cancel()
+					dedupCtx = logging.WithRequestID(dedupCtx, requestID)
+					desc, err := h.deps.VisionProvider.DescribeImage(dedupCtx, blk.Source.Data, blk.Source.MediaType, imageSize)
+					// fn 内部写缓存：确保等待者从 SF.Do 返回时缓存已就绪，
+					// 避免 errgroup 释放 semaphore 后下一个 goroutine 查缓存 miss
+					if err == nil && herr == nil {
+						h.deps.Cache.Put(hash, desc)
+					}
+					return desc, err
+				})
+				desc, _ := v.(string)
 				visionElapsed := time.Since(vStart)
 				visionMs := visionElapsed.Milliseconds()
+
+				if shared {
+					log.Debug("vision call deduplicated by singleflight",
+						"index", i,
+						"hash", hash,
+						"vision_duration_ms", visionMs,
+					)
+				}
 
 				if verr != nil {
 					if !h.deps.FailOpen {
@@ -238,6 +264,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 							"err", verr,
 							"vision_elapsed", visionElapsed.String(),
 							"vision_duration_ms", visionMs,
+							"deduplicated", shared,
 						)
 						h.recordVisionMetric("error", visionElapsed)
 						failed.Add(1)
@@ -252,6 +279,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 						"vision_elapsed", visionElapsed.String(),
 						"vision_duration_ms", visionMs,
 						"image_size_bytes", imageSize,
+						"deduplicated", shared,
 					)
 					messages.ReplaceImageWithDescription(blk, "[Image could not be described by vision model]")
 					rewritten.Add(1)
@@ -261,15 +289,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 					return nil
 				}
 
-				// 成功
-				if herr == nil {
-					h.deps.Cache.Put(hash, desc)
-					log.Debug("cache populated for image",
-						"index", i,
-						"hash", hash,
-						"desc_len", len(desc),
-					)
-				}
+				// 成功：缓存已在 singleflight fn 内部写入，无需重复写
 				messages.ReplaceImageWithDescription(blk, desc)
 				rewritten.Add(1)
 				h.recordVisionMetric("success", visionElapsed)
