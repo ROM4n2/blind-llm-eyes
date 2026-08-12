@@ -37,7 +37,7 @@ func TestDescribeImage_OK(t *testing.T) {
 		Timeout:        5 * time.Second,
 	}
 
-	desc, err := c.DescribeImage(context.Background(), "iVBORw0K...", "image/png")
+	desc, err := c.DescribeImage(context.Background(), "iVBORw0K...", "image/png", 70)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestDescribeImage_500Fail(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, APIKey: "x", Model: "m", DescriptionCap: 100, Timeout: 2 * time.Second}
-	_, err := c.DescribeImage(context.Background(), "abc", "image/png")
+	_, err := c.DescribeImage(context.Background(), "abc", "image/png", 10)
 	if err == nil {
 		t.Errorf("expected error on 500")
 	}
@@ -78,7 +78,7 @@ func TestDescribeImage_ReasoningFallback(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, APIKey: "x", Model: "m", DescriptionCap: 300, Timeout: 5 * time.Second}
-	desc, err := c.DescribeImage(context.Background(), "abc", "image/png")
+	desc, err := c.DescribeImage(context.Background(), "abc", "image/png", 10)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestDescribeImage_BothEmpty(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL, APIKey: "x", Model: "m", DescriptionCap: 300, Timeout: 5 * time.Second}
-	_, err := c.DescribeImage(context.Background(), "abc", "image/png")
+	_, err := c.DescribeImage(context.Background(), "abc", "image/png", 10)
 	if err == nil {
 		t.Errorf("expected error when both content and reasoning_content are empty")
 	}

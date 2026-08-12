@@ -23,12 +23,16 @@ type UpstreamCfg struct {
 }
 
 type VisionCfg struct {
-	BaseURL        string `yaml:"base_url"`
-	APIKey         string `yaml:"api_key"`
-	Model          string `yaml:"model"`
-	TimeoutStr     string `yaml:"timeout"`
-	Timeout        time.Duration `yaml:"-"`
-	DescriptionCap int `yaml:"description_cap"`
+	BaseURL            string        `yaml:"base_url"`
+	APIKey             string        `yaml:"api_key"`
+	Model              string        `yaml:"model"`
+	TimeoutStr         string        `yaml:"timeout"`
+	Timeout            time.Duration `yaml:"-"`
+	LargeTimeoutStr    string        `yaml:"large_image_timeout"`
+	LargeTimeout       time.Duration `yaml:"-"`
+	LargeImageThreshold int64       `yaml:"large_image_threshold"` // bytes; images >= this use large timeout
+	DescriptionCap     int           `yaml:"description_cap"`
+	SupportedFormats   []string      `yaml:"supported_formats"`
 }
 
 type CacheCfg struct {
@@ -56,6 +60,22 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("vision.timeout: %w", err)
 	}
 	c.Vision.Timeout = d
+
+	if c.Vision.LargeTimeoutStr == "" {
+		c.Vision.LargeTimeoutStr = "120s"
+	}
+	ld, err := time.ParseDuration(c.Vision.LargeTimeoutStr)
+	if err != nil {
+		return nil, fmt.Errorf("vision.large_image_timeout: %w", err)
+	}
+	c.Vision.LargeTimeout = ld
+
+	if c.Vision.LargeImageThreshold <= 0 {
+		c.Vision.LargeImageThreshold = 1_000_000 // 1MB default
+	}
+	if len(c.Vision.SupportedFormats) == 0 {
+		c.Vision.SupportedFormats = []string{"image/png", "image/jpeg", "image/webp", "image/gif"}
+	}
 	if c.Vision.DescriptionCap <= 0 {
 		c.Vision.DescriptionCap = 2000
 	}

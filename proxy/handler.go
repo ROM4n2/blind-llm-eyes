@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,9 +69,15 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		// 4) 逐个图：查缓存 → 未命中调视觉
 		for _, blk := range imgs {
 			hash, herr := cache.HashFromBase64Data(blk.Source.Data)
+			// 计算原始图片字节数（base64 解码后）
+			rawBytes, _ := base64.StdEncoding.DecodeString(blk.Source.Data)
+			imageSize := int64(len(rawBytes))
+
 			h.deps.Log.Debug("processing image block",
 				"data_len", len(blk.Source.Data),
+				"image_size_bytes", imageSize,
 				"media_type", blk.Source.MediaType,
+				"is_large", imageSize >= h.deps.VisionClient.LargeImageThreshold,
 				"hash_err", fmt.Sprintf("%v", herr),
 			)
 			if herr == nil {
@@ -84,7 +91,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			}
 
 			// 缓存 miss / hash 失败 → 调视觉
-			desc, verr := h.deps.VisionClient.DescribeImage(r.Context(), blk.Source.Data, blk.Source.MediaType)
+			desc, verr := h.deps.VisionClient.DescribeImage(r.Context(), blk.Source.Data, blk.Source.MediaType, imageSize)
 			if verr != nil {
 				// 视觉失败：fail-open 则替换为占位文字（不透传原始图片给纯文本上游）
 				if !h.deps.FailOpen {
