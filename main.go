@@ -54,6 +54,7 @@ func main() {
 			cfg.Vision.LargeImageThreshold,
 			cfg.Vision.DescriptionCap,
 			cfg.Vision.SupportedFormats,
+			logger,
 		),
 		Cache:    cache.NewLRU(cfg.Cache.MaxEntries),
 		FailOpen: cfg.FailOpen,

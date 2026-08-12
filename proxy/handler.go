@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	"github.com/ROM4n2/blind-llm-eyes/cache"
 	"github.com/ROM4n2/blind-llm-eyes/messages"
@@ -38,17 +39,33 @@ type requestHandler struct {
 }
 
 func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) {
+	requestStart := time.Now()
+	log := h.deps.Log
+
 	if r.Method != http.MethodPost {
+		log.Warn("method not allowed",
+			"method", r.Method,
+			"path", r.URL.Path,
+		)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	// 1) 读原始 body
+	readStart := time.Now()
 	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {
+		log.Error("read request body failed",
+			"err", err,
+			"read_elapsed", time.Since(readStart).String(),
+		)
 		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Debug("request body read",
+		"body_bytes", len(rawBody),
+		"read_elapsed", time.Since(readStart).String(),
+	)
 
 	// 2) 解析 JSON
 	var req messages.Request
@@ -58,62 +75,110 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	var cached atomic.Int64
 
 	if parseErr == nil {
-		h.deps.Log.Debug("parsed request",
+		log.Debug("request JSON parsed",
 			"messages", len(req.Messages),
 			"body_bytes", len(rawBody),
 		)
+
 		// 3) 找图
 		imgs := messages.FindImageBlocks(&req)
-		h.deps.Log.Debug("found image blocks", "count", len(imgs))
+		var totalImageBytes int64
+		for _, blk := range imgs {
+			raw, _ := base64.StdEncoding.DecodeString(blk.Source.Data)
+			totalImageBytes += int64(len(raw))
+		}
+		log.Info("image blocks found in request",
+			"count", len(imgs),
+			"total_image_bytes", totalImageBytes,
+			"is_large_request", totalImageBytes >= h.deps.VisionClient.LargeImageThreshold,
+		)
 
 		// 4) 逐个图：查缓存 → 未命中调视觉
-		for _, blk := range imgs {
+		for i, blk := range imgs {
+			imgStart := time.Now()
 			hash, herr := cache.HashFromBase64Data(blk.Source.Data)
-			// 计算原始图片字节数（base64 解码后）
 			rawBytes, _ := base64.StdEncoding.DecodeString(blk.Source.Data)
 			imageSize := int64(len(rawBytes))
+			isLarge := imageSize >= h.deps.VisionClient.LargeImageThreshold
 
-			h.deps.Log.Debug("processing image block",
+			log.Debug("processing image block",
+				"index", i,
 				"data_len", len(blk.Source.Data),
 				"image_size_bytes", imageSize,
 				"media_type", blk.Source.MediaType,
-				"is_large", imageSize >= h.deps.VisionClient.LargeImageThreshold,
+				"is_large", isLarge,
+				"hash", hash,
 				"hash_err", fmt.Sprintf("%v", herr),
 			)
+
 			if herr == nil {
 				if desc, ok := h.deps.Cache.Get(hash); ok {
 					messages.ReplaceImageWithDescription(blk, desc)
 					rewritten.Add(1)
 					cached.Add(1)
-					h.deps.Log.Debug("cache hit", "hash", hash)
+					log.Debug("cache hit for image",
+						"index", i,
+						"hash", hash,
+						"desc_len", len(desc),
+						"cache_elapsed", time.Since(imgStart).String(),
+					)
 					continue
 				}
 			}
 
 			// 缓存 miss / hash 失败 → 调视觉
+			log.Debug("cache miss, calling vision",
+				"index", i,
+				"hash", hash,
+				"image_size_bytes", imageSize,
+				"timeout_override", isLarge,
+			)
 			desc, verr := h.deps.VisionClient.DescribeImage(r.Context(), blk.Source.Data, blk.Source.MediaType, imageSize)
+			visionElapsed := time.Since(imgStart)
+
 			if verr != nil {
-				// 视觉失败：fail-open 则替换为占位文字（不透传原始图片给纯文本上游）
 				if !h.deps.FailOpen {
+					log.Error("vision call failed, fail_open=false, returning 502",
+						"index", i,
+						"err", verr,
+						"vision_elapsed", visionElapsed.String(),
+					)
 					http.Error(w, "vision call failed: "+verr.Error(), http.StatusBadGateway)
 					return
 				}
-				h.deps.Log.Warn("vision call failed, replacing with placeholder", "err", verr)
+				log.Warn("vision call failed, replacing with placeholder",
+					"index", i,
+					"err", verr,
+					"vision_elapsed", visionElapsed.String(),
+					"image_size_bytes", imageSize,
+				)
 				messages.ReplaceImageWithDescription(blk, "[Image could not be described by vision model]")
 				rewritten.Add(1)
 				continue
 			}
 
-			// 成功：写缓存 + 替换
+			// 成功
 			if herr == nil {
 				h.deps.Cache.Put(hash, desc)
+				log.Debug("cache populated for image",
+					"index", i,
+					"hash", hash,
+					"desc_len", len(desc),
+				)
 			}
 			messages.ReplaceImageWithDescription(blk, desc)
 			rewritten.Add(1)
+			log.Info("image block processed successfully",
+				"index", i,
+				"image_size_bytes", imageSize,
+				"is_large", isLarge,
+				"vision_elapsed", visionElapsed.String(),
+				"desc_len", len(desc),
+				"desc_preview", truncate(desc, 80),
+			)
 		}
 
-		// 5) 如果做过改写，在请求的 system 段追加一条强指令，防止上游模型
-		//    声称"看不到图"或凭空编造。
+		// 5) 如果做过改写，追加 system 指令
 		if rewritten.Load() > 0 {
 			postfix := messages.ContentBlock{
 				Type: "text",
@@ -123,18 +188,41 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 
 			newBody, merr := json.Marshal(&req)
 			if merr != nil {
-				h.deps.Log.Error("re-marshal request failed", "err", merr)
+				log.Error("re-marshal request failed",
+					"err", merr,
+					"rewritten_count", rewritten.Load(),
+				)
 			} else {
 				rawBody = newBody
+				log.Debug("request re-marshaled for upstream",
+					"original_bytes", len(rawBody),
+					"new_bytes", len(newBody),
+					"rewritten_count", rewritten.Load(),
+				)
 			}
 		}
 	} else {
-		h.deps.Log.Warn("parse anthropic request failed, passthrough raw", "err", parseErr)
+		log.Warn("request JSON parse failed, passthrough raw",
+			"err", parseErr,
+			"body_bytes", len(rawBody),
+		)
 	}
 
 	// 6) 转发给上游
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, h.deps.UpstreamBaseURL+"/v1/messages", bytes.NewReader(rawBody))
+	upstreamURL := h.deps.UpstreamBaseURL + "/v1/messages"
+	log.Debug("forwarding request to upstream",
+		"url", upstreamURL,
+		"body_bytes", len(rawBody),
+		"rewritten", rewritten.Load(),
+		"cached", cached.Load(),
+	)
+
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(rawBody))
 	if err != nil {
+		log.Error("build upstream request failed",
+			"err", err,
+			"url", upstreamURL,
+		)
 		http.Error(w, "build upstream req: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -148,18 +236,31 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			upstreamReq.Header.Add(k, v)
 		}
 	}
-	// 如果配置了上游 API key，覆盖 Authorization 头（最常用场景）
 	if h.deps.UpstreamAPIKey != "" {
 		upstreamReq.Header.Set("Authorization", "Bearer "+h.deps.UpstreamAPIKey)
 	}
 	upstreamReq.ContentLength = int64(len(rawBody))
 
+	upstreamStart := time.Now()
 	upstreamResp, err := http.DefaultClient.Do(upstreamReq)
 	if err != nil {
+		log.Error("upstream request failed",
+			"err", err,
+			"url", upstreamURL,
+			"upstream_elapsed", time.Since(upstreamStart).String(),
+		)
 		http.Error(w, "upstream do: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer upstreamResp.Body.Close()
+
+	log.Info("upstream response received",
+		"status_code", upstreamResp.StatusCode,
+		"upstream_elapsed", time.Since(upstreamStart).String(),
+		"total_elapsed", time.Since(requestStart).String(),
+		"rewritten", rewritten.Load(),
+		"cached", cached.Load(),
+	)
 
 	// 7) 加改写结果头
 	upstreamResp.Header.Set("X-Blind-Llm-Eyes",
@@ -167,7 +268,10 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 
 	// 8) SSE 原样透传
 	if err := CopyResponse(w, upstreamResp); err != nil {
-		h.deps.Log.Error("copy response", "err", err)
+		log.Error("copy response to client failed",
+			"err", err,
+			"total_elapsed", time.Since(requestStart).String(),
+		)
 	}
 }
 
@@ -195,4 +299,11 @@ func formatInt(n int64) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
