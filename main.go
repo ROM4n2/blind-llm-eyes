@@ -46,6 +46,7 @@ func main() {
 		"supported_formats", cfg.Vision.SupportedFormats,
 		"fail_open", cfg.FailOpen,
 		"cache_max", cfg.Cache.MaxEntries,
+		"concurrency_limit", cfg.ConcurrencyLimit,
 	)
 
 	// 初始化 Prometheus Metrics
@@ -74,6 +75,7 @@ func main() {
 		Cache:               cache.NewLRU(cfg.Cache.MaxEntries),
 		FailOpen:            cfg.FailOpen,
 		LargeImageThreshold: cfg.Vision.LargeImageThreshold,
+		ConcurrencyLimit:    cfg.ConcurrencyLimit,
 		Log:                 logger,
 		WG:                  &wg,
 		Metrics:             m,

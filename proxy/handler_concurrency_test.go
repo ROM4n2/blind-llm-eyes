@@ -195,3 +195,68 @@ func TestHandler_ParallelImageProcessing_5Images(t *testing.T) {
 	fmt.Fprintln(os.Stderr, "=== captured logs ===")
 	fmt.Fprintln(os.Stderr, logs)
 }
+
+// TestHandler_ConcurrencyLimit_CustomValue 验证 HandlerDeps.ConcurrencyLimit
+// 真实驱动 errgroup.SetLimit：设 limit=2 + 3 张图 × 1s，第 3 张应在第 1 批
+// 完成后才开始（offset >= 900ms）。
+func TestHandler_ConcurrencyLimit_CustomValue(t *testing.T) {
+	var upstreamGot []byte
+	up := fakeUpstream(t, &upstreamGot)
+	defer up.Close()
+
+	// mock vision: 每张图 1 秒
+	slow := newSlowVisionMock(1*time.Second, "SlowMockDesc")
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	deps := HandlerDeps{
+		UpstreamBaseURL:     strings.TrimSuffix(up.URL, "/"),
+		VisionProvider:      slow,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		ConcurrencyLimit:    2, // 关键：覆盖默认 4
+		Log:                 logger,
+	}
+	h := NewHandler(deps)
+
+	reqBody := buildNImageRequest(3)
+
+	start := time.Now()
+	rr := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewBufferString(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(rr, req)
+	elapsed := time.Since(start)
+
+	if rr.Code != 200 {
+		t.Fatalf("status: %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	// 3 张图 × 1s，limit=2 → 2 批：预期 ~2s（串行 3s）
+	if elapsed > 3500*time.Millisecond {
+		t.Errorf("elapsed = %v, want <3.5s (limit=2 not working?)", elapsed)
+	}
+	t.Logf("total elapsed: %v (3 images × 1s, concurrency_limit=2, expected ~2s)", elapsed)
+
+	offsets := slow.offsets()
+	if len(offsets) != 3 {
+		t.Fatalf("vision calls = %d, want 3", len(offsets))
+	}
+	t.Logf("vision call start offsets (ms): %v", offsets)
+
+	// 前 2 个并发启动
+	for i := 0; i < 2; i++ {
+		if offsets[i] > 200 {
+			t.Errorf("vision call %d started at %dms, want <200ms", i, offsets[i])
+		}
+	}
+	// 第 3 个应等第 1 批完成（>= 900ms）
+	if offsets[2] < 900 {
+		t.Errorf("vision call 2 started at %dms, want >=900ms (limit=2 should block)", offsets[2])
+	}
+	if offsets[2] > 1300 {
+		t.Errorf("vision call 2 started too late: %dms, want <1300ms", offsets[2])
+	}
+}

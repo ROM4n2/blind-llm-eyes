@@ -7,8 +7,9 @@ vision:
   api_key: "sk-mimo-placeholder"
   model: "mimo-v2.5"                                # 有视觉的那个（opus 等级）
   timeout: "60s"
-  description_cap: 2000                             # max_tokens，MiMo 是推理模型需要足够预算
+  description_cap: 1000                            # max_tokens；thinking 已禁用，实测生成 1000-1300 chars，1000 足够
 cache:
   max_entries: 500                                  # 纯内存 LRU 容量
+concurrency_limit: 4                                # 单请求内并发 vision 调用上限（errgroup.SetLimit），覆盖典型 2-4 图场景
 fail_open: true                                     # 视觉失败 → 替换为占位文字，不阻塞主链路
 log_level: "info"                                   # debug / info / warn / error

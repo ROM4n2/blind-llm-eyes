@@ -33,6 +33,7 @@ type HandlerDeps struct {
 	Cache               *cache.LRU
 	FailOpen            bool
 	LargeImageThreshold int64
+	ConcurrencyLimit    int // 单请求并发 vision 上限，<=0 时 NewHandler 兜底为 4
 	Log                 *slog.Logger
 	WG                  *sync.WaitGroup
 	Metrics             *metrics.Metrics // 可选：Prometheus 指标
@@ -42,6 +43,9 @@ type HandlerDeps struct {
 func NewHandler(deps HandlerDeps) http.Handler {
 	if deps.WG == nil {
 		deps.WG = &sync.WaitGroup{}
+	}
+	if deps.ConcurrencyLimit <= 0 {
+		deps.ConcurrencyLimit = 4
 	}
 	mux := http.NewServeMux()
 	h := &requestHandler{deps: deps}
@@ -152,14 +156,14 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		// 用 errgroup 并发执行。singleflight fn 内部用独立 ctx，不依赖 gctx，
 		// 所以用普通 errgroup.Group 即可（无需 WithContext 的 cancel 语义）。
 		g := new(errgroup.Group)
-		g.SetLimit(4) // 限制并发，避免一次请求里大量图片打爆 MiMo
+		g.SetLimit(h.deps.ConcurrencyLimit) // 限制并发，避免一次请求里大量图片打爆 MiMo
 
 		parallelStart := time.Now()
 		log.Info("parallel image processing started",
 			"stage", "parallel_images_start",
 			"status", "info",
 			"image_count", len(imgs),
-			"concurrency_limit", 4,
+			"concurrency_limit", h.deps.ConcurrencyLimit,
 			"total_image_bytes", totalImageBytes,
 		)
 

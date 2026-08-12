@@ -9,12 +9,13 @@ import (
 )
 
 type Config struct {
-	Listen   string      `yaml:"listen"`
-	Upstream UpstreamCfg `yaml:"upstream"`
-	Vision   VisionCfg   `yaml:"vision"`
-	Cache    CacheCfg    `yaml:"cache"`
-	FailOpen bool        `yaml:"fail_open"`
-	LogLevel string      `yaml:"log_level"` // debug|info|warn|error
+	Listen            string      `yaml:"listen"`
+	Upstream          UpstreamCfg `yaml:"upstream"`
+	Vision            VisionCfg   `yaml:"vision"`
+	Cache             CacheCfg    `yaml:"cache"`
+	FailOpen          bool        `yaml:"fail_open"`
+	LogLevel          string      `yaml:"log_level"` // debug|info|warn|error
+	ConcurrencyLimit  int         `yaml:"concurrency_limit"` // 单请求内并发 vision 调用上限
 }
 
 type UpstreamCfg struct {
@@ -77,13 +78,16 @@ func Load(path string) (*Config, error) {
 		c.Vision.SupportedFormats = []string{"image/png", "image/jpeg", "image/webp", "image/gif"}
 	}
 	if c.Vision.DescriptionCap <= 0 {
-		c.Vision.DescriptionCap = 2000
+		c.Vision.DescriptionCap = 1000
 	}
 	if c.Cache.MaxEntries <= 0 {
 		c.Cache.MaxEntries = 500
 	}
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
+	}
+	if c.ConcurrencyLimit <= 0 {
+		c.ConcurrencyLimit = 4
 	}
 	if v := os.Getenv("BLIND_LISTEN"); v != "" {
 		c.Listen = v
