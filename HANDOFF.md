@@ -1,7 +1,7 @@
 # 交接文档 — blind-llm-eyes 视觉代理
 
-> **最近更新**：2026-08-12（singleflight 去重 + 耗时分解日志）
-> **状态**：核心功能完成，性能优化已完成三轮（MiMo thinking 关闭 + errgroup 并行 + singleflight 去重），可端到端使用
+> **最近更新**：2026-08-12（P1 配置化：concurrency_limit 可配置 + description_cap 降至 1000）
+> **状态**：核心功能完成，性能优化已完成三轮（MiMo thinking 关闭 + errgroup 并行 + singleflight 去重），P1 配置化任务已完成，可端到端使用
 
 ---
 
@@ -52,17 +52,24 @@
 9. **设计文档** (commit `b092fb6`)
    - CONCURRENCY_DESIGN.md：errgroup + concurrency_limit + singleflight 设计
 
+10. **P1 配置化任务** (未提交)
+    - `concurrency_limit` 从 handler.go 硬编码改为 config.yaml 读取（Config + HandlerDeps + main 全链路打通，NewHandler 兜底默认 4 保证向后兼容）
+    - `description_cap` 默认值 2000 → 1000（thinking 已禁用，实测只生成 1000-1300 chars，旧注释「MiMo 是推理模型需要足够预算」已过时）
+    - 新增测试 `TestHandler_ConcurrencyLimit_CustomValue`（limit=2 + 3 图 × 1s，验证配置真实生效，offsets `[14, 15, 1015]ms`）
+    - `go test -race ./...` 全绿
+
 ### 当前状态
-- **所有代码已提交**，工作区干净
+- **P1 配置化代码已完成但未提交**（5 文件变更 + 1 新测试，工作区有改动）
 - **go test -race ./... 全绿**
 - **服务可运行**：`.\blind-llm-eyes.exe` 启动后监听 127.0.0.1:8790
 - **端到端验证通过**：2 图请求 19.8s，MiMo 阶段 14.2s，DeepSeek 阶段 5.5s
+- **用户已手动把 config.yaml 的 `description_cap` 改为 1000**
 
 ### 下一步建议（按优先级）
 | 优先级 | 任务 | 说明 |
 |--------|------|------|
-| P1 | `concurrency_limit` 配置化 | 当前硬编码 4，从 config.yaml 读取 |
-| P1 | 调小 `description_cap: 2000 → 1000` | 实际只生成 1000-1300 chars，可能再省 2-5s |
+| ✅ P1 | ~~`concurrency_limit` 配置化~~ | **已完成**：Config + HandlerDeps + main 全链路打通，NewHandler 兜底默认 4 |
+| ✅ P1 | ~~调小 `description_cap: 2000 → 1000`~~ | **已完成**：loader 默认值 + config.example.yaml 同步更新，用户 config.yaml 已改 |
 | P2 | 自适应限流 | 根据 MiMo 响应时间动态调整并发度 |
 | P3 | 多 vision provider | 抽象为 provider 池，支持故障转移 |
 
@@ -176,9 +183,10 @@ vision:
   model: "mimo-v2.5"
   timeout: "60s"
   large_image_timeout: "120s"
-  description_cap: 2000
+  description_cap: 1000
 cache:
   max_entries: 500
+concurrency_limit: 4
 fail_open: true
 log_level: "debug"
 ```
@@ -212,7 +220,7 @@ go test -race -v -run TestHandler_ ./proxy/
 
 测试覆盖：
 - `proxy/handler_test.go` — 基础代理逻辑
-- `proxy/handler_concurrency_test.go` — errgroup 并行（5 图 × 2s mock，验证 4+1 批次）
+- `proxy/handler_concurrency_test.go` — errgroup 并行（5 图 × 2s mock，验证 4+1 批次）+ concurrency_limit 配置化（limit=2 + 3 图 × 1s，验证配置真实生效）
 - `proxy/handler_singleflight_test.go` — singleflight 去重（stampede / cross-request / ctx 隔离）
 - `vision/client_test.go` — MiMo Anthropic API 调用
 - `messages/*_test.go` — 请求解析/改写/校验
@@ -235,8 +243,8 @@ c130070 feat(observability): add per-goroutine and errgroup-level logs
 
 | 优先级 | 方向 | 说明 |
 |--------|------|------|
-| P1 | `concurrency_limit` 配置化 | 当前硬编码 4，可从 config.yaml 读取 |
-| P1 | 调小 `description_cap` | 当前 2000，实际只生成 1000-1300 chars，降到 1000 可能再省 2-5s |
+| ✅ 完成 | ~~`concurrency_limit` 配置化~~ | 已从 config.yaml 读取，NewHandler 兜底默认 4（commit 待提交） |
+| ✅ 完成 | ~~调小 `description_cap`~~ | 默认值已降至 1000，config.example.yaml 同步更新，用户 config.yaml 已改 |
 | P2 | 自适应限流 | 根据 MiMo 响应时间动态调整并发度 |
 | P2 | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P3 | 多 vision provider 支持 | 当前硬编码 MiMo，可抽象为 provider 池 |
