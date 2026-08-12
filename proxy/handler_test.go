@@ -257,3 +257,69 @@ func labelKey(labels []*dto.LabelPair) string {
 	}
 	return strings.Join(parts, ",")
 }
+
+func TestHandler_ValidationErrors(t *testing.T) {
+	up := fakeUpstream(t, nil)
+	defer up.Close()
+
+	deps := HandlerDeps{
+		UpstreamBaseURL:     strings.TrimSuffix(up.URL, "/"),
+		VisionProvider:      &mockVisionProvider{desc: "test"},
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		Log:                 slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+	h := NewHandler(deps)
+
+	// 缺少 model → 400
+	t.Run("missing model", func(t *testing.T) {
+		reqBody := `{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
+		rr := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("want 400 for missing model, got %d", rr.Code)
+		}
+		if !strings.Contains(rr.Body.String(), "validation failed") {
+			t.Errorf("want validation error, got: %s", rr.Body.String())
+		}
+	})
+
+	// 无效 role → 400
+	t.Run("invalid role", func(t *testing.T) {
+		reqBody := `{"model":"test","messages":[{"role":"system","content":[{"type":"text","text":"hi"}]}]}`
+		rr := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("want 400 for invalid role, got %d", rr.Code)
+		}
+	})
+
+	// 无效媒体类型 → 400
+	t.Run("invalid media type", func(t *testing.T) {
+		reqBody := `{"model":"test","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/bmp","data":"abc"}}]}]}`
+		rr := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("want 400 for invalid media type, got %d", rr.Code)
+		}
+	})
+
+	// data: 前缀 → 400
+	t.Run("data prefix in base64", func(t *testing.T) {
+		reqBody := `{"model":"test","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"data:image/png;base64,abc"}}]}]}`
+		rr := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("want 400 for data: prefix, got %d", rr.Code)
+		}
+	})
+}

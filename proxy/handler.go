@@ -115,6 +115,18 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			"body_bytes", len(rawBody),
 		)
 
+		// 2.5) 校验请求结构
+		if verr := req.Validate(); verr != nil {
+			log.Warn("request validation failed",
+				"err", verr,
+				"body_bytes", len(rawBody),
+			)
+			statusCode = http.StatusBadRequest
+			http.Error(w, "validation failed: "+verr.Error(), http.StatusBadRequest)
+			h.recordRequestMetrics(r.Method, route, statusCode, requestStart)
+			return
+		}
+
 		// 3) 找图
 		imgs := messages.FindImageBlocks(&req)
 		var totalImageBytes int64
