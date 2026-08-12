@@ -20,6 +20,7 @@ import (
 	"github.com/ROM4n2/blind-llm-eyes/messages"
 	"github.com/ROM4n2/blind-llm-eyes/metrics"
 	"github.com/ROM4n2/blind-llm-eyes/vision"
+	"golang.org/x/sync/errgroup"
 )
 
 // HandlerDeps 是 Handler 的依赖（用 struct 注入，方便测试替换 mock）。
@@ -144,105 +145,123 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			"is_large_request", totalImageBytes >= h.deps.LargeImageThreshold,
 		)
 
-		// 4) 逐个图：查缓存 → 未命中调视觉
+		// 4) 并行处理图片：查缓存 → 未命中调视觉
+		// 用 errgroup 并发执行，fail_open=false 时首个 vision 失败会 cancel 其他 in-flight 调用。
+		g, gctx := errgroup.WithContext(r.Context())
+		g.SetLimit(4) // 限制并发，避免一次请求里大量图片打爆 MiMo
+
 		for i, blk := range imgs {
-			imgStart := time.Now()
-			hash, herr := cache.HashFromBase64Data(blk.Source.Data)
-			rawBytes, _ := base64.StdEncoding.DecodeString(blk.Source.Data)
-			imageSize := int64(len(rawBytes))
-			isLarge := imageSize >= h.deps.LargeImageThreshold
+			i, blk := i, blk // 闭包捕获
+			g.Go(func() error {
+				imgStart := time.Now()
+				hash, herr := cache.HashFromBase64Data(blk.Source.Data)
+				rawBytes, _ := base64.StdEncoding.DecodeString(blk.Source.Data)
+				imageSize := int64(len(rawBytes))
+				isLarge := imageSize >= h.deps.LargeImageThreshold
 
-			log.Debug("processing image block",
-				"index", i,
-				"data_len", len(blk.Source.Data),
-				"image_size_bytes", imageSize,
-				"media_type", blk.Source.MediaType,
-				"is_large", isLarge,
-				"hash", hash,
-				"hash_err", fmt.Sprintf("%v", herr),
-			)
+				log.Debug("processing image block",
+					"index", i,
+					"data_len", len(blk.Source.Data),
+					"image_size_bytes", imageSize,
+					"media_type", blk.Source.MediaType,
+					"is_large", isLarge,
+					"hash", hash,
+					"hash_err", fmt.Sprintf("%v", herr),
+				)
 
-			totalLookups.Add(1)
+				totalLookups.Add(1)
 
-			if herr == nil {
-				if desc, ok := h.deps.Cache.Get(hash); ok {
-					messages.ReplaceImageWithDescription(blk, desc)
-					rewritten.Add(1)
-					cached.Add(1)
-					cacheHits.Add(1)
-					h.recordImageMetric("cached")
-					log.Debug("cache hit for image",
-						"index", i,
-						"hash", hash,
-						"desc_len", len(desc),
-						"cache_elapsed", time.Since(imgStart).String(),
-					)
-					continue
+				if herr == nil {
+					if desc, ok := h.deps.Cache.Get(hash); ok {
+						messages.ReplaceImageWithDescription(blk, desc)
+						rewritten.Add(1)
+						cached.Add(1)
+						cacheHits.Add(1)
+						h.recordImageMetric("cached")
+						log.Debug("cache hit for image",
+							"index", i,
+							"hash", hash,
+							"desc_len", len(desc),
+							"cache_elapsed", time.Since(imgStart).String(),
+						)
+						return nil
+					}
 				}
-			}
 
-			// 缓存 miss / hash 失败 → 调视觉
-			log.Debug("cache miss, calling vision",
-				"index", i,
-				"hash", hash,
-				"image_size_bytes", imageSize,
-				"timeout_override", isLarge,
-			)
+				// 缓存 miss / hash 失败 → 调视觉
+				log.Debug("cache miss, calling vision",
+					"index", i,
+					"hash", hash,
+					"image_size_bytes", imageSize,
+					"timeout_override", isLarge,
+				)
 
-			vStart := time.Now()
-			visionCtx := logging.WithRequestID(r.Context(), requestID)
-			desc, verr := h.deps.VisionProvider.DescribeImage(visionCtx, blk.Source.Data, blk.Source.MediaType, imageSize)
-			visionElapsed := time.Since(vStart)
+				vStart := time.Now()
+				visionCtx := logging.WithRequestID(gctx, requestID)
+				desc, verr := h.deps.VisionProvider.DescribeImage(visionCtx, blk.Source.Data, blk.Source.MediaType, imageSize)
+				visionElapsed := time.Since(vStart)
 
-			if verr != nil {
-				if !h.deps.FailOpen {
-					log.Error("vision call failed, fail_open=false, returning 502",
+				if verr != nil {
+					if !h.deps.FailOpen {
+						log.Error("vision call failed, fail_open=false, returning 502",
+							"index", i,
+							"err", verr,
+							"vision_elapsed", visionElapsed.String(),
+						)
+						h.recordVisionMetric("error", visionElapsed)
+						failed.Add(1)
+						h.recordImageMetric("failed")
+						return fmt.Errorf("vision call failed (index=%d): %w", i, verr)
+					}
+					log.Warn("vision call failed, replacing with placeholder",
 						"index", i,
 						"err", verr,
 						"vision_elapsed", visionElapsed.String(),
+						"image_size_bytes", imageSize,
 					)
-					statusCode = http.StatusBadGateway
-					h.recordVisionMetric("error", visionElapsed)
-					failed.Add(1)
-					h.recordImageMetric("failed")
-					http.Error(w, "vision call failed: "+verr.Error(), http.StatusBadGateway)
-					h.recordRequestMetrics(r.Method, route, statusCode, requestStart)
-					return
+					messages.ReplaceImageWithDescription(blk, "[Image could not be described by vision model]")
+					rewritten.Add(1)
+					h.recordVisionMetric("fail_open", visionElapsed)
+					h.recordImageMetric("rewritten")
+					return nil
 				}
-				log.Warn("vision call failed, replacing with placeholder",
-					"index", i,
-					"err", verr,
-					"vision_elapsed", visionElapsed.String(),
-					"image_size_bytes", imageSize,
-				)
-				messages.ReplaceImageWithDescription(blk, "[Image could not be described by vision model]")
-				rewritten.Add(1)
-				h.recordVisionMetric("fail_open", visionElapsed)
-				h.recordImageMetric("rewritten")
-				continue
-			}
 
-			// 成功
-			if herr == nil {
-				h.deps.Cache.Put(hash, desc)
-				log.Debug("cache populated for image",
+				// 成功
+				if herr == nil {
+					h.deps.Cache.Put(hash, desc)
+					log.Debug("cache populated for image",
+						"index", i,
+						"hash", hash,
+						"desc_len", len(desc),
+					)
+				}
+				messages.ReplaceImageWithDescription(blk, desc)
+				rewritten.Add(1)
+				h.recordVisionMetric("success", visionElapsed)
+				h.recordImageMetric("rewritten")
+				log.Info("image block processed successfully",
 					"index", i,
-					"hash", hash,
+					"image_size_bytes", imageSize,
+					"is_large", isLarge,
+					"vision_elapsed", visionElapsed.String(),
 					"desc_len", len(desc),
+					"desc_preview", truncate(desc, 80),
 				)
-			}
-			messages.ReplaceImageWithDescription(blk, desc)
-			rewritten.Add(1)
-			h.recordVisionMetric("success", visionElapsed)
-			h.recordImageMetric("rewritten")
-			log.Info("image block processed successfully",
-				"index", i,
-				"image_size_bytes", imageSize,
-				"is_large", isLarge,
-				"vision_elapsed", visionElapsed.String(),
-				"desc_len", len(desc),
-				"desc_preview", truncate(desc, 80),
+				return nil
+			})
+		}
+
+		if err := g.Wait(); err != nil {
+			log.Error("image processing failed, returning 502",
+				"err", err,
+				"rewritten", rewritten.Load(),
+				"cached", cached.Load(),
+				"failed", failed.Load(),
 			)
+			statusCode = http.StatusBadGateway
+			http.Error(w, "vision call failed: "+err.Error(), http.StatusBadGateway)
+			h.recordRequestMetrics(r.Method, route, statusCode, requestStart)
+			return
 		}
 
 		// 计算缓存命中率
