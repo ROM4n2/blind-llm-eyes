@@ -103,8 +103,15 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			rewritten.Add(1)
 		}
 
-		// 5) 重新序列化请求体
+		// 5) 如果做过改写，在请求的 system 段追加一条强指令，防止上游模型
+		//    声称"看不到图"或凭空编造。
 		if rewritten.Load() > 0 {
+			postfix := &messages.ContentBlock{
+				Type: "text",
+				Text: "IMPORTANT: Some image blocks in this conversation have been replaced with <BLIND_LLM_EYES_IMAGE>...</BLIND_LLM_EYES_IMAGE> text blocks. Treat the content inside those tags as if you saw the image directly — never reply that you cannot see the image, never guess what might be missing. If the description is insufficient, ask the user to share the original image.",
+			}
+			req.System = append(req.System, *postfix)
+
 			newBody, merr := json.Marshal(&req)
 			if merr != nil {
 				h.deps.Log.Error("re-marshal request failed", "err", merr)

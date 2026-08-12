@@ -30,10 +30,10 @@ func TestReplaceImageWithDescription(t *testing.T) {
 	if blk.Type != "text" {
 		t.Errorf("want type=text, got %s", blk.Type)
 	}
-	if blk.Text != "[Image Description: 这是一张 1x1 红色 PNG 图片]" {
-		t.Errorf("text mismatch: %s", blk.Text)
+	wantPrefix := "<BLIND_LLM_EYES_IMAGE>"
+	if len(blk.Text) < len(wantPrefix) || blk.Text[:len(wantPrefix)] != wantPrefix {
+		t.Errorf("want text to start with %q, got %q", wantPrefix, blk.Text)
 	}
-	// 断言：source 被清空（避免序列化时带冗余字段）
 	if blk.Source != nil {
 		t.Errorf("source should be nil after replace")
 	}
