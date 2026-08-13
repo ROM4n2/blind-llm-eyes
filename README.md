@@ -35,19 +35,33 @@ DeepSeek has no vision. Using it from Claude Code means pasting a screenshot get
 
 ## Quick start
 
-### 1. Build
+Three subcommands do the heavy lifting: `setup` (interactive config), `connect` (wire Claude Code to the proxy), and `start` (run the proxy). The whole flow is download → `setup` → `connect` → `start`.
+
+### 1. Install
+
+Download a precompiled binary from the [releases page](../../releases) (Windows / Linux / macOS, amd64 + arm64), or build from source:
 
 ```bash
+go install github.com/ROM4n2/blind-llm-eyes@latest
+# or, from a checkout:
 go build -o blind-llm-eyes .
 ```
 
-### 2. Configure
+Verify the install:
 
 ```bash
-cp config.example.yaml config.yaml   # then fill in real keys
+blind-llm-eyes version   # blind-llm-eyes <version> (go <runtime>)
 ```
 
-Minimal working config (real values used in production):
+### 2. Configure (`setup`)
+
+Run the interactive wizard. It can import providers from your existing [cc-switch](https://github.com/farion1231/cc-switch) database, then runs a connectivity self-check (`doctor`) before saving:
+
+```bash
+blind-llm-eyes setup
+```
+
+The wizard collects an upstream (text-only) and a vision provider — base URL, API key, and vision model — pings both, and writes `config.yaml`. Prefer manual editing? Copy `config.example.yaml` to `config.yaml` and fill in real keys. Minimal working config:
 
 ```yaml
 listen: "127.0.0.1:8790"
@@ -64,17 +78,35 @@ log_level: "info"
 
 `config.yaml` is git-ignored; `config.example.yaml` is committed with placeholders. Secrets can also be provided via env vars (`BLIND_VISION_API_KEY`, `BLIND_UPSTREAM_BASE_URL`, `BLIND_UPSTREAM_API_KEY`, `BLIND_LISTEN`).
 
-### 3. Run
+### 3. Connect Claude Code (`connect`)
+
+Point Claude Code at the proxy by rewriting `~/.claude/settings.json`'s `env.ANTHROPIC_BASE_URL`:
 
 ```bash
-./blind-llm-eyes -config config.yaml
+blind-llm-eyes connect
 ```
 
-### 4. Point Claude Code at it
+A full backup is written to `~/.claude/.bak-before-connect` (never overwritten on repeat `connect`). Restart Claude Code so it re-reads `settings.json`. Undo with `blind-llm-eyes disconnect` — it restores `settings.json` byte-for-byte from the backup.
 
-Set the provider's `ANTHROPIC_BASE_URL` to `http://127.0.0.1:8790` (via env override in CC Switch, or the provider's base URL setting), then paste a screenshot. The text-only model should now answer questions about the image.
+### 4. Run (`start`)
 
-Verify with a single request:
+```bash
+blind-llm-eyes            # no args = start (backward compat)
+blind-llm-eyes start      # explicit
+blind-llm-eyes -config /path/to/config.yaml
+```
+
+Manage the running proxy:
+
+```bash
+blind-llm-eyes status     # pidfile + GET /healthz → RUNNING / STALE
+blind-llm-eyes stop       # POST /admin/shutdown (token-authed) → graceful drain
+blind-llm-eyes doctor     # full connectivity self-check (upstream + each vision provider)
+```
+
+### 5. Verify
+
+Paste a screenshot into Claude Code — the text-only model should now answer questions about it. Or curl directly:
 
 ```bash
 curl -N http://127.0.0.1:8790/v1/messages \
@@ -86,6 +118,8 @@ curl -N http://127.0.0.1:8790/v1/messages \
 ```
 
 Response header `X-Blind-Llm-Eyes` reports the outcome: `rewritten=1 cached=0`.
+
+> **Note on CC Switch:** set the provider's `ANTHROPIC_BASE_URL` to `http://127.0.0.1:8790`. Do **not** use CC Switch's proxy mode — it truncates image bodies.
 
 ## Configuration reference
 
@@ -156,10 +190,14 @@ The core concurrency follows Go's practical model rather than the slogan: channe
 ## Development
 
 ```bash
-go build ./...     # compile
-go vet ./...       # static checks
-go test -race ./...  # tests with race detector
+make test          # go test -race -count=1 ./...  (the CI gate)
+make vet           # go vet ./...
+make build         # local binary with version ldflags
+make snapshot      # goreleaser build --snapshot — compile all platform targets
+make goreleaser-check  # validate .goreleaser.yaml
 ```
+
+Releasing is tag-driven: push a `v*` tag and the `release` workflow runs `goreleaser release`, publishing archives + checksums to the GitHub release. Maintainers can also run `make release` locally with `GITHUB_TOKEN` set.
 
 The test suite covers parsing/rewrite round-trips (including preserving unknown fields), LRU behavior, vision client against a mock server, the full handler pipeline with mock vision + upstream, concurrency bounds, `singleflight` dedup across requests, and adaptive-limit behavior.
 

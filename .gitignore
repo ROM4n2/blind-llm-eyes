@@ -21,3 +21,6 @@ config-*-test.yaml
 *.test
 *.out
 vendor/
+
+# goreleaser build output
+dist/
