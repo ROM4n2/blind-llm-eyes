@@ -12,9 +12,10 @@ if [ -z "$FILES" ]; then
     exit 0
 fi
 
-# 搜索硬编码的 API key 模式
-# sk- 后跟至少 20 个字母数字字符（覆盖 OpenAI/DeepSeek/Anthropic/MiMo 等）
-PATTERN='sk-[A-Za-z0-9]{20,}'
+# 搜索硬编码的 API key 模式（本机全局 CLAUDE.md 记录了同款标准，保持同步）
+# 覆盖常见 key 家族：sk- (OpenAI/DeepSeek/Anthropic/MiMo)、AKIA (AWS)、ghp_/github_pat_ (GitHub)、
+# AIza (Google)、xoxb (Slack)、JWT (eyJ...)、PEM 私钥
+PATTERN='(sk-[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,}|AIza[A-Za-z0-9_-]{30,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
 
 FOUND=""
 for file in $FILES; do
