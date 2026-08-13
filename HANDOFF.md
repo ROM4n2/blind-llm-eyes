@@ -172,6 +172,7 @@
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
+| **P5** | **上下文感知描述** | **下一迭代规划，详见第 12 节** |
 
 ---
 
@@ -448,6 +449,143 @@ c14d1a5 feat(vision): multi-provider pool with circuit breaker failover
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
+| **P5** | **上下文感知描述** | **下一迭代规划，详见下方第 12 节设计方案** |
+
+---
+
+## 12. P5 设计方案：上下文感知图片描述
+
+> **状态**：规划中，尚未实施。plan 文档（`.trae/documents/plan-tool-result-and-body-limit.md`）中标注为延后的 B 项。
+
+### 问题
+
+当前 `VisionProvider.DescribeImage` 只接收裸图片数据，零对话上下文：
+
+```go
+DescribeImage(ctx context.Context, base64Data, mediaType string, imageSize int64) (string, error)
+```
+
+用户问"这个报错怎么解决？"附了一张截图 → vision provider 只能生成"一个代码编辑器界面"这种通用描述，无法聚焦到报错信息。描述质量受限于"盲描述"。
+
+### 目标
+
+把最近 N 轮对话（user/assistant 交替）的文本提取出来，传给 vision provider，让其生成贴合上下文的图片描述。
+
+### 设计方案
+
+#### 1. 接口扩展（向后兼容）
+
+新增带上下文的方法，保留原方法不变：
+
+```go
+type VisionProvider interface {
+    DescribeImage(ctx context.Context, base64Data, mediaType string, imageSize int64) (string, error)
+
+    // DescribeImageWithContext 带对话上下文描述图片。
+    // contextText 是最近 N 轮对话的纯文本摘要，可为空（等价于 DescribeImage）。
+    // 默认实现：如果 provider 未实现此方法，回退到 DescribeImage。
+    DescribeImageWithContext(ctx context.Context, base64Data, mediaType string, imageSize int64, contextText string) (string, error)
+}
+```
+
+**向后兼容策略**：在 `vision/provider.go` 中定义一个 `BaseProvider` 嵌入结构体，提供 `DescribeImageWithContext` 的默认实现（直接调用 `DescribeImage` 忽略 contextText）。各 provider 可选择 override。
+
+#### 2. 上下文提取（`messages/context.go` 新文件）
+
+```go
+// ExtractConversationContext 从请求中提取最近 N 轮对话的纯文本。
+// 跳过 image 块，只收集 text 块。按时间顺序拼接为 "user: ...\nassistant: ...\n"。
+// maxChars 限制总长度，超出时截断早期对话。
+func ExtractConversationContext(req *Request, recentRounds int, maxChars int) string
+```
+
+- `recentRounds`：默认 3（最近 3 轮 user/assistant 交替）
+- `maxChars`：默认 2000（约 500 tokens，控制 vision 调用成本）
+- 跳过当前正在处理的图片所在消息（避免把图片的 base64 数据当文本）
+- 输出格式：`[user] 前面的问题文本\n[assistant] 上次回答文本\n[user] 当前问题文本`
+
+#### 3. 缓存策略（关键决策）
+
+**方案：缓存 key 仍只 hash 图片内容，不感知上下文。**
+
+理由：
+- 同一张截图在不同对话中复用时（如用户多次追问同一张图），首次生成上下文感知描述后，后续命中缓存直接返回，避免重复 vision 调用
+- 缓存命中率不下降
+- 代价：同一张图在不同上下文下返回首次的描述，可能不完全贴合新上下文
+- 权衡：vision 调用成本高（8-30s + API 费用），缓存命中的价值远大于描述精确度的微小损失
+
+#### 4. handler.go 集成
+
+在 errgroup goroutine 内，调用 `DescribeImageWithContext` 替代 `DescribeImage`：
+
+```go
+// 在 goroutine 闭包外预提取上下文（所有图片共享同一份上下文）
+contextText := messages.ExtractConversationContext(&req, 3, 2000)
+
+// singleflight 闭包内
+res.Desc, res.Err = h.deps.VisionProvider.DescribeImageWithContext(
+    dedupCtx, blk.Source.Data, blk.Source.MediaType, imageSize, contextText,
+)
+```
+
+#### 5. Provider 实现
+
+**MiMo（Anthropic API）**：在 messages 数组中图片消息前插入一个 user text block 携带上下文：
+
+```json
+{
+  "role": "user",
+  "content": [
+    {"type": "text", "text": "对话上下文：\n[user] 这个报错怎么解决？\n[assistant] ..."},
+    {"type": "image", "source": {"type": "base64", ...}}
+  ]
+}
+```
+
+**OpenAI 兼容客户端**：在 `messages` 数组中图片消息前插入一个 text 消息：
+
+```json
+{
+  "role": "user",
+  "content": [
+    {"type": "text", "text": "对话上下文：\n[user] ..."},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+  ]
+}
+```
+
+#### 6. 配置
+
+```yaml
+vision:
+  context_rounds: 3          # 传入最近 N 轮对话，0 = 禁用上下文感知（向后兼容）
+  context_max_chars: 2000    # 上下文文本最大字符数
+```
+
+- `context_rounds: 0` 时完全等价于当前行为（不提取上下文，调用 DescribeImage）
+- 单 provider 模式和多 provider 池模式都支持
+
+#### 7. 文件结构
+
+| 文件 | 改动 | 职责 |
+|------|------|------|
+| `vision/provider.go` | 修改 | 新增 `DescribeImageWithContext` 方法 + `BaseProvider` 默认实现 |
+| `messages/context.go` | **新增** | `ExtractConversationContext` 函数 |
+| `messages/context_test.go` | **新增** | 上下文提取测试（轮数截断 / 字符截断 / 跳过 image / 空对话） |
+| `vision/client.go` | 修改 | MiMo 客户端 override `DescribeImageWithContext` |
+| `vision/openai_client.go` | 修改 | OpenAI 客户端 override `DescribeImageWithContext` |
+| `vision/pool.go` | 修改 | Pool 透传 `DescribeImageWithContext` 到底层 provider |
+| `config/loader.go` | 修改 | 新增 `ContextRounds` / `ContextMaxChars` 字段 |
+| `proxy/handler.go` | 修改 | 预提取上下文 + 调用 `DescribeImageWithContext` |
+| `main.go` | 修改 | 传配置到 HandlerDeps |
+
+#### 8. 风险与注意事项
+
+- **token 成本**：上下文增加 vision 调用的 input tokens，但 2000 字符约 500 tokens，影响可忽略
+- **延迟**：vision 调用本身 8-30s，上下文预提取 < 1ms，不增加可感知延迟
+- **singleflight**：同一张图的 singleflight key 不变（仍只 hash 图片内容），上下文不参与去重 key
+- **向后兼容**：`context_rounds: 0` 完全禁用，行为与当前一致；旧 provider 不实现新方法也能工作（默认实现回退）
+- **上下文泄露**：上下文文本会发送给 vision provider，需确认无敏感信息（与图片本身发送给 vision provider 的风险一致）
 
 ## 10. 环境事实
 
