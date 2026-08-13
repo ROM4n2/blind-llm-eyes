@@ -348,3 +348,225 @@ func TestE2E_AdminShutdown_RejectsMissingToken(t *testing.T) {
 	default:
 	}
 }
+
+// TestE2E_VisionTimeout_FailOpen simulates the MiMo vision endpoint being
+// unreachable (slow response) and verifies that FailOpen=true lets the proxy
+// substitute a placeholder description and keep the request flowing to the
+// upstream. This is the critical resilience path described in the onboarding
+// plan: "fail-open — a failed vision call replaces the image with a placeholder
+// instead of blocking the whole request."
+func TestE2E_VisionTimeout_FailOpen(t *testing.T) {
+	logger := quietLogger()
+	pngB64, _ := redPNGBase64(t)
+
+	// --- Slow vision server: deliberately blocks > client timeout ---
+	var visionCalls int32
+	visionDone := make(chan struct{})
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&visionCalls, 1)
+		// Use select + done channel instead of bare time.Sleep so srv.Close()
+		// doesn't hang waiting for this handler to finish. The 2s delay exceeds
+		// the client's 200ms timeout, guaranteeing a context deadline error.
+		select {
+		case <-time.After(2 * time.Second):
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"content": []map[string]any{
+					{"type": "text", "text": "SHOULD_NOT_APPEAR"},
+				},
+				"stop_reason": "end_turn",
+			})
+		case <-visionDone:
+			// test is cleaning up; just return
+			return
+		}
+	}))
+	defer func() {
+		close(visionDone)
+		visionSrv.Close()
+	}()
+
+	// --- Fake upstream (should still receive the forwarded request with placeholder) ---
+	var upstreamGot []byte
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		upstreamGot = b
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"type\":\"message_start\"}\n\n"))
+		w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstreamSrv.Close()
+
+	// --- Vision client with a short timeout so the 2s server delay triggers a deadline error ---
+	visionClient := vision.NewClient(
+		visionSrv.URL, "test-vision-key", "mimo-v2.5",
+		200*time.Millisecond, 500*time.Millisecond, 1<<20, 300,
+		[]string{"image/png", "image/jpeg", "image/webp", "image/gif"},
+		logger,
+	)
+
+	deps := proxy.HandlerDeps{
+		UpstreamBaseURL:     upstreamSrv.URL,
+		UpstreamAPIKey:      "test-upstream-key",
+		VisionProvider:      visionClient,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true, // <-- the key knob: resilience over correctness
+		LargeImageThreshold: 1 << 20,
+		Log:                 logger,
+	}
+	handler := proxy.NewHandler(deps)
+
+	reqBody := `{"model":"deepseek-chat[1m]","max_tokens":100,"stream":true,` +
+		`"messages":[{"role":"user","content":[` +
+		`{"type":"text","text":"What is in this image?"},` +
+		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + pngB64 + `"}}` +
+		`]}]}`
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(rr, req)
+
+	// 1. FailOpen: the proxy returns 200 (not 502) — the request still succeeds.
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (FailOpen should mask vision timeout)", rr.Code)
+	}
+
+	// 2. Exactly one vision call was attempted (singleflight dedup doesn't change that).
+	if got := atomic.LoadInt32(&visionCalls); got != 1 {
+		t.Errorf("vision calls: got %d, want 1", got)
+	}
+
+	// 3. The upstream received the placeholder text, NOT the vision's delayed response.
+	var upstreamReq map[string]any
+	if err := json.Unmarshal(upstreamGot, &upstreamReq); err != nil {
+		t.Fatalf("unmarshal upstream request: %v\nbody: %s", err, upstreamGot)
+	}
+	msgs := upstreamReq["messages"].([]any)
+	firstMsg := msgs[0].(map[string]any)
+	content := firstMsg["content"].([]any)
+	foundPlaceholder, foundImage := false, false
+	for _, blk := range content {
+		b := blk.(map[string]any)
+		switch b["type"] {
+		case "text":
+			if strings.Contains(b["text"].(string), "Image could not be described") {
+				foundPlaceholder = true
+			}
+			if strings.Contains(b["text"].(string), "SHOULD_NOT_APPEAR") {
+				t.Errorf("upstream body contains delayed vision response that should never arrive")
+			}
+		case "image":
+			foundImage = true
+		}
+	}
+	if !foundPlaceholder {
+		t.Errorf("upstream body missing fail-open placeholder; content=%v", content)
+	}
+	if foundImage {
+		t.Errorf("upstream body still contains an image block (should be replaced by placeholder); content=%v", content)
+	}
+
+	// 4. Model sanitization still works even when vision fails.
+	if got := upstreamReq["model"].(string); got != "deepseek-chat" {
+		t.Errorf("upstream model: got %q, want \"deepseek-chat\" ([1m] stripped)", got)
+	}
+
+	// 5. SSE passthrough still works (upstream was reached successfully).
+	body := rr.Body.String()
+	if !strings.Contains(body, "[DONE]") {
+		t.Errorf("response body missing [DONE]: %q", body)
+	}
+
+	// 6. Header reports the fail-open outcome.
+	if hdr := rr.Header().Get("X-Blind-Llm-Eyes"); !strings.Contains(hdr, "rewritten") {
+		t.Errorf("X-Blind-Llm-Eyes header: got %q, want rewritten count", hdr)
+	}
+}
+
+// TestE2E_VisionTimeout_FailClosed verifies the counterpoint: when
+// FailOpen=false, a vision timeout must surface as HTTP 502 to the client
+// instead of silently substituting a placeholder. This is the "fail loud"
+// mode that callers can opt into when data integrity matters more than
+// availability.
+func TestE2E_VisionTimeout_FailClosed(t *testing.T) {
+	logger := quietLogger()
+	pngB64, _ := redPNGBase64(t)
+
+	var visionCalls int32
+	visionDone := make(chan struct{})
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&visionCalls, 1)
+		select {
+		case <-time.After(2 * time.Second):
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"content": []map[string]any{
+					{"type": "text", "text": "SHOULD_NOT_APPEAR"},
+				},
+				"stop_reason": "end_turn",
+			})
+		case <-visionDone:
+			return
+		}
+	}))
+	defer func() {
+		close(visionDone)
+		visionSrv.Close()
+	}()
+
+	var upstreamCalled int32
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamCalled, 1)
+	}))
+	defer upstreamSrv.Close()
+
+	visionClient := vision.NewClient(
+		visionSrv.URL, "test-vision-key", "mimo-v2.5",
+		200*time.Millisecond, 500*time.Millisecond, 1<<20, 300,
+		[]string{"image/png", "image/jpeg", "image/webp", "image/gif"},
+		logger,
+	)
+
+	deps := proxy.HandlerDeps{
+		UpstreamBaseURL:     upstreamSrv.URL,
+		UpstreamAPIKey:      "test-upstream-key",
+		VisionProvider:      visionClient,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            false, // <-- fail-closed: vision failure = request failure
+		LargeImageThreshold: 1 << 20,
+		Log:                 logger,
+	}
+	handler := proxy.NewHandler(deps)
+
+	reqBody := `{"model":"deepseek-chat[1m]","max_tokens":100,"stream":true,` +
+		`"messages":[{"role":"user","content":[` +
+		`{"type":"text","text":"What is in this image?"},` +
+		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + pngB64 + `"}}` +
+		`]}]}`
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(rr, req)
+
+	// 1. FailClosed: the proxy returns 502 (not 200) — the request fails loudly.
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status: got %d, want 502 (FailClosed should surface vision timeout)", rr.Code)
+	}
+
+	// 2. Exactly one vision call was attempted.
+	if got := atomic.LoadInt32(&visionCalls); got != 1 {
+		t.Errorf("vision calls: got %d, want 1", got)
+	}
+
+	// 3. The upstream was never reached — the request was terminated before forwarding.
+	if got := atomic.LoadInt32(&upstreamCalled); got != 0 {
+		t.Errorf("upstream calls: got %d, want 0 (should not forward on fail-closed)", got)
+	}
+
+	// 4. The response body mentions the vision failure.
+	if body := rr.Body.String(); !strings.Contains(body, "vision call failed") {
+		t.Errorf("response body missing failure detail: %q", body)
+	}
+}
