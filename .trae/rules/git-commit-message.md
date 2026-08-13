@@ -5,7 +5,9 @@ scene: git_message
 
 # Git Commit Message Convention
 
-Write every commit message in **English**, in the format:
+Write every commit message **entirely in English** — no mixed languages. The
+summary, body, and every field must be English; never mix Chinese and English
+in a single message. Use the format:
 
     <type>(<scope>): <summary>
 
