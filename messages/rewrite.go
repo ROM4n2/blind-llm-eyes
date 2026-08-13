@@ -30,3 +30,29 @@ func ReplaceImageWithDescription(blk *ContentBlock, description string) {
 		blk.raw = newRaw
 	}
 }
+
+// NormalizeSystemMessages 把 messages 数组中 role=="system" 的消息提取出来，
+// 合并到顶层 system 字段。某些客户端（如 Claude Code）偶尔会将 system 消息
+// 放入 messages 数组而非顶层 system 字段，这违反 Anthropic Messages API 规范，
+// 会导致上游 400 错误。此函数在 Validate 之前调用以规范化请求结构。
+// 返回被移动的 system 消息数量（>0 表示请求体需要重新序列化）。
+func NormalizeSystemMessages(req *Request) int {
+	if len(req.Messages) == 0 {
+		return 0
+	}
+	var filtered []Message
+	moved := 0
+	for i := range req.Messages {
+		if req.Messages[i].Role == "system" {
+			// 把 system 消息的 content blocks 追加到顶层 system 字段
+			req.System = append(req.System, req.Messages[i].Content...)
+			moved++
+		} else {
+			filtered = append(filtered, req.Messages[i])
+		}
+	}
+	if moved > 0 {
+		req.Messages = filtered
+	}
+	return moved
+}

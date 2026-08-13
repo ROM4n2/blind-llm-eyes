@@ -136,6 +136,16 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			"body_bytes", len(rawBody),
 		)
 
+		// 2.4) 规范化：把 messages 数组中 role=="system" 的消息提取到顶层 system 字段
+		systemMoved := messages.NormalizeSystemMessages(&req)
+		if systemMoved > 0 {
+			log.Info("system messages normalized",
+				"moved_count", systemMoved,
+				"messages_after", len(req.Messages),
+				"system_blocks_after", len(req.System),
+			)
+		}
+
 		// 2.5) 校验请求结构
 		if verr := req.Validate(); verr != nil {
 			log.Warn("request validation failed",
@@ -389,12 +399,16 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 				Text: "IMPORTANT: Some image blocks in this conversation have been replaced with <BLIND_LLM_EYES_IMAGE>...</BLIND_LLM_EYES_IMAGE> text blocks. Treat the content inside those tags as if you saw the image directly — never reply that you cannot see the image, never guess what might be missing. If the description is insufficient, ask the user to share the original image.",
 			}
 			req.System = append(req.System, postfix)
+		}
 
+		// 6) 改写了图片或规范化了 system 消息 → 重新序列化请求体
+		if rewritten.Load() > 0 || systemMoved > 0 {
 			newBody, merr := json.Marshal(&req)
 			if merr != nil {
 				log.Error("re-marshal request failed",
 					"err", merr,
 					"rewritten_count", rewritten.Load(),
+					"system_moved", systemMoved,
 				)
 			} else {
 				rawBody = newBody
@@ -402,6 +416,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 					"original_bytes", len(rawBody),
 					"new_bytes", len(newBody),
 					"rewritten_count", rewritten.Load(),
+					"system_moved", systemMoved,
 				)
 			}
 		}
