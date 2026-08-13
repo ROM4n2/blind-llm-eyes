@@ -10,9 +10,10 @@ const (
 	RoleUser      = "user"
 	RoleAssistant  = "assistant"
 
-	ContentTypeText   = "text"
-	ContentTypeImage  = "image"
-	ContentTypeThinking = "thinking"
+	ContentTypeText      = "text"
+	ContentTypeImage     = "image"
+	ContentTypeThinking  = "thinking"
+	ContentTypeToolResult = "tool_result"
 
 	ImageSourceTypeBase64 = "base64"
 )

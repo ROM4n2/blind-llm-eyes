@@ -1,11 +1,11 @@
 # 交接文档 — blind-llm-eyes 视觉代理
 
-> **最近更新**：2026-08-13（生产冒烟测试 + 配置调优 + 已推送远程）
-> **状态**：核心功能完成，性能优化已完成四轮（MiMo thinking 关闭 + errgroup 并行 + singleflight 去重 + AIMD 自适应限流），P1 配置化 + P2 自适应限流均已完成并通过生产冒烟测试，配置已基于实测数据调优，已推送到 origin/master
+> **最近更新**：2026-08-13（P3 多 Provider 池 + 熔断故障转移 + 安全修复 + 日志增强）
+> **状态**：MVP → P1 → P2 → P3 全部完成。多 Vision Provider 池支持优先级故障转移 + 三态熔断器 + OpenAI 兼容客户端，端到端验证通过。安全修复：API key 泄露清理 + pre-commit hook 防护。已推送到 origin/master（git 历史已用 git filter-repo 清理）
 
 ---
 
-## 0. 本次会话工作总结（50 轮对话）
+## 0. 本次会话工作总结
 
 ### 起点
 用户从上一个会话交接到此工作区，项目已有基础骨架（config/messages/proxy/vision/cache 五包），但 MiMo 视觉调用耗时过长（单图 31s），端到端体验差。
@@ -82,13 +82,48 @@
     - 同步更新 config.example.yaml / config/loader.go / proxy/adaptive.go 兜底默认值
     - `go build` / `go vet` / `go test -race ./proxy/` 全绿
 
+14. **P3 多 Provider 池 + 熔断故障转移** (commit `c14d1a5`)
+    - 新增 `vision/pool.go`：Provider 池实现 `VisionProvider` 接口，按优先级遍历，跳过熔断器开启的 provider，失败时自动故障转移
+    - 新增 `vision/circuit_breaker.go`：三态熔断器（Closed → Open → Half-open），线程安全，半开态单试探请求保护
+    - 新增 `vision/openai_client.go`：通用 OpenAI 兼容客户端（`/v1/chat/completions` + `image_url` 格式）
+    - `config/loader.go` 新增 `ProviderCfg` + `CircuitBreakerCfg`，向后兼容（`vision_providers` 缺省 = 单 provider 模式，行为不变）
+    - `metrics/metrics.go` 新增 4 个 per-provider 指标：`provider_calls_total{provider,result}` / `provider_duration_seconds{provider}` / `circuit_breaker_state{provider}` / `failover_events_total`
+    - `main.go` 条件构造：`vision_providers` 存在时构建 Pool，否则单 provider 直连
+    - **handler.go 零改动**：Pool 透明注入 `HandlerDeps.VisionProvider`，singleflight / errgroup / AIMD 全部不变
+    - 19 个新测试全部通过（`go test -race`）
+
+15. **P3 详细日志埋点** (commit `c8dd7b9`)
+    - `CircuitBreaker.Stats()` 方法暴露完整状态快照（State / ConsecutiveFails / FailureThreshold / OpenedAgo / HalfOpenInFlight）
+    - Pool.DescribeImage 新增 9 个日志 stage：`pool_start` / `provider_call_start` / `cb_transition` / `cb_opened` / `cb_recovered` / `provider_skipped`（增强）/ `provider_failover`（增强）/ `pool_complete` / `pool_exhausted`（增强）
+    - 熔断器状态转换全链路可追踪：Closed→Open / Open→HalfOpen / HalfOpen→Closed / HalfOpen→Open
+
+16. **安全修复：API key 泄露清理 + 防护** (commit `ecdcb8c`, `c8dd7b9`)
+    - `smoke-fill-samples.py` 硬编码 DeepSeek key → 改为 `os.environ.get("BLIND_LLM_EYES_API_KEY")`
+    - `.githooks/pre-commit`：扫描暂存文件中 `sk-[A-Za-z0-9]{20,}` 模式，匹配则阻止提交
+    - `git config core.hooksPath .githooks` 已配置
+    - `.gitignore` 增强：`config-*-test.yaml` + `.trae/` IDE 产物
+    - **git 历史清理**：`git filter-repo --replace-text` 将 40 个 commit 中的泄露 key 替换为 `REDACTED_USE_ENV_VAR`，已 force push
+
+17. **Bug 修复：system message 规范化** (commit `14858c0`)
+    - Claude Code 发送 `role:system` 消息在 `messages` 数组中（非顶层 `system` 字段），导致 `Validate()` 拒绝 → 400 错误
+    - 新增 `messages.NormalizeSystemMessages()`：提取 `role:system` 条目合并到顶层 `system` 字段
+    - handler 在 `Validate()` 前调用，确保对话正常工作
+
+18. **P3 端到端验证**
+    - 使用 `config-failover-test.yaml`（primary 用假 key → 401 快速失败，fallback 用真实 MiMo key）
+    - 5 张不同颜色 8x8 PNG 验证完整链路：
+      - Req 1-3：primary 失败 → 故障转移到 fallback → 成功
+      - 第 3 次失败后熔断器开启（threshold=3）
+      - Req 4-5：primary 被跳过（circuit open），直接命中 fallback
+    - Metrics 验证：`circuit_breaker_state{provider="mimo-broken"}=1`(OPEN) / `failover_events_total=3` / `provider_calls_total{result="skipped"}=2`
+
 ### 当前状态
-- **P1 配置化 + P2 自适应限流 + 冒烟测试 + 配置调优均已完成并推送**（origin/master 同步）
+- **MVP → P1 → P2 → P3 全部完成**，已推送到 origin/master
 - **go test -race ./... 全绿**，`go build` / `go vet` 零警告
-- **服务可运行**：`.\blind-llm-eyes.exe` 启动后监听 127.0.0.1:8790
-- **端到端验证通过**：2 图请求 19.8s，MiMo 阶段 14.2s，DeepSeek 阶段 5.5s
-- **自适应限流双重验证通过**：mock MiMo 三阶段 + 真实 MiMo 20 样本冒烟
-- **配置已调优**：基于 20 样本实测数据，参数已从保守值调整为最优值
+- **服务可运行**：`go run . -config config.yaml` 启动后监听 127.0.0.1:8790
+- **多 Provider 池已验证**：故障转移 + 熔断器 + 跳过逻辑端到端通过
+- **安全防护已就位**：pre-commit hook 阻止 key 泄露，git 历史已清理
+- **handler.go 零改动**：P3 透明注入 Pool，singleflight / errgroup / AIMD 全部不变
 
 ### 下一步建议（按优先级）
 | 优先级 | 任务 | 说明 |
@@ -96,8 +131,12 @@
 | ✅ P1 | ~~`concurrency_limit` 配置化~~ | **已完成**：Config + HandlerDeps + main 全链路打通 |
 | ✅ P1 | ~~调小 `description_cap: 2000 → 1000`~~ | **已完成**：loader 默认值 + config.example.yaml 同步更新 |
 | ✅ P2 | ~~自适应限流~~ | **已完成**：AIMD + 单测 + 集成测试 + 端到端验证 + 冒烟测试 + 配置调优 |
-| ✅ | ~~git push~~ | **已完成**：5 个提交已推送到 origin/master |
-| P3 | 多 vision provider | 抽象为 provider 池，支持故障转移 |
+| ✅ P3 | ~~多 vision provider 池~~ | **已完成**：Provider 池 + 熔断器 + OpenAI 客户端 + 故障转移验证 |
+| ✅ | ~~安全修复~~ | **已完成**：key 泄露清理 + pre-commit hook + git 历史清理 |
+| ✅ | ~~system message 修复~~ | **已完成**：NormalizeSystemMessages 修复 Claude Code 400 错误 |
+| — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
+| P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
+| P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
 
 ---
 
@@ -114,11 +153,16 @@ Claude Code ──POST /v1/messages──▶ blind-llm-eyes (127.0.0.1:8790)
                                     ├─ 查 LRU 缓存 (SHA-256 hash)
                                     │   ├─ 命中 → 直接用缓存的描述
                                     │   └─ miss → singleflight.Do(hash)
-                                    │              ├─ 首个调用者 → MiMo vision API → 写缓存
+                                    │              ├─ 首个调用者 → Pool.DescribeImage → 写缓存
                                     │              └─ 等待者 → 共享结果
                                     ├─ errgroup 并行处理多图 (concurrency_limit=6, adaptive [1,12])
                                     ├─ 替换 image block → text block
                                     └─ 转发给 DeepSeek (anthropic 端点) ──▶ 流式响应透传
+
+Pool 内部（vision/pool.go）:
+  ┌─ Provider[0] (priority=1, e.g. MiMo)  ← CircuitBreaker: Closed/Open/Half-open
+  ├─ Provider[1] (priority=2, e.g. GPT-4o) ← CircuitBreaker: Closed/Open/Half-open
+  └─ ...按优先级遍历，跳过熔断器开启的，失败时自动故障转移
 ```
 
 ### 关键设计决策
@@ -131,25 +175,36 @@ Claude Code ──POST /v1/messages──▶ blind-llm-eyes (127.0.0.1:8790)
 | 缓存写入时机 | singleflight fn 内部 | 避免等待者比执行者更早 return 导致下批 miss |
 | ctx 隔离 | fn 用 context.Background + 120s | 调用者取消不影响其他等待者 |
 | 自适应限流 | AIMD + P90 反馈 | 静态并发度无法应对 MiMo 延迟波动（8s~38s），动态调整防打爆 / 提吞吐 |
+| Provider 池 | Pool 实现 VisionProvider 接口 | handler.go 零改动，singleflight/errgroup/AIMD 全部不变，Pool 透明注入 |
+| 熔断器 | 三态（Closed/Open/Half-open） | 连续失败达阈值 → 开启跳过；reset_timeout 后半开试探；成功恢复 / 失败重开 |
+| 故障转移策略 | 优先级 failover | 简单可靠，backup 仅在 primary 故障时启用；加权 LB 留作 P4 |
+| 配置兼容 | `vision_providers` 缺省 = 单 provider | 向后兼容，现有 config.yaml 无需改动 |
 
 ## 3. 代码结构
 
 ```
 blind-llm-eyes/
-├── main.go                     # 入口 + graceful shutdown
+├── main.go                     # 入口 + graceful shutdown + Pool/单 provider 条件构造
 ├── config.yaml                 # 运行配置（gitignore，见 config.example.yaml）
+├── .githooks/pre-commit        # API key 泄露检测（sk-[A-Za-z0-9]{20,}）
 ├── config/
-│   └── loader.go               # YAML 配置加载
+│   └── loader.go               # YAML 配置加载 + ProviderCfg + CircuitBreakerCfg
 ├── messages/                   # Anthropic Messages API 请求解析/改写
 │   ├── content.go              # ContentBlock 结构
 │   ├── parse.go                # 请求解析
-│   ├── rewrite.go              # 图片块替换为文字
+│   ├── rewrite.go              # 图片块替换为文字 + NormalizeSystemMessages
+│   ├── normalize_test.go       # system message 规范化测试
 │   └── validate.go             # 请求校验
-├── vision/                     # MiMo 视觉客户端
-│   ├── client.go               # Anthropic API 调用 + WebP 转换 + httptrace
-│   └── provider.go             # VisionProvider 接口
+├── vision/                     # Vision Provider 层
+│   ├── provider.go             # VisionProvider 接口
+│   ├── client.go               # MiMo 客户端（Anthropic API + WebP + httptrace）
+│   ├── openai_client.go        # 通用 OpenAI 兼容客户端（/v1/chat/completions）
+│   ├── pool.go                 # 多 Provider 池（优先级 failover + 详细日志）
+│   ├── circuit_breaker.go      # 三态熔断器 + Stats() 状态快照
+│   ├── pool_test.go            # 池测试（优先级/故障转移/熔断/并发）
+│   └── circuit_breaker_test.go # 熔断器测试（状态转换/半开/并发）
 ├── proxy/
-│   ├── handler.go              # 核心代理逻辑（errgroup + singleflight）
+│   ├── handler.go              # 核心代理逻辑（errgroup + singleflight + AIMD）
 │   ├── adaptive.go             # AIMD 自适应限流控制器
 │   └── passthrough.go          # 流式响应透传
 ├── cache/
@@ -158,7 +213,7 @@ blind-llm-eyes/
 ├── logging/
 │   └── logging.go              # 异步 JSON 日志 + request_id 传播
 └── metrics/
-    └── metrics.go              # Prometheus 指标
+    └── metrics.go              # Prometheus 指标（含 per-provider 指标）
 ```
 
 ## 4. 性能优化历程
@@ -210,6 +265,8 @@ blind-llm-eyes/
 
 `config.example.yaml` 是模板，实际 `config.yaml` 被 gitignore。关键配置：
 
+### 单 Provider 模式（向后兼容）
+
 ```yaml
 listen: "127.0.0.1:8790"
 upstream:
@@ -238,6 +295,36 @@ adaptive_concurrency:
   increase_step: 1
   decrease_ratio: 0.75
   error_threshold: 0.10        # 错误率 > 10% → 触发降并发
+```
+
+### 多 Provider 池模式（P3 新增，opt-in）
+
+```yaml
+# vision: 块在 vision_providers 存在时被忽略
+vision_providers:
+  - name: "mimo"                    # 标识符（用于日志/metrics）
+    type: "mimo"                     # "mimo" = Anthropic Messages API
+    priority: 1                      # 数值越小越先尝试
+    base_url: "https://api.xiaomimimo.com/anthropic"
+    api_key: "sk-..."
+    model: "mimo-v2.5"
+    timeout: "60s"
+    description_cap: 1000
+    circuit_breaker:
+      failure_threshold: 5           # 连续失败 5 次 → 熔断
+      reset_timeout: "30s"           # 30s 后半开试探
+
+  - name: "openai-fallback"
+    type: "openai_compatible"        # "openai_compatible" = /v1/chat/completions
+    priority: 2
+    base_url: "https://api.openai.com/v1"
+    api_key: "sk-..."
+    model: "gpt-4o"
+    timeout: "30s"
+    description_cap: 1000
+    circuit_breaker:
+      failure_threshold: 3
+      reset_timeout: "30s"
 ```
 
 ## 6. 使用方式
@@ -280,27 +367,37 @@ go test -race -v -run TestHandler_ ./proxy/
 - `test-adaptive-prod.py` / `test-adaptive.ps1` — 自适应限流端到端验证脚本（mock MiMo + 三阶段 AIMD 验证）
 - `smoke-fill-samples.py` — 生产冒烟测试脚本（9 请求 × 2 唯一图 = 18 样本填窗口）
 - `SMOKE_TEST_REPORT.md` — 生产冒烟测试报告（20 样本完整延迟数据 + AIMD 决策日志）
+- `vision/pool_test.go` — Provider 池测试（优先级排序 / 故障转移 / 熔断跳过 / 全部失败 / 并发安全）
+- `vision/circuit_breaker_test.go` — 熔断器测试（状态转换 / 半开单试探 / reset_timeout / 并发安全）
+- `messages/normalize_test.go` — system message 规范化测试（5 场景：无 system / 单条 / 多条 / 空内容 / JSON 往返）
+- `test-failover.py` — P3 故障转移端到端验证脚本（5 张不同图片验证熔断器开启→跳过链路）
 
-## 8. 最近 6 个 commit
+## 8. 最近 commit
 
 ```
-ccd5249 chore(config): tune adaptive parameters based on smoke test data
-b651276 docs: add adaptive concurrency smoke test report
-fb9d585 docs: update handoff with P2 adaptive concurrency completion
-e60e098 test: add adaptive concurrency end-to-end validation scripts
-f6f58dc feat(proxy): implement adaptive concurrency limiter with AIMD control
-1990954 feat(proxy): add adaptive concurrency limiter based on MiMo latency
+c8dd7b9 chore(pre-commit): update api key detection pattern to cover more services
+c14d1a5 feat(vision): multi-provider pool with circuit breaker failover
+14858c0 fix(proxy): normalize system messages before validation
+ecdcb8c chore: remove leaked API key and add pre-commit guard
+04665a0 chore: initial project setup and configuration
+02ecff5 docs: update handoff for session handoff
+c5cd7a6 chore(config): tune adaptive parameters based on smoke test data
+870981c docs: add adaptive concurrency smoke test report
 ```
+
+> 注：commit hash 在 git filter-repo 清理后已变更，旧 hash 不再有效。
 
 ## 9. 已知限制 & 后续方向
 
 | 优先级 | 方向 | 说明 |
 |--------|------|------|
-| ✅ 完成 | ~~`concurrency_limit` 配置化~~ | 已从 config.yaml 读取，兜底默认 6 |
-| ✅ 完成 | ~~调小 `description_cap`~~ | 默认值已降至 1000，config.example.yaml 同步更新 |
-| ✅ 完成 | ~~P2 自适应限流~~ | AIMD 控制器 + 5 单测 + 跨请求集成测试 + 端到端验证 + 冒烟测试 + 配置调优，均已推送 |
+| ✅ 完成 | ~~P1 配置化~~ | concurrency_limit + description_cap 从 config.yaml 读取 |
+| ✅ 完成 | ~~P2 自适应限流~~ | AIMD 控制器 + 单测 + 集成测试 + 端到端验证 + 冒烟测试 + 配置调优 |
+| ✅ 完成 | ~~P3 多 Provider 池~~ | Provider 池 + 熔断器 + OpenAI 客户端 + 故障转移验证 + 详细日志 |
+| ✅ 完成 | ~~安全修复~~ | key 泄露清理 + pre-commit hook + git 历史清理 |
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
-| P3 | 多 vision provider 支持 | 当前硬编码 MiMo，可抽象为 provider 池。`VisionProvider` 接口已就绪，P3 主要是加池层 + 多 provider config + 健康检查/熔断 |
+| P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
+| P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
 
 ## 10. 环境事实
 
@@ -309,12 +406,16 @@ f6f58dc feat(proxy): implement adaptive concurrency limiter with AIMD control
 - **CC Switch 代理模式会截断图片数据**（316→188 bytes），必须用 `ANTHROPIC_BASE_URL` 直连
 - **MiMo 端点**：`https://api.xiaomimimo.com/anthropic`（Anthropic 格式），不是 `/v1`（OpenAI 格式）
 - **真实 API key** 在 `config.yaml`（gitignore），不在代码里
+- **pre-commit hook** 已配置（`git config core.hooksPath .githooks`），扫描 `sk-[A-Za-z0-9]{20,}` 阻止 key 泄露
+- **git 历史已清理**：旧 commit 中的 API key 已用 `git filter-repo` 替换为 `REDACTED_USE_ENV_VAR`
+- **测试脚本用环境变量**：`smoke-fill-samples.py` 和 `test-failover.py` 通过 `BLIND_LLM_EYES_API_KEY` 环境变量读取 key
 
 ## 11. 相关文档
 
 | 文件 | 内容 |
 |------|------|
 | [CONCURRENCY_DESIGN.md](./CONCURRENCY_DESIGN.md) | errgroup 并发优化 + concurrency_limit 设计文档 |
+| [docs/superpowers/specs/2026-08-12-multi-vision-provider-pool-design.md](./docs/superpowers/specs/2026-08-12-multi-vision-provider-pool-design.md) | P3 多 Provider 池设计规格文档 |
 | [vision-fallback-architecture.md](./vision-fallback-architecture.md) | 原始架构设计 v1 |
 | [vision-fallback-notes.md](./vision-fallback-notes.md) | 决策时间线 + 调研记录 |
 | [CONTEXT.md](./CONTEXT.md) | 项目上下文 |

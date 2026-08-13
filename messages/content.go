@@ -79,9 +79,11 @@ type ContentBlock struct {
 	raw json.RawMessage // 原始 JSON，Marshal 时优先使用
 
 	// 解析后的常用字段（非穷举）
-	Type   string       `json:"-"`
-	Text   string       `json:"-"`
-	Source *ImageSource `json:"-"`
+	Type    string         `json:"-"`
+	Text    string         `json:"-"`
+	Source  *ImageSource   `json:"-"`
+	Content MessageContent `json:"-"` // tool_result 的嵌套 content 块
+	IsError bool           `json:"-"` // tool_result 错误标志
 }
 
 // UnmarshalJSON 保存原始 JSON，并解析常用字段。
@@ -90,9 +92,11 @@ func (b *ContentBlock) UnmarshalJSON(data []byte) error {
 
 	// 解析常用字段到结构体字段，方便业务代码使用
 	var aux struct {
-		Type   string       `json:"type"`
-		Text   string       `json:"text"`
-		Source *ImageSource `json:"source"`
+		Type    string         `json:"type"`
+		Text    string         `json:"text"`
+		Source  *ImageSource   `json:"source"`
+		Content MessageContent `json:"content"`
+		IsError bool           `json:"is_error"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
@@ -100,16 +104,46 @@ func (b *ContentBlock) UnmarshalJSON(data []byte) error {
 	b.Type = aux.Type
 	b.Text = aux.Text
 	b.Source = aux.Source
+	b.Content = aux.Content
+	b.IsError = aux.IsError
 	return nil
 }
 
 // MarshalJSON 输出保存的原始 JSON。
+// tool_result 特殊处理：从 raw 提取所有原始字段，只覆盖 content（嵌套 image
+// 替换后 raw 中的旧 content 已过期）。保留 tool_use_id 等未知字段。
 // 如果 raw 为空（极端情况），回退到结构体字段。
 func (b ContentBlock) MarshalJSON() ([]byte, error) {
+	// tool_result：合并 raw + 覆盖 content
+	if b.Type == ContentTypeToolResult && len(b.raw) > 0 {
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(b.raw, &raw); err != nil {
+			// raw 损坏，回退到结构体字段重建
+			return b.marshalFromFields()
+		}
+		contentBytes, err := json.Marshal(b.Content)
+		if err != nil {
+			return nil, err
+		}
+		raw["content"] = contentBytes
+		return json.Marshal(raw)
+	}
+
 	if len(b.raw) > 0 {
 		return b.raw, nil
 	}
-	type alias ContentBlock
+	return b.marshalFromFields()
+}
+
+// marshalFromFields 从结构体字段重建 JSON（raw 为空时的回退路径）。
+func (b ContentBlock) marshalFromFields() ([]byte, error) {
+	if b.Type == ContentTypeToolResult {
+		return json.Marshal(struct {
+			Type    string         `json:"type"`
+			Content MessageContent `json:"content"`
+			IsError bool           `json:"is_error,omitempty"`
+		}{Type: b.Type, Content: b.Content, IsError: b.IsError})
+	}
 	aux := struct {
 		Type   string       `json:"type"`
 		Text   string       `json:"text,omitempty"`
