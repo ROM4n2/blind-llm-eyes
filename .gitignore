@@ -11,7 +11,11 @@ debug.log
 # Config with secrets
 config.yaml
 config.*.yaml
+config-*-test.yaml
 !config.example.yaml
+
+# IDE artifacts
+.trae/
 
 # Go workspace
 *.test

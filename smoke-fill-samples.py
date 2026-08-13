@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Smoke test: send 9 requests with unique images to fill adaptive sample window."""
-import base64, hashlib, json, struct, time, urllib.request, zlib
+import base64, hashlib, json, os, struct, time, urllib.request, zlib
 
 PROXY = "http://127.0.0.1:8790"
+API_KEY = os.environ.get("BLIND_LLM_EYES_API_KEY", "")
+if not API_KEY:
+    print("ERROR: set BLIND_LLM_EYES_API_KEY env var before running")
+    raise SystemExit(1)
 
 def make_png_b64(r, g, b):
     sig = b"\x89PNG\r\n\x1a\n"
@@ -60,7 +64,7 @@ for i in range(9):
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "x-api-key": "REDACTED_USE_ENV_VAR",
+                "x-api-key": API_KEY,
                 "anthropic-version": "2023-06-01",
             },
             method="POST",

@@ -1,0 +1,49 @@
+#!/bin/bash
+# pre-commit hook: 阻止 API key 等敏感信息进入 git 历史
+# 匹配常见 key 前缀：sk- (OpenAI/DeepSeek/Anthropic), AKIA (AWS), etc.
+# 安装：git config core.hooksPath .githooks
+
+set -e
+
+# 获取暂存区中新增/修改的文件（排除删除的）
+FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -vE '\.git$' || true)
+
+if [ -z "$FILES" ]; then
+    exit 0
+fi
+
+# 搜索硬编码的 API key 模式
+# sk- 后跟至少 20 个字母数字字符（覆盖 OpenAI/DeepSeek/Anthropic/MiMo 等）
+PATTERN='sk-[A-Za-z0-9]{20,}'
+
+FOUND=""
+for file in $FILES; do
+    # 只检查文本文件，跳过二进制
+    if file "$file" | grep -qi 'text\|json\|yaml\|python\|script\|go'; then
+        MATCHES=$(grep -nE "$PATTERN" "$file" 2>/dev/null || true)
+        if [ -n "$MATCHES" ]; then
+            FOUND="$FOUND\n$file:\n$MATCHES\n"
+        fi
+    fi
+done
+
+if [ -n "$FOUND" ]; then
+    echo ""
+    echo "================================================"
+    echo "  COMMIT BLOCKED: 检测到硬编码 API key"
+    echo "================================================"
+    echo ""
+    echo "以下文件中发现了疑似 API key 的硬编码字符串："
+    echo -e "$FOUND"
+    echo "请使用环境变量代替硬编码，例如："
+    echo "  Python:  os.environ.get(\"API_KEY\")"
+    echo "  Go:      os.Getenv(\"API_KEY\")"
+    echo "  YAML:    用 config.yaml（已 gitignore）存放真实 key"
+    echo ""
+    echo "如确认为误报（如测试占位符 sk-xxx），可跳过："
+    echo "  git commit --no-verify"
+    echo ""
+    exit 1
+fi
+
+exit 0
