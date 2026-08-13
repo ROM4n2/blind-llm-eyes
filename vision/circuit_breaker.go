@@ -144,3 +144,33 @@ func (cb *CircuitBreaker) State() CBState {
 	defer cb.mu.Unlock()
 	return cb.state
 }
+
+// CBStats 是熔断器的内部状态快照，用于日志记录。
+type CBStats struct {
+	State            CBState
+	ConsecutiveFails int
+	FailureThreshold int
+	ResetTimeout     time.Duration
+	OpenedAgo        time.Duration // 熔断器开启后经过的时间（未开启时为 0）
+	HalfOpenInFlight bool
+}
+
+// Stats 返回当前熔断器的完整状态快照（线程安全）。
+// 用于日志记录，帮助排查熔断器行为。
+func (cb *CircuitBreaker) Stats() CBStats {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	var openedAgo time.Duration
+	if cb.state == CBOpen && !cb.openedAt.IsZero() {
+		openedAgo = time.Since(cb.openedAt)
+	}
+	return CBStats{
+		State:            cb.state,
+		ConsecutiveFails: cb.consecutiveFails,
+		FailureThreshold: cb.failureThreshold,
+		ResetTimeout:     cb.resetTimeout,
+		OpenedAgo:        openedAgo,
+		HalfOpenInFlight: cb.halfOpenTrialInFlight,
+	}
+}

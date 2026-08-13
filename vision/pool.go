@@ -78,76 +78,167 @@ func (p *Pool) DescribeImage(ctx context.Context, base64Data, mediaType string, 
 	requestID := logging.GetRequestID(ctx)
 	log := p.log.With("node_name", "vision_pool", "request_id", requestID)
 
+	poolStart := time.Now()
+
+	// 日志：pool 开始 — 记录待处理的图片信息和可用 provider 列表
+	log.Info("pool DescribeImage started",
+		"stage", "pool_start",
+		"status", "info",
+		"image_size_bytes", imageSize,
+		"media_type", mediaType,
+		"provider_count", len(p.providers),
+		"providers", p.ProviderNames(),
+	)
+
 	var lastErr error
 	var triedProvider string
+	failoverCount := 0
 
 	for i := range p.providers {
 		entry := &p.providers[i]
 		triedProvider = entry.Name
 
-		// 1. 检查熔断器
+		// 1. 检查熔断器 — 先获取快照用于转换检测
+		statsBefore := entry.CB.Stats()
 		allowed := entry.CB.Allow()
 		if !allowed {
-			cbState := entry.CB.State()
+			statsAfter := entry.CB.Stats()
 			log.Info("provider skipped (circuit breaker open)",
 				"stage", "provider_skipped",
 				"status", "info",
 				"provider", entry.Name,
 				"priority", entry.Priority,
-				"cb_state", cbState.String(),
+				"cb_state", statsAfter.State.String(),
+				"consecutive_fails", statsAfter.ConsecutiveFails,
+				"failure_threshold", statsAfter.FailureThreshold,
+				"opened_ago_ms", statsAfter.OpenedAgo.Milliseconds(),
+				"reset_timeout_ms", statsAfter.ResetTimeout.Milliseconds(),
 			)
 			if p.m != nil {
 				p.m.ProviderCallsTotal.WithLabelValues(entry.Name, "skipped").Inc()
-				p.m.CircuitBreakerState.WithLabelValues(entry.Name).Set(cbState.NumericValue())
+				p.m.CircuitBreakerState.WithLabelValues(entry.Name).Set(statsAfter.State.NumericValue())
 			}
 			lastErr = fmt.Errorf("provider %q circuit open", entry.Name)
 			continue
 		}
 
-		// 2. 调用 provider
+		// 检测 CB 状态转换（如 Open→HalfOpen）
+		statsAfterAllow := entry.CB.Stats()
+		if statsAfterAllow.State != statsBefore.State {
+			log.Info("circuit breaker state transition",
+				"stage", "cb_transition",
+				"status", "info",
+				"provider", entry.Name,
+				"from_state", statsBefore.State.String(),
+				"to_state", statsAfterAllow.State.String(),
+				"consecutive_fails", statsAfterAllow.ConsecutiveFails,
+				"failure_threshold", statsAfterAllow.FailureThreshold,
+			)
+		}
+
+		// 2. 日志：provider 调用开始 — 记录调用前的上下文
+		log.Info("provider call started",
+			"stage", "provider_call_start",
+			"status", "info",
+			"provider", entry.Name,
+			"priority", entry.Priority,
+			"cb_state", statsAfterAllow.State.String(),
+			"image_size_bytes", imageSize,
+			"provider_index", i,
+			"total_providers", len(p.providers),
+		)
+
+		// 3. 调用 provider
 		pStart := time.Now()
 		desc, err := entry.Provider.DescribeImage(ctx, base64Data, mediaType, imageSize)
 		pElapsed := time.Since(pStart)
 
-		// 3. 记录结果
+		// 4. 记录结果
 		if err == nil {
+			statsBeforeRecord := entry.CB.Stats()
 			entry.CB.RecordSuccess()
-			cbState := entry.CB.State()
+			statsAfterRecord := entry.CB.Stats()
+
+			// 检测 CB 状态转换（如 HalfOpen→Closed）
+			if statsAfterRecord.State != statsBeforeRecord.State {
+				log.Info("circuit breaker recovered",
+					"stage", "cb_recovered",
+					"status", "ok",
+					"provider", entry.Name,
+					"from_state", statsBeforeRecord.State.String(),
+					"to_state", statsAfterRecord.State.String(),
+				)
+			}
+
 			log.Info("provider succeeded",
 				"stage", "provider_success",
 				"status", "ok",
 				"provider", entry.Name,
 				"priority", entry.Priority,
 				"duration_ms", pElapsed.Milliseconds(),
-				"cb_state", cbState.String(),
+				"cb_state", statsAfterRecord.State.String(),
 				"desc_len", len(desc),
 			)
 			if p.m != nil {
 				p.m.ProviderCallsTotal.WithLabelValues(entry.Name, "success").Inc()
 				p.m.ProviderDuration.WithLabelValues(entry.Name).Observe(pElapsed.Seconds())
-				p.m.CircuitBreakerState.WithLabelValues(entry.Name).Set(cbState.NumericValue())
+				p.m.CircuitBreakerState.WithLabelValues(entry.Name).Set(statsAfterRecord.State.NumericValue())
 			}
+
+			// 日志：pool 完成 — 记录总耗时和成功 provider
+			log.Info("pool DescribeImage completed",
+				"stage", "pool_complete",
+				"status", "ok",
+				"total_duration_ms", time.Since(poolStart).Milliseconds(),
+				"succeeded_provider", entry.Name,
+				"providers_tried", i+1,
+				"failover_count", failoverCount,
+			)
 			return desc, nil
 		}
 
 		// 失败：记录并尝试下一个 provider
+		statsBeforeRecord := entry.CB.Stats()
 		entry.CB.RecordFailure()
-		cbState := entry.CB.State()
+		statsAfterRecord := entry.CB.Stats()
+
+		// 检测 CB 状态转换（如 Closed→Open 或 HalfOpen→Open）
+		if statsAfterRecord.State != statsBeforeRecord.State {
+			log.Warn("circuit breaker opened",
+				"stage", "cb_opened",
+				"status", "warning",
+				"provider", entry.Name,
+				"from_state", statsBeforeRecord.State.String(),
+				"to_state", statsAfterRecord.State.String(),
+				"consecutive_fails", statsAfterRecord.ConsecutiveFails,
+				"failure_threshold", statsAfterRecord.FailureThreshold,
+				"reset_timeout_ms", statsAfterRecord.ResetTimeout.Milliseconds(),
+			)
+		}
+
 		isLast := i == len(p.providers)-1
+		nextProvider := ""
+		if !isLast {
+			nextProvider = p.providers[i+1].Name
+			failoverCount++
+		}
 		log.Warn("provider failed, failing over",
 			"stage", "provider_failover",
 			"status", "warning",
 			"provider", entry.Name,
 			"priority", entry.Priority,
 			"duration_ms", pElapsed.Milliseconds(),
-			"err", err,
-			"cb_state", cbState.String(),
+			"err", err.Error(),
+			"cb_state", statsAfterRecord.State.String(),
+			"consecutive_fails", statsAfterRecord.ConsecutiveFails,
+			"failure_threshold", statsAfterRecord.FailureThreshold,
 			"has_next_provider", !isLast,
+			"next_provider", nextProvider,
 		)
 		if p.m != nil {
 			p.m.ProviderCallsTotal.WithLabelValues(entry.Name, "error").Inc()
 			p.m.ProviderDuration.WithLabelValues(entry.Name).Observe(pElapsed.Seconds())
-			p.m.CircuitBreakerState.WithLabelValues(entry.Name).Set(cbState.NumericValue())
+			p.m.CircuitBreakerState.WithLabelValues(entry.Name).Set(statsAfterRecord.State.NumericValue())
 			if !isLast {
 				p.m.FailoverEventsTotal.Inc()
 			}
@@ -161,7 +252,9 @@ func (p *Pool) DescribeImage(ctx context.Context, base64Data, mediaType string, 
 		"status", "error",
 		"provider_count", len(p.providers),
 		"last_provider", triedProvider,
-		"last_err", lastErr,
+		"last_err", lastErr.Error(),
+		"total_duration_ms", time.Since(poolStart).Milliseconds(),
+		"failover_count", failoverCount,
 	)
 	return "", fmt.Errorf("all %d providers failed or circuit-open (last: %w)", len(p.providers), lastErr)
 }
