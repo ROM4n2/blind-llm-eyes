@@ -79,8 +79,8 @@ func ExtractConversationContext(req *Request, recentRounds int, maxChars int) st
 	cutFrom := 0 // 从 formatted[cutFrom:] 保留
 	for i := len(formatted) - 1; i >= 0; i-- {
 		lineLen := len(formatted[i]) + 1 // +1 for \n
-		if total+lineLen > maxChars && i > 0 {
-			// 再加入这条就超了（且不是最后一条，保证至少保留最新一条）
+		if total+lineLen > maxChars && i < len(formatted)-1 {
+			// 再加入这条就超了，且不是最新一条（保证至少保留最新一条）
 			cutFrom = i + 1
 			break
 		}

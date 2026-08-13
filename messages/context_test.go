@@ -141,6 +141,25 @@ func TestExtract_MaxChars_Truncation(t *testing.T) {
 	}
 }
 
+// TestExtract_MaxChars_TwoMessages_BothExceed: 2 条消息合起来超 maxChars，
+// 各自单独不超 → 必须截断早期那条，只保留最新一条。
+// 回归测试：修复前 i>0 条件导致 i=0 时无法截断，结果超出 maxChars。
+func TestExtract_MaxChars_TwoMessages_BothExceed(t *testing.T) {
+	medium := strings.Repeat("Y", 50) // 50 chars
+	req := &Request{Messages: []Message{
+		{Role: "user", Content: MessageContent{textBlock(medium)}},      // [user] + 50 ≈ 56 chars
+		{Role: "assistant", Content: MessageContent{textBlock(medium)}}, // [assistant] + 50 ≈ 61 chars
+	}}
+	// maxChars=80：两条合起来 ≈ 118 > 80，但最新一条单独 ≈ 61 < 80
+	got := ExtractConversationContext(req, 10, 80)
+	if !strings.Contains(got, medium) {
+		t.Errorf("must keep at least the latest message, got %q", got)
+	}
+	if len(got) > 80 {
+		t.Errorf("result length %d exceeds maxChars=80, got %q", len(got), got)
+	}
+}
+
 // TestExtract_SkipImages: 含 image 的消息只取 text，绝无 base64 泄露
 func TestExtract_SkipImages(t *testing.T) {
 	req := &Request{Messages: []Message{
