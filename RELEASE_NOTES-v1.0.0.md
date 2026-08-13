@@ -1,10 +1,12 @@
 # Release Notes — v1.0.0
 
+> ← Back to [README](README.md) · [HANDOFF](HANDOFF.md) · [CHANGELOG-style commits](../commits/v1.0.0)
+
 **blind-llm-eyes** — Give text-only LLMs eyes.
 
 Release date: 2026-08-13
-Branch: `feat/onboarding-productize`
-Scope: 12 commits · 41 files changed · +4442 / −83 lines
+Branch: merged to `master` via `58c1ee8` (tag: `v1.0.0`)
+Scope: 13 commits · 44 files changed · +5379 / −83 lines (incl. docs)
 
 ---
 

@@ -32,6 +32,10 @@ DeepSeek has no vision. Using it from Claude Code means pasting a screenshot get
 - **Observability** — structured JSON logs (async writer), per-stage timing via `httptrace`, Prometheus metrics at `/metrics`, request IDs threaded through the whole pipeline, graceful shutdown.
 - **Pluggable vision backends** — anything implementing `vision.VisionProvider` works.
 - **Single static binary** — no runtime dependencies, ~10 MB.
+- **Model name sanitization** — automatically strips vendor context-length suffixes before forwarding to upstream (`deepseek-chat[1m]` → `deepseek-chat`); applied both on the request path and during cc-switch import (double-safe).
+- **CLI lifecycle** — 8 subcommands cover the full lifecycle: `setup` (interactive config + doctor), `doctor` (connectivity self-check), `connect`/`disconnect` (Claude Code settings.json wiring), `start`, `status`, `stop`, `version`.
+- **cc-switch one-click import** — reads providers directly from the cc-switch SQLite database (best-effort: falls back to temp-copy on DB lock, falls back to manual input on any error).
+- **Safe settings management** — `connect` rewrites Claude Code's `settings.json` with a full-file backup taken exactly once (repeat `connect` never overwrites the backup); `disconnect` restores byte-for-byte from the backup via atomic writes.
 
 ## Quick start
 
@@ -120,6 +124,62 @@ curl -N http://127.0.0.1:8790/v1/messages \
 Response header `X-Blind-Llm-Eyes` reports the outcome: `rewritten=1 cached=0`.
 
 > **Note on CC Switch:** set the provider's `ANTHROPIC_BASE_URL` to `http://127.0.0.1:8790`. Do **not** use CC Switch's proxy mode — it truncates image bodies.
+
+### Verification & troubleshooting
+
+Use the 5-step progressive verification to isolate issues without guessing:
+
+```powershell
+# L1 — Binary & version injection
+blind-llm-eyes version
+# → blind-llm-eyes 1.0.0 (go go1.26.5)
+
+# L2 — Connectivity (zero or ~1 token consumed)
+blind-llm-eyes doctor
+# → upstream=PASS  vision=PASS   (exit 0)
+# If any FAIL: check base_url (no trailing slash, correct /anthropic vs /v1),
+#              check API key via env var or config.yaml
+
+# L3 — Process liveness
+# terminal A: blind-llm-eyes start
+# terminal B:
+blind-llm-eyes status
+curl -s http://127.0.0.1:8790/healthz
+# → status: RUNNING pid=1234 addr=127.0.0.1:8790
+# → healthz: ok
+
+# L4 — End-to-end (small API quota consumed)
+curl -N http://127.0.0.1:8790/v1/messages `
+  -H "Authorization: Bearer <upstream-key>" -H "Content-Type: application/json" `
+  -d '{\"model\":\"deepseek-chat\",\"max_tokens\":500,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What color is this?\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==\"}}]}]}' `
+  -D - 2>&1 | Select-Object -First 50
+# Look for: HTTP/1.1 200 OK  +  X-Blind-Llm-Eyes: rewritten=1 cached=0
+#           then the SSE stream containing the vision description text
+
+# L5 — Graceful shutdown
+blind-llm-eyes stop
+blind-llm-eyes status
+# → NOT RUNNING
+```
+
+Common gotchas:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `doctor` reports vision `PASS` but L4 returns 502 with `"vision call failed"` | Real `DescribeImage` (larger payload + longer timeout) fails where `Ping` (1-token) succeeds. Common when vision timeout is too small. | Raise `vision.timeout` (default 30s) and confirm the vision model accepts images at its configured endpoint. |
+| `status` returns `NOT RUNNING` even though `start` is running in foreground | On Windows Trae IDE terminals, `os.CreateTemp` for the pidfile is blocked by the sandbox (sandbox error: `Not allow operate files: ...pidfile-*.tmp`). This only affects the IDE-integrated terminal. | Run `status` / `stop` from a standalone PowerShell window. The foreground `start` itself works everywhere, including inside Trae. |
+| Upstream returns 400 `"model: deepseek-chat[1m] not found"` | `[1m]` suffix reached upstream (model sanitization is not active). Older pre-v1.0.0 builds didn't strip the suffix; or a reverse proxy in front of blind-llm-eyes is re-injecting the original model. | Upgrade to v1.0.0+ (`blind-llm-eyes version` confirms). Confirm the `ANTHROPIC_MODEL` env in Claude Code / cc-switch doesn't override the model field sent through the proxy — the sanitization only runs *inside* the proxy on the parsed request body. |
+| Claude Code still says "I can't see images" after `connect` | Claude Code reads `settings.json` on startup only; or a cc-switch switcher run after `connect` overwrote `ANTHROPIC_BASE_URL` back. | Restart Claude Code. Run `connect` again and **don't** switch providers in cc-switch while using the proxy. |
+| Images get truncated / vision hash mismatch errors | Using CC Switch **proxy mode** (not base_url override). It silently truncates request bodies > ~200 bytes before forwarding. | Set `ANTHROPIC_BASE_URL=http://127.0.0.1:8790` directly. Don't enable proxy mode in cc-switch. `blind-llm-eyes connect` writes exactly this setting. |
+| `go install github.com/ROM4n2/blind-llm-eyes@latest` errors with "invalid version: unknown revision" | `@latest` requires at least one published semver tag on the remote repo. Tag `v1.0.0` exists locally but hasn't been pushed yet. | Download a prebuilt archive from the releases page, or build from a checkout: `go build -ldflags "-X github.com/ROM4n2/blind-llm-eyes/buildinfo.Version=1.0.0" .` |
+
+### Security considerations
+
+- **Admin token** — generated fresh from `crypto/rand` on every `start`, written to the pidfile at `<UserConfigDir>/blind-llm-eyes/pidfile.json`, and deleted by `stop`. It's never persisted elsewhere (no env var, no config key).
+- **Bind address** — default listen is `127.0.0.1:8790` (loopback only). Exposing `0.0.0.0` or a LAN IP forwards `/v1/messages` with your upstream API key to anyone who can reach the port — never do that on an untrusted network. `/metrics` and `/healthz` also have no client auth.
+- **Keys from config vs env** — API keys set in `config.yaml` override the client's `Authorization` header. The handler strips `Authorization` / `Proxy-Authorization` / `Cookie` headers from the client before forwarding upstream whenever `UpstreamAPIKey` is configured, to avoid leaking client-side credentials.
+- **Pidfile permissions** — on Windows the pidfile directory defaults to `%AppData%\blind-llm-eyes\` (user-only ACLs inherited from `AppData`). Don't share `%AppData%` across accounts or put it on a world-readable share.
+- **`connect` backup** — `~/.claude/.bak-before-connect` is a verbatim copy of your original `settings.json`. It contains whatever secrets `settings.json` held (e.g. `ANTHROPIC_API_KEY`). Treat it the same as the real file.
 
 ## Configuration reference
 

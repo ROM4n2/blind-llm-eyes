@@ -1,7 +1,7 @@
 # 交接文档 — blind-llm-eyes 视觉代理
 
-> **最近更新**：2026-08-13（P5 上下文感知描述实现 + maxChars 截断 bug 修复）
-> **状态**：MVP → P1 → P2 → P3 → P5 全部完成。P5 上下文感知图片描述：新增 ContextualVisionProvider 接口 + 对话上下文提取（messages/context.go）+ MiMo/OpenAI client 上下文注入 + Pool 透传 + 配置化（context_rounds/context_max_chars）+ Handler 集成 + 详细日志（context_extract_complete / vision_call_dispatch / prompt_built）。9 个单元测试覆盖。maxChars 截断 bug 修复（i>0 → i<len-1 保护最新而非最旧消息）。go build + go vet + go test -race ./... 全绿。本地与 origin/master 同步
+> **最近更新**：2026-08-13（产品化 v1.0.0 发布：11 项 TDD 任务全部完成 + Release Notes + 合并 master + tag v1.0.0）
+> **状态**：MVP → P1 → P2 → P3 → P5 → **产品化 v1.0.0 全部完成**。产品化内容：buildinfo + CLI 子命令 + admin/pidfile + vision/upstream Ping + `[1m]` 模型剥离 + connect/disconnect settings.json 接线 + cc-switch SQLite 导入 + 交互式 setup 向导 + goreleaser/Makefile/发布 workflow + E2E 集成测试（含 FailOpen/FailClosed 网络超时场景）5 用例。`go test -race ./...` 全 13 包全绿；`goreleaser build --snapshot` 6 平台二进制全成功；master 已合并，tag `v1.0.0` 本地就位。详见 [RELEASE_NOTES-v1.0.0.md](./RELEASE_NOTES-v1.0.0.md)
 
 ---
 
@@ -146,14 +146,91 @@
     - **NewHandler nil 检查补全**：新增 `UpstreamBaseURL` 空字符串 panic + `LargeImageThreshold` 默认 1MB
     - **跨请求并发压力测试**：20 goroutine 混合 3 种图片组合（含嵌套 tool_result），vision 调用从潜在 40 次去重到 3 次；AdaptiveConcurrency 100 次并发 RecordSample 无竞态
 
+24. **T1 buildinfo 包 + version 子命令** (commit `3d9f9eb`)
+    - 新建 `buildinfo/buildinfo.go`：`var Version = "dev"`，由 goreleaser 经 ldflags `-X ...buildinfo.Version=1.0.0` 注入
+    - CLI 内 `version`：打印 `blind-llm-eyes <Version> (go <runtime.Version()>)`
+    - 验证：本地构建 `go build -ldflags "-X ...buildinfo.Version=1.0.0"` → `blind-llm-eyes 1.0.0 (go go1.26.5)`
+
+25. **T2 抽取 vision provider 构造函数** (commit `ad70a9f`)
+    - main.go 中 200 行 provider 构造抽成 `vision.BuildProvider(pc, logger)` / `BuildSingleProvider(vc, logger)` / `BuildPool(cfg, logger)`
+    - main.go 瘦身为：dispatch → `runServer` 调用 builder
+    - 每种 Type 构造单测：`go test ./vision/` 全通过
+
+26. **T3 CLI 子命令分发骨架 + thin main.go** (commit `77f8ee8`)
+    - `cli/cli.go`：`Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int`，手写 switch 分发（零 CLI 依赖）
+    - main.go：无参数 / `start` / `-config` / `-*` → 走 `runServer`（向后兼容）；其余 → `cli.Run`
+    - 8 个子命令：`version` / `setup` / `doctor` / `connect` / `disconnect` / `status` / `stop` / 隐含 `start`
+    - 路由表驱动单测：`go test ./cli/ -run TestRun_` 全通过
+
+27. **T4 admin shutdown 端点 + pidfile + status/stop** (commit `405b4b2`)
+    - `admin/admin.go`：`POST /admin/shutdown`，`X-Admin-Token` 鉴权（错 token → 403，对 → 202 + 触发 graceful drain）
+    - `cli/pidfile.go`：pidfile 存 `os.UserConfigDir()/blind-llm-eyes/pidfile.json`（Windows = `%AppData%\blind-llm-eyes\`），字段 pid/addr/token/startedAt
+    - `status`：读 pidfile → `GET /healthz` → `RUNNING` / `STALE`（不信任 pid 存活，Windows pid 复用）
+    - `stop`：读 pidfile → POST `/admin/shutdown` 带 token → 清理 pidfile
+    - 4 个文件测试 + admin 端点测试 + status/stop 子命令测试全绿
+
+28. **T5 vision Ping + upstream Ping → doctor 子命令** (commit `e2cbf8b`)
+    - `vision/Ping(ctx)`：客户端级发送 `max_tokens=1` text-only 请求，语义 = 可达 + 非 401/403；model 级 400 当 warning 不当失败
+    - `cli.PingUpstream(ctx, baseURL, apiKey, model)`：对上游 `/v1/messages` 同语义 ping
+    - `doctor`：按顺序 ping upstream + 每个 vision provider，打印表；全部通过 exit=0，任一失败 exit=1
+    - `go test ./vision/ ./cli/ -run Ping` / `Doctor` 全通过
+
+29. **T6 `[1m]` 模型名剥离** (commit `7a26701`)
+    - 新建 `modelutil/modelutil.go`：`SanitizeModel(m string) string`，仅剥尾部 `[<digits><unit>]`（`[1m]`/`[1M]`/`[128K]` 等），不碰中间括号
+    - proxy handler 转发前 `req.Model = modelutil.SanitizeModel(req.Model)`（全量缓冲 + remarshal，改写安全）
+    - cc-switch 导入层同样经 `SanitizeModel`（双保险）
+    - 纯函数表驱动单测 + E2E 断言上游收到剥后 model，全绿
+
+30. **T7 connect/disconnect settings.json 接线** (commit `5565bd6`)
+    - `cli/settings.go`：`map[string]json.RawMessage` 往返，只改 `env.ANTHROPIC_BASE_URL`，非 env 顶层键（effortLevel/hooks/theme/tui 等）逐字节保留
+    - `connect`：写前整文件备份到 `~/.claude/.bak-before-connect`（备份已存在不覆盖，保证原始状态永远可恢复）；原子写（temp + rename）
+    - `disconnect`：从备份整文件字节还原，然后删备份标记
+    - golden 测试：非 env 键逐字节保留、重复 connect 备份不变、disconnect 还原一致，`go test ./cli/ -run TestConnect` 全通过
+
+31. **T8 cc-switch SQLite 供应商导入** (commit `252d06e`)
+    - 依赖 `modernc.org/sqlite`（纯 Go、无 CGO，三平台 goreleaser 可交叉编译）
+    - 打开 `~/.cc-switch/cc-switch.db`：`mode=ro&immutable=1` 只读；文件锁定（cc-switch GUI 运行中）→ 整 DB 拷贝到 temp 再读；仍失败 → setup 回退手填（best-effort）
+    - 查询 `app_type='claude'` provider，解析 `settings_config JSON env` → 列出候选供 setup 挑选 upstream/vision；模型经 `SanitizeModel` 后填 vision.model
+    - 内存 SQLite 测试：正常抽取 / 空行容错 / 损坏回退 全绿
+
+32. **T9 交互式 setup 向导编排** (commit `1508234`)
+    - 纯 stdin 问答流：① cc-switch 导入？（T8）→ ② 手填 upstream/vision（base_url/api_key/model，带默认值 deepseek/mimo）→ ③ doctor 自检（失败询问"仍要保存吗"）→ ④ 可选立即 connect（T7）→ ⑤ 原子写 `config.yaml` → ⑥ 打印启动指引
+    - 可测试性：stdin/stdout/写文件/connect 全部接口注入，`bytes.Buffer` 脚本化 stdin 驱动不落盘
+    - 3 个测试场景：纯手填 / doctor 失败仍保存 / cc-switch 导入 全通过
+
+33. **T10 goreleaser + release workflow + Makefile + README** (commit `9f46a2b`)
+    - `.goreleaser.yaml`：linux/darwin/windows × amd64/arm64 = 6 目标；CGO_ENABLED=0（全依赖纯 Go）；ldflags 注入版本；archives + checksums
+    - `.github/workflows/release.yml`：推送 `v*` tag → check out → setup-go → `goreleaser release --clean`
+    - `Makefile`：`test`（race）/ `vet` / `build`（VERSION 变量）/ `snapshot` / `goreleaser-check` / `release` / `clean`
+    - README Quick start 重写：下载 / setup / connect / start 四步法
+    - 验证：`goreleaser check` 通过；`goreleaser build --snapshot --clean` 6 二进制全成功（darwin amd64 15.9M / linux amd64 15.7M / windows amd64 16.0M 等）
+
+34. **T11 E2E 集成测试** (commit `29c5104`)
+    - `test/e2e_test.go`：httptest 假 DeepSeek + 假 MiMo，真实 `vision.Client` + `proxy.NewHandler`
+    - `TestE2E_FullPipeline`：`model:"deepseek-chat[1m]"` + 1×1 PNG → 断言上游收到 `deepseek-chat`（T6 生效）、MiMo 恰好被调用 1 次并看到 `mimo-v2.5`、图片被替换为描述、SSE 透传、`X-Blind-Llm-Eyes: rewritten=1 cached=0`、第 2 次请求缓存 hit（vision 调用不增）
+    - `TestE2E_AdminShutdown_PidfileCleanup`：真实 `WritePidfile` + `admin.ShutdownHandler`；错 token → 403 + 不关闭；对 token → 202 + `Done()` 关闭 + pidfile 删除
+    - `go test -race -count=1 ./test/` 全通过
+
+35. **网络超时健壮性 E2E（T11 增强）** (commit `3f059f8`)
+    - `TestE2E_VisionTimeout_FailOpen`：慢 MiMo（2s）+ 客户端 200ms 超时 + `FailOpen=true` → HTTP 200，上游收到占位符 `[Image could not be described by vision model]` 而非图片或延迟描述
+    - `TestE2E_VisionTimeout_FailClosed`：同慢服务器 + `FailOpen=false` → HTTP 502，上游永不触达，响应体含 `"vision call failed"`
+    - **goroutine 生命周期安全**：handler 用 `select`+`done` channel 模式（非裸 `time.Sleep`），`httptest.Server.Close()` 不阻塞
+    - `-race` 全通过，无数据竞争
+
+36. **Release Notes + 合并 master + 打 tag** (commit `08dc4bd` + merge `58c1ee8`)
+    - 生成 [RELEASE_NOTES-v1.0.0.md](./RELEASE_NOTES-v1.0.0.md)：7 大新功能 / 改进 / 测试（5 E2E 表格）/ 发布基础设施 / 升级指引 / 12 提交完整列表 / 已知限制 / 验证总结
+    - `feat/onboarding-productize` → `master` 合并（`--no-ff` merge commit `58c1ee8`）
+    - annotated tag `v1.0.0` 打在 master HEAD（待用户推送远程 + 设置 GITHUB_TOKEN 后触发 release workflow）
+
 ### 当前状态
-- **MVP → P1 → P2 → P3 全部完成 + 代码审查 11 个问题全部修复**
-- **go test -race ./... 全绿**，`go build` / `go vet` 零警告
-- **服务可运行**：`go run . -config config.yaml` 启动后监听 127.0.0.1:8790
+- **MVP → P1 → P2 → P3 → P5 → 产品化 v1.0.0 全部完成**
+- **go test -race ./... 全绿（13 包全通过）**，`go build` / `go vet` 零警告
+- **服务可运行**：`blind-llm-eyes start` 或 `go run . -config config.yaml`，监听 127.0.0.1:8790
 - **多 Provider 池已验证**：故障转移 + 熔断器 + 跳过逻辑端到端通过
 - **安全防护已就位**：pre-commit hook 阻止 key 泄露，git 历史已清理
 - **并发安全已验证**：跨请求压力测试（20 goroutine + 100 并发采样）`-race` 无报告
-- **本地与 origin/master 同步**
+- **产品化验证通过**：`doctor` 双端 ping PASS、goreleaser 6 平台 snapshot 构建成功、E2E 5 用例全过、status/stop pidfile 流程有效
+- **master 已合并，tag v1.0.0 本地就位**（待 `git push --tags` 推送）
 
 ### 下一步建议（按优先级）
 | 优先级 | 任务 | 说明 |
@@ -169,10 +246,24 @@
 | ✅ | ~~核心流程日志增强~~ | **已完成**：9 个 stage 日志 + request_id 关联 |
 | ✅ | ~~代码审查 11 个问题~~ | **已完成**：5 严重 + 4 中等 + 2 低优先级全部修复 |
 | ✅ P5 | ~~上下文感知描述~~ | **已完成**：ContextualVisionProvider 接口 + 上下文提取 + client 注入 + Pool 透传 + 配置化 + Handler 集成 + 日志增强 + maxChars 截断 bug 修复 |
-| 🔴 BUG | failover 时间预算被共享 deadline 饿死 | 详见第 9 节「遗留 bug」：singleflight 单一 120s 父 ctx 顺序传给所有 provider，大图或 N 个 provider 顺序失败时 fallback 拿到已过期 ctx |
+| ✅ | ~~failover 时间预算被共享 deadline 饿死~~ | **2026-08-13 修复（产品化前）**。singleflight fn 改为 `WithCancel(Background)` 无硬截止；Pool 每次尝试独立 `WithTimeout(parent, provider timeout)` 子 ctx，fallback 拿到从 parent 派生的全新子 ctx 不受前者耗时影响。3 个回归测试全通过 |
+| ✅ T1 | ~~buildinfo 包 + version 子命令~~ | **已完成**（产品化 T1，commit `3d9f9eb`） |
+| ✅ T2 | ~~vision provider 构造抽取~~ | **已完成**（T2，`ad70a9f`） |
+| ✅ T3 | ~~CLI 分发骨架 + thin main~~ | **已完成**（T3，`77f8ee8`） |
+| ✅ T4 | ~~admin + pidfile + status/stop~~ | **已完成**（T4，`405b4b2`） |
+| ✅ T5 | ~~vision/upstream Ping + doctor~~ | **已完成**（T5，`e2cbf8b`） |
+| ✅ T6 | ~~`[1m]` 模型名剥离~~ | **已完成**（T6，`7a26701`） |
+| ✅ T7 | ~~connect/disconnect 接线~~ | **已完成**（T7，`5565bd6`） |
+| ✅ T8 | ~~cc-switch SQLite 导入~~ | **已完成**（T8，`252d06e`） |
+| ✅ T9 | ~~setup 交互式向导~~ | **已完成**（T9，`1508234`） |
+| ✅ T10 | ~~goreleaser + workflow + Makefile~~ | **已完成**（T10，`9f46a2b`） |
+| ✅ T11 | ~~E2E 集成测试（含网络超时场景）~~ | **已完成**（T11，`29c5104` + `3f059f8`） |
+| 🔴 发布 | 推送 master + tag + 上传 Release Assets | **阻塞于 GITHUB_TOKEN**。用户需在终端设置 `$env:GITHUB_TOKEN='ghp_...'` 后执行：`git push origin master; git push origin v1.0.0`，release workflow 自动出包；或本地 `goreleaser release --clean` |
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
+| P4 | README 中文翻译 | `README.zh-CN.md` 未创建（Glob 验证缺失） |
+| P4 | daemon / systemd 模式 | 当前仅前台 serve，后台 daemon 化留给 P4 |
 
 ---
 
@@ -183,22 +274,44 @@
 ## 2. 当前架构
 
 ```
+┌───────────────────────────────────────────────────────────────────────┐
+│  用户层（CLI 子命令）                                                │
+│  blind-llm-eyes setup │ doctor │ connect │ disconnect │ status │     │
+│                stop │ version │ start (隐含)                         │
+│                ▲                                                     │
+│                │ cli.Run(args) 分发                                 │
+└────────────────┼──────────────────────────────────────────────────────┘
+                 │
+                 ▼
 Claude Code ──POST /v1/messages──▶ blind-llm-eyes (127.0.0.1:8790)
                                     │
-                                    ├─ 解析请求，提取 image blocks
+                                    ├─ GET  /healthz       ← status 判活
+                                    ├─ GET  /metrics
+                                    ├─ POST /admin/shutdown ← stop (X-Admin-Token 鉴权)
+                                    │     (token 仅存 pidfile，不持久化)
+                                    │
+                                    ├─ 解析请求，modelutil.SanitizeModel() 剥 [1m] 后缀
+                                    ├─ 提取 image blocks
                                     ├─ 查 LRU 缓存 (SHA-256 hash)
                                     │   ├─ 命中 → 直接用缓存的描述
                                     │   └─ miss → singleflight.Do(hash)
-                                    │              ├─ 首个调用者 → Pool.DescribeImage → 写缓存
+                                    │              ├─ 首个调用者 → Pool.DescribeImageWithContext()
+                                    │              │         │
+                                    │              │         └─ messages.ExtractConversationContext()
+                                    │              │             (最近 N 轮对话，maxChars 截断)
+                                    │              │         └─ 写缓存
                                     │              └─ 等待者 → 共享结果
                                     ├─ errgroup 并行处理多图 (concurrency_limit=6, adaptive [1,12])
-                                    ├─ 替换 image block → text block
+                                    ├─ 替换 image block → text block (或 fail-open 占位符)
                                     └─ 转发给 DeepSeek (anthropic 端点) ──▶ 流式响应透传
+                                                 ▲
+                                                 │ Ping(doctor) 轻量可达性+鉴权自检
 
 Pool 内部（vision/pool.go）:
   ┌─ Provider[0] (priority=1, e.g. MiMo)  ← CircuitBreaker: Closed/Open/Half-open
   ├─ Provider[1] (priority=2, e.g. GPT-4o) ← CircuitBreaker: Closed/Open/Half-open
   └─ ...按优先级遍历，跳过熔断器开启的，失败时自动故障转移
+       每个 provider 有独立 WithTimeout 子 ctx（避免共享 deadline 饿死 fallback）
 ```
 
 ### 关键设计决策
@@ -226,29 +339,75 @@ Pool 内部（vision/pool.go）:
 
 ```
 blind-llm-eyes/
-├── main.go                     # 入口 + graceful shutdown + Pool/单 provider 条件构造
+├── main.go                     # 入口：薄分发（无参数/start → runServer；其余 → cli.Run）
 ├── config.yaml                 # 运行配置（gitignore，见 config.example.yaml）
+├── Makefile                    # test / vet / build / snapshot / release / clean
+├── .goreleaser.yaml            # goreleaser 6 平台交叉编译配置
 ├── .githooks/pre-commit        # API key 泄露检测（sk-[A-Za-z0-9]{20,}）
+├── RELEASE_NOTES-v1.0.0.md     # v1.0.0 发布说明（7 大功能 + 5 E2E 用例 + 发布流程）
+├── .github/workflows/
+│   └── release.yml             # tag push → goreleaser release
+├── buildinfo/                  # T1：版本号包
+│   ├── buildinfo.go            # var Version = "dev"（ldflags 注入）
+│   └── buildinfo_test.go
+├── modelutil/                  # T6：模型名工具（纯函数）
+│   ├── modelutil.go            # SanitizeModel() 剥尾部 [1m]/[1M]/[128K]
+│   └── modelutil_test.go       # 表驱动纯函数测试 + proxy 集成 E2E
+├── cli/                        # T3-T9：全部子命令实现
+│   ├── cli.go                  # Run(args, stdin, stdout, stderr) int 分发入口
+│   ├── cli_test.go             # 路由表驱动测试
+│   ├── pidfile.go              # WritePidfile / ReadPidfile / RemovePidfile（原子写）
+│   ├── pidfile_test.go         # pidfile 往返、stale 清理
+│   ├── status.go               # status 子命令（pidfile + GET /healthz）
+│   ├── status_test.go
+│   ├── stop.go                 # stop 子命令（pidfile 取 token → POST /admin/shutdown）
+│   ├── stop_test.go
+│   ├── ping_upstream.go        # PingUpstream()：上游 `/v1/messages` 可达性自检
+│   ├── ping_upstream_test.go
+│   ├── doctor.go               # doctor 子命令（上游 ping + 每个 vision provider ping）
+│   ├── doctor_test.go
+│   ├── settings.go             # settings.json 读写（RawMessage 往返保留非 env 键）
+│   ├── connect.go              # connect / disconnect 子命令（备份 + 原子写 + 还原）
+│   ├── connect_test.go         # golden 测试
+│   ├── ccswitch.go             # cc-switch SQLite 导入（modernc.org/sqlite，只读 + 锁回退）
+│   ├── ccswitch_test.go        # 内存 SQLite 测试
+│   ├── setup.go                # setup 向导（stdin/stdout + 写 config + connect 全部注入）
+│   ├── setup_test.go           # 脚本化 stdin 测试（手填 / doctor失败仍存 / cc-switch导入）
+│   └── stubs.go                # （已清空占位，所有命令均实现）
+├── admin/                      # T4：管理端点
+│   ├── admin.go                # ShutdownHandler（X-Admin-Token 鉴权 → Done() 关闭）
+│   └── admin_test.go           # 403 拒 token / 202 触发 / 重复调用
+├── test/                       # T11 + 网络超时增强
+│   └── e2e_test.go             # 5 个 E2E 用例：FullPipeline / AdminShutdown / ShutdownRejectToken / VisionTimeout_FailOpen / VisionTimeout_FailClosed
 ├── config/
 │   └── loader.go               # YAML 配置加载 + ProviderCfg + CircuitBreakerCfg
-├── messages/                   # Anthropic Messages API 请求解析/改写
+├── messages/                   # Anthropic Messages API 请求解析/改写/上下文提取
 │   ├── content.go              # ContentBlock 结构
 │   ├── parse.go                # 请求解析
 │   ├── rewrite.go              # 图片块替换为文字 + NormalizeSystemMessages
+│   ├── context.go              # P5：ExtractConversationContext()（最近 N 轮对话）
+│   ├── context_test.go         # P5：9 个上下文提取测试
 │   ├── normalize_test.go       # system message 规范化测试
 │   └── validate.go             # 请求校验
 ├── vision/                     # Vision Provider 层
-│   ├── provider.go             # VisionProvider 接口
-│   ├── client.go               # MiMo 客户端（Anthropic API + WebP + httptrace）
-│   ├── openai_client.go        # 通用 OpenAI 兼容客户端（/v1/chat/completions）
-│   ├── pool.go                 # 多 Provider 池（优先级 failover + 详细日志）
+│   ├── provider.go             # T2：VisionProvider / ContextualVisionProvider 接口 + BuildProvider() / BuildSingleProvider() / BuildPool()
+│   ├── provider_test.go        # T2：每种 Type 构造正确 / 空配置报错 / 重复构造不 panic
+│   ├── ping.go                 # T5：Client / SingleProvider / Ping(ctx) error（max_tokens=1 轻量）
+│   ├── ping_test.go            # T5：Ping 请求体/响应/错误分法测试
+│   ├── client.go               # MiMo 客户端（Anthropic API + WebP + httptrace + DescribeImageWithContext）
+│   ├── openai_client.go        # 通用 OpenAI 兼容客户端（/v1/chat/completions + DescribeImageWithContext）
+│   ├── pool.go                 # 多 Provider 池（优先级 failover + 独立子 ctx 防饿死 fallback）
 │   ├── circuit_breaker.go      # 三态熔断器 + Stats() 状态快照
-│   ├── pool_test.go            # 池测试（优先级/故障转移/熔断/并发）
+│   ├── pool_test.go            # 池测试（优先级/故障转移/熔断/并发 + failover 不饿死 + per-provider timeout）
 │   └── circuit_breaker_test.go # 熔断器测试（状态转换/半开/并发）
 ├── proxy/
-│   ├── handler.go              # 核心代理逻辑（errgroup + singleflight + AIMD + 安全过滤）
+│   ├── handler.go              # 核心代理逻辑（SanitizeModel → errgroup + singleflight → AIMD → 安全过滤）
 │   ├── adaptive.go             # AIMD 自适应限流控制器
 │   ├── passthrough.go          # 流式响应透传
+│   ├── handler_test.go         # 基础图片替换 + 缓存 round-trip
+│   ├── handler_concurrency_test.go  # errgroup 并行 + concurrency_limit 配置化 + 自适应跨请求
+│   ├── handler_singleflight_test.go # singleflight stampede / 跨请求 / ctx 隔离
+│   ├── handler_modelutil_test.go    # T6：SanitizeModel proxy 集成 E2E
 │   ├── handler_integration_fix_test.go  # 5 个严重问题修复集成测试
 │   ├── handler_medium_fix_test.go       # 4 个中等问题修复 + 端到端嵌套测试
 │   └── handler_race_stress_test.go      # 跨请求并发压力测试（-race）
@@ -258,7 +417,7 @@ blind-llm-eyes/
 ├── logging/
 │   └── logging.go              # 异步 JSON 日志 + request_id 传播
 └── metrics/
-    └── metrics.go              # Prometheus 指标（含 per-provider 指标）
+    └── metrics.go              # Prometheus 指标（含 per-provider 指标 + adaptive_limit 等）
 ```
 
 ## 4. 性能优化历程
@@ -374,66 +533,168 @@ vision_providers:
 
 ## 6. 使用方式
 
-```powershell
-# 构建
-go build -o blind-llm-eyes.exe .
+### 产品化标准流程（v1.0.0+）
 
-# 启动
-.\blind-llm-eyes.exe
+```powershell
+# 0. 安装：从 Releases 下载二进制，或从源码构建
+#    下载：https://github.com/ROM4n2/blind-llm-eyes/releases
+#    源码：go build -ldflags "-X github.com/ROM4n2/blind-llm-eyes/buildinfo.Version=1.0.0" -o blind-llm-eyes.exe .
+
+# 1. 交互式配置（cc-switch 导入 / 手填 / doctor 自检 / 可选 connect / 写 config.yaml）
+.\blind-llm-eyes.exe setup
+
+# 2. 接线 Claude Code（改写 ~/.claude/settings.json env.ANTHROPIC_BASE_URL，备份+原子写）
+.\blind-llm-eyes.exe connect
+#    需要重启 Claude Code 让它重新读 settings.json
+#    connect 期间勿用 cc-switch 切供应商（会覆盖 base_url）
+#    还原： .\blind-llm-eyes.exe disconnect   （从 .bak-before-connect 字节还原）
+
+# 3. 启动（无参数或 start 均为前台 serve，后台 daemon 化留给 P4）
+.\blind-llm-eyes.exe                  # 向后兼容
+.\blind-llm-eyes.exe start            # 显式
+.\blind-llm-eyes.exe -config C:\path\to\config.yaml   # 指定配置路径
+
+# 4. 生命周期管理（在另一个终端执行）
+.\blind-llm-eyes.exe status           # RUNNING / STALE / NOT RUNNING（pidfile + /healthz 双重判活）
+.\blind-llm-eyes.exe doctor           # 连通性自检（上游 ping + 每个 vision provider ping），非零=有问题
+.\blind-llm-eyes.exe stop             # POST /admin/shutdown token-authed → graceful drain → 删 pidfile
+.\blind-llm-eyes.exe version          # blind-llm-eyes 1.0.0 (go go1.26.5)
 
 # 端点
-# POST /v1/messages  — 代理接口
-# GET  /healthz      — 健康检查
-# GET  /metrics      — Prometheus 指标
+# POST /v1/messages     — 代理接口
+# GET  /healthz         — 健康检查（liveness）
+# GET  /metrics         — Prometheus 指标
+# POST /admin/shutdown  — 优雅关闭（需 X-Admin-Token，只供 stop 子命令使用）
 ```
 
-CC Switch 配置：把 DeepSeek 供应商的 `ANTHROPIC_BASE_URL` 指向 `http://127.0.0.1:8790`（**不要用 CC Switch 代理模式**，会截断图片数据）。
+### 验证（5 层递进法）
+
+```powershell
+# L1: 基础 — 版本号注入正确
+.\blind-llm-eyes.exe version          # 期望 blind-llm-eyes 1.0.0 (go goX.Y.Z)
+
+# L2: 连通性 — doctor 双端可达
+.\blind-llm-eyes.exe doctor           # 期望 upstream=PASS vision=PASS，exit=0
+
+# L3: 进程存活 — start + status/healthz
+# terminal A: .\blind-llm-eyes.exe start
+# terminal B:
+.\blind-llm-eyes.exe status           # 期望 RUNNING pid=<pid> addr=127.0.0.1:8790
+curl http://127.0.0.1:8790/healthz   # 期望 ok
+
+# L4: 端到端链路 — 发带图请求（消耗少量 API 配额）
+curl -N http://127.0.0.1:8790/v1/messages `
+  -H "Authorization: Bearer sk-upstream-key" `
+  -H "Content-Type: application/json" `
+  -d '{\"model\":\"deepseek-chat\",\"max_tokens\":500,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What color is this?\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==\"}}]}]}'
+# 期望: HTTP 200 + X-Blind-Llm-Eyes: rewritten=1 cached=0 + 响应中含图片描述文字
+
+# L5: 优雅关闭
+.\blind-llm-eyes.exe stop             # 成功后 status → NOT RUNNING
+```
+
+### CC Switch 注意事项
+
+把 DeepSeek 供应商的 `ANTHROPIC_BASE_URL` 指向 `http://127.0.0.1:8790`（**不要用 CC Switch 代理模式**，会截断图片 body 导致 hash 失败/vision 报错；setup/connect 均显式用直连）。
+
+### 从 v0（dev 时期）升级
+
+无需改 config.yaml 格式（产品化改动零破坏）。推荐做法：
+1. 解压 v1.0.0 二进制覆盖旧 `blind-llm-eyes.exe`
+2. 跑一次 `setup` 复用现有值 + 触发 doctor 双端验证
+3. 首次运行 `connect` 自动接管 Claude Code settings.json（之前手动配的 base_url 会被备份）
 
 ## 7. 测试
 
 ```powershell
-# 全量测试（含 race detector）
+# 全量测试（含 race detector，CI 门禁）
 go test -race -count=1 ./...
 
-# 单独跑并发/singleflight 测试
-go test -race -v -run TestHandler_ ./proxy/
+# 仅跑产品化 CLI + E2E
+go test -race -v ./cli/ ./admin/ ./buildinfo/ ./modelutil/ ./test/
+
+# 仅跑 E2E（全链路 + 网络超时场景）
+go test -race -v ./test/
 ```
 
-测试覆盖：
-- `proxy/handler_test.go` — 基础代理逻辑
-- `proxy/handler_concurrency_test.go` — errgroup 并行（5 图 × 2s mock，验证 4+1 批次）+ concurrency_limit 配置化 + 自适应限流跨请求集成测试
-- `proxy/handler_singleflight_test.go` — singleflight 去重（stampede / cross-request / ctx 隔离）
-- `proxy/handler_integration_fix_test.go` — 5 个严重问题修复集成测试（race / timeout / marshal / cache pollution / header leak）
-- `proxy/handler_medium_fix_test.go` — 4 个中等问题修复 + 嵌套 tool_result 端到端测试
-- `proxy/handler_race_stress_test.go` — 跨请求并发压力测试（20 goroutine 混合图片 + AdaptiveConcurrency 100 并发采样）
-- `proxy/adaptive_test.go` — AIMD 控制器单元测试（increase / decrease / error-trigger / hysteresis / disabled-is-static）
-- `vision/client_test.go` — MiMo Anthropic API 调用
-- `messages/*_test.go` — 请求解析/改写/校验（含嵌套 tool_result round-trip 测试）
-- `cache/lru_test.go` — LRU 缓存
-- `logging/logging_test.go` — 异步日志
-- `metrics/metrics_test.go` — Prometheus 指标
-- `test-adaptive-prod.py` / `test-adaptive.ps1` — 自适应限流端到端验证脚本（mock MiMo + 三阶段 AIMD 验证）
-- `smoke-fill-samples.py` — 生产冒烟测试脚本（9 请求 × 2 唯一图 = 18 样本填窗口）
-- `SMOKE_TEST_REPORT.md` — 生产冒烟测试报告（20 样本完整延迟数据 + AIMD 决策日志）
-- `vision/pool_test.go` — Provider 池测试（优先级排序 / 故障转移 / 熔断跳过 / 全部失败 / 并发安全）
-- `vision/circuit_breaker_test.go` — 熔断器测试（状态转换 / 半开单试探 / reset_timeout / 并发安全）
-- `messages/normalize_test.go` — system message 规范化测试（5 场景：无 system / 单条 / 多条 / 空内容 / JSON 往返）
-- `test-failover.py` — P3 故障转移端到端验证脚本（5 张不同图片验证熔断器开启→跳过链路）
+测试覆盖（v1.0.0 产品化后全量）：
+
+**基础层**
+- `buildinfo/buildinfo_test.go` — 版本号默认值 / 格式校验
+- `modelutil/modelutil_test.go` — `SanitizeModel` 表驱动纯函数 + proxy handler 集成 E2E
+- `config/*` — YAML 加载/默认值/env 覆盖（无新增测试，向后兼容）
+
+**CLI 子命令层（全部 TDD，20+ 个新测试）**
+- `cli/cli_test.go` — 子命令路由表（version/setup/doctor/connect/disconnect/status/stop/unknown），未知命令非零退出
+- `cli/pidfile_test.go` — pidfile 往返 JSON、stale 进程 pid 检查、清理
+- `cli/status_test.go` — RUNNING / STALE / NOT RUNNING 三态（pidfile + mock healthz 交叉）
+- `cli/stop_test.go` — 正确 token 触发 shutdown + 清 pidfile；stale 报错提示清理
+- `cli/ping_upstream_test.go` — httptest 模拟：200 OK / 401 鉴权失败 / 400 model 级 warning 不当失败 / 网络超时
+- `cli/doctor_test.go` — 全部 PASS 零退出、任一 FAIL 非零、坏配置路径报错
+- `cli/connect_test.go`（golden）：settings.json 非 env 键逐字节保留、重复 connect 不覆盖备份、disconnect 字节还原与备份一致、空 settings 生成新 + 备份标记
+- `cli/ccswitch_test.go` — 内存 SQLite：正常 providers 抽取、空行跳过容忍、损坏/锁 DB 失败回退手填
+- `cli/setup_test.go`（脚本化 stdin）：纯手填 full flow → config.yaml 字段全对 / doctor 失败默认不保存（用户确认才存）/ cc-switch 导入 pick 候选
+
+**Vision + Provider**
+- `vision/provider_test.go`（T2 新增）— mimo/openai 类型构造正确、空 model/base_url 报错、重复构造不 panic（metrics 注入式安全）
+- `vision/ping_test.go`（T5 新增）— 无图 body + max_tokens=1、2xx/401/400/网络错 三分法、Pool 多 provider 逐个 ping
+- `vision/client_test.go` — MiMo Anthropic API 调用（含 thinking.disabled）
+- `vision/openai_client_test.go` — OpenAI 兼容客户端
+- `vision/pool_test.go` — 优先级排序 / 故障转移 / 熔断跳过 / 全部失败 / 并发安全 + **failover 不饿死 fallback（独立子 ctx timeout）** + per-provider large timeout 选择
+- `vision/circuit_breaker_test.go` — 状态转换 / 半开单试探 / reset_timeout / 并发安全
+
+**Admin 端点（T4）**
+- `admin/admin_test.go` — 缺 token → 403、错 token → 403、对 token → 202 + Done() 关闭、重复调用 Done() 安全
+
+**Proxy Handler**
+- `proxy/handler_test.go` — 基础图片替换 + 缓存 round-trip
+- `proxy/handler_concurrency_test.go` — errgroup 并行（5 图 × 2s mock 验证 4+1 批次）+ concurrency_limit 配置化 + 自适应跨请求集成
+- `proxy/handler_singleflight_test.go` — singleflight stampede / 跨请求 / ctx 隔离
+- `proxy/handler_modelutil_test.go`（T6 新增）— `deepseek-chat[1m]` → 上游收到 `deepseek-chat`，其余字段逐字节不变
+- `proxy/handler_integration_fix_test.go` — 5 个严重问题修复集成（race / timeout / marshal / cache pollution / header leak）
+- `proxy/handler_medium_fix_test.go` — 4 个中等问题修复 + 嵌套 tool_result 端到端
+- `proxy/handler_race_stress_test.go` — 跨请求并发压力（20 goroutine 混合图片 + AdaptiveConcurrency 100 并发采样）
+- `proxy/adaptive_test.go` — AIMD 控制器 increase / decrease / error-trigger / hysteresis / disabled-is-static
+
+**Messages（含 P5 上下文）**
+- `messages/context_test.go`（P5 新增 9 个）— nil/empty、rounds=0 禁用、单轮、多轮截断、maxChars 截断、双消息超限、跳过 image、嵌套 tool_result、最后 user 含 image 跳过
+- `messages/normalize_test.go` — system message 规范化（5 场景）
+- `messages/*_test.go` — 请求解析/改写/校验 + 嵌套 tool_result round-trip
+
+**E2E 集成（T11 + 超时增强）**
+- `test/e2e_test.go` — 5 个端到端用例：
+  - `TestE2E_FullPipeline`：`model:"deepseek-chat[1m]"` 剥后 → 真实 vision.Client + 假 MiMo → handler → 假 DeepSeek → SSE 透传，断言 rewritten/cached/描述/上游 model；第 2 次请求缓存 hit
+  - `TestE2E_AdminShutdown_PidfileCleanup`：真实 `WritePidfile` + `admin.ShutdownHandler`，错 token 403/好 token 202+Done+清 pidfile
+  - `TestE2E_AdminShutdown_RejectsMissingToken` — 无 token POST 被拒（403）+ handler 仍 armed
+  - `TestE2E_VisionTimeout_FailOpen`（新增）— 慢 vision + 短超时 + FailOpen=true → 200 + 占位符描述，上游收到占位符
+  - `TestE2E_VisionTimeout_FailClosed`（新增）— 慢 vision + FailOpen=false → 502，上游永不触达，响应体含 vision call failed
+
+**脚本/冒烟（手工运行）**
+- `test-adaptive-prod.py` / `test-adaptive.ps1` — 自适应限流端到端（mock MiMo + 三阶段 AIMD）
+- `smoke-fill-samples.py` — 生产冒烟（9 请求 × 2 唯一图 = 18 样本填 AIMD 窗口）
+- `SMOKE_TEST_REPORT.md` — 生产冒烟报告（20 样本延迟 + AIMD 决策）
+- `test-failover.py` — P3 故障转移端到端（5 图验证熔断器开启→跳过）
 
 ## 8. 最近 commit
 
 ```
-c0a2fa7 fix(proxy): merge message traversals and add missing nil checks in NewHandler
-467f6c7 fix: resolve 4 medium-priority issues in image processing pipeline
-4fa5821 fix(proxy): resolve 5 critical bugs in image processing pipeline
-206f1d6 feat(messages): add support for tool_result content type
-6b7dde0 feat(vision): add circuit breaker stats and improve failover logging
-c8dd7b9 chore(pre-commit): update api key detection pattern to cover more services
-c14d1a5 feat(vision): multi-provider pool with circuit breaker failover
-14858c0 fix(proxy): normalize system messages before validation
+58c1ee8 merge: productize blind-llm-eyes for v1.0.0 release
+08dc4bd docs: add v1.0.0 release notes
+3f059f8 test(e2e): add network timeout scenarios for fail-open and fail-closed paths
+29c5104 test: add e2e integration test for full pipeline and admin shutdown
+9f46a2b chore: add goreleaser, release workflow, and makefile
+1508234 feat(cli): add interactive setup wizard with cc-switch import and doctor
+252d06e feat(cli): add cc-switch SQLite provider import
+5565bd6 feat(cli): add connect/disconnect for Claude Code settings.json wiring
+7a26701 feat(proxy): strip [1m] model suffix before forwarding to upstream
+e2cbf8b feat(cli): add doctor subcommand with vision and upstream ping
+405b4b2 feat(admin): add shutdown endpoint, pidfile, and status/stop subcommands
+77f8ee8 feat(cli): add subcommand dispatch skeleton and thin main.go
+ad70a9f refactor(vision): extract provider builders from main.go
+3d9f9eb feat(cli): add buildinfo package and version subcommand
 ```
 
-> 注：commit hash 在 git filter-repo 清理后已变更，旧 hash 不再有效。
+> 注：git filter-repo 清理 key 后，早期（P1 及之前）commit hash 与 HANDOFF 中引用的旧 hash 不一致，以 `git log` 实际输出为准。
 
 ## 9. 已知限制 & 后续方向
 
@@ -443,13 +704,18 @@ c14d1a5 feat(vision): multi-provider pool with circuit breaker failover
 | ✅ 完成 | ~~P2 自适应限流~~ | AIMD 控制器 + 单测 + 集成测试 + 端到端验证 + 冒烟测试 + 配置调优 |
 | ✅ 完成 | ~~P3 多 Provider 池~~ | Provider 池 + 熔断器 + OpenAI 客户端 + 故障转移验证 + 详细日志 |
 | ✅ 完成 | ~~安全修复~~ | key 泄露清理 + pre-commit hook + git 历史清理 |
-| ✅ 完成 | ~~代码审查 11 个问题~~ | 5 严重 + 4 中等 + 2 低优先级全部修复，含并发安全、性能优化、防御性编程 |
+| ✅ 完成 | ~~代码审查 11 个问题~~ | 5 严重 + 4 中等 + 2 低优先级全部修复 |
 | ✅ 完成 | ~~并发压力测试~~ | 跨请求 20 goroutine + AdaptiveConcurrency 100 并发采样，`-race` 无报告 |
-| ✅ 完成 | ~~P5 上下文感知描述~~ | ContextualVisionProvider 接口 + 上下文提取 + client/Pool 透传 + 配置化 + Handler 集成 + 日志增强 + maxChars bug 修复，详见第 12 节 |
-| ✅ 完成 | ~~failover 时间预算被共享 deadline 饿死~~ | **2026-08-13 修复（采用修法②）。** ① [handler.go:481](proxy/handler.go#L481) singleflight fn 的 dedupCtx 从 `WithTimeout(Background, 120s)` 改为 `WithCancel(Background)`，parent 只做 cancel 传播、不设硬截止；② [pool.go](vision/pool.go) 每次尝试用独立 `WithTimeout(parent, 该 provider timeout)` 创建子 ctx（PoolEntry 新增 `Timeout`/`LargeTimeout`/`LargeImageThreshold` 字段，由 `selectTimeout` 按 imageSize 选 large/normal），第一个 provider 耗满自己的 timeout 后 fallback 拿到从 parent 派生的全新子 ctx，不受前者耗时影响。新增 3 个回归测试（`TestPool_FailoverNotStarvedBySharedDeadline` / `TestPool_PerProviderTimeoutSelectsLarge` / `TestPool_NoTimeoutFallsBackToParentCtx`），`go test -race ./...` 全绿 |
+| ✅ 完成 | ~~P5 上下文感知描述~~ | ContextualVisionProvider 接口 + 上下文提取 + client/Pool 透传 + 配置化 + Handler 集成 + maxChars bug 修复 |
+| ✅ 完成 | ~~failover 时间预算被共享 deadline 饿死~~ | **2026-08-13 修复**。singleflight fn 改为 `WithCancel(Background)` 无硬截止；Pool 每次尝试独立 `WithTimeout(parent, provider timeout)` 子 ctx，fallback 拿全新子 ctx 不受前者耗时影响。3 个回归测试全通过 |
+| ✅ 完成 | ~~T1-T11 产品化 11 项 TDD 任务~~ | buildinfo / 构造抽取 / CLI 骨架 / admin+pidfile / Ping+doctor / `[1m]` 剥离 / connect / cc-switch / setup / goreleaser+workflow / E2E+超时场景。13 commit，`go test -race ./...` 13 包全绿 |
+| 🔴 发布 | 推送 master + tag + Release Assets | **阻塞于 GITHUB_TOKEN**。设置 `$env:GITHUB_TOKEN='ghp_...'` 后 `git push origin master; git push origin v1.0.0`，release workflow 自动出包；或本地 `goreleaser release --clean` |
+| ⚠️ Trae 沙箱限制 | pidfile tmp 文件被沙箱拒（仅 IDE 终端） | Trae 沙箱不允许在 `%AppData%` 下创建 `*.tmp`（CreateTemp 报错）。**在独立 PowerShell 终端中运行 `status`/`stop` 正常**；前台 start 不受影响 |
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
+| P4 | README 中文翻译 | `README.zh-CN.md` 未创建 |
+| P4 | daemon / systemd 模式 | 当前仅前台 serve，后台 daemon 化留给 P4 |
 
 ---
 
@@ -605,22 +871,36 @@ vision:
 
 ## 10. 环境事实
 
-- **Go 版本**：go 1.22+（用了 loopvar 修复，但代码里仍显式 `i, blk := i, blk`）
-- **Windows PowerShell**：环境变量用 `$env:VAR = "value"` 语法
-- **CC Switch 代理模式会截断图片数据**（316→188 bytes），必须用 `ANTHROPIC_BASE_URL` 直连
-- **MiMo 端点**：`https://api.xiaomimimo.com/anthropic`（Anthropic 格式），不是 `/v1`（OpenAI 格式）
+- **Go 版本**：go 1.26.5（`go.mod` 声明；用了 loopvar 修复，但代码里仍显式 `i, blk := i, blk` 防御）
+- **Windows PowerShell**：环境变量用 `$env:VAR = "value"` 语法；bash-style `VAR=value command` 会抛 CommandNotFoundException
+- **Trae IDE 沙箱限制**：在 `%AppData%\blind-llm-eyes\` 下创建 `*.tmp`（pidfile 的 os.CreateTemp）会被沙箱拒，导致 `status`/`stop` 无法工作；**在独立 PowerShell 终端运行无此问题**；前台 `start` 不受影响
+- **CC Switch 代理模式会截断图片数据**（316→188 bytes），必须用 `ANTHROPIC_BASE_URL` 直连；`setup`/`connect` 均显式用直连不经过代理
+- **cc-switch SQLite**：`~/.cc-switch/cc-switch.db`（Windows = `%USERPROFILE%\.cc-switch\`），表 `providers(app_type, settings_config JSON)`；modernc.org/sqlite 纯 Go 无 CGO，goreleaser 三平台可交叉编译
+- **cc-switch DB 锁定**：GUI 运行中时 SQLite 文件被独占锁，导入逻辑自动 fallback 到 temp copy 后打开读；仍失败 → setup 回退手填（best-effort）
+- **MiMo 端点**：`https://api.xiaomimimo.com/anthropic`（Anthropic Messages API，支持 `thinking.type: disabled`），不是 `/v1`（OpenAI Chat Completions）
+- **MiMo 默认思考模式**：不关闭 `thinking.type` 会生成 ~2257 chars 隐藏 `reasoning_content`，导致 body_read 23.5s；关闭后 4.2s（-82%）
+- **模型名 `[1m]` 后缀**：cc-switch UI 给部分模型加长度尾标（`deepseek-chat[1m]` / `mimo-v2.5[1M]`），DeepSeek 上游会拒；`modelutil.SanitizeModel` 在转发层和导入层双保险剥离
+- **pidfile 路径**：`os.UserConfigDir()/blind-llm-eyes/pidfile.json` = Windows 下 `%AppData%\blind-llm-eyes\pidfile.json`，字段 pid/addr/token/startedAt；admin token 仅存此处，不持久化到别处
+- **Claude Code settings.json 路径**：`~/.claude/settings.json` = Windows `%USERPROFILE%\.claude\settings.json`，备份 `~/.claude/.bak-before-connect`（首次 connect 创建，重复 connect 永不覆盖）
 - **真实 API key** 在 `config.yaml`（gitignore），不在代码里
-- **pre-commit hook** 已配置（`git config core.hooksPath .githooks`），扫描 `sk-[A-Za-z0-9]{20,}` 阻止 key 泄露
+- **API key 注入优先级**：`config.yaml upstream.api_key` > 环境变量 `BLIND_UPSTREAM_API_KEY` / `BLIND_VISION_API_KEY`；UpstreamAPIKey 已配置时客户端 Authorization 会被显式剥离（防泄露）
+- **pre-commit hook** 已配置（`git config core.hooksPath .githooks`），扫描 `sk-[A-Za-z0-9]{20,}` 阻止 key 泄露；config-*-test.yaml 和 `.trae/` 已在 .gitignore
 - **git 历史已清理**：旧 commit 中的 API key 已用 `git filter-repo` 替换为 `REDACTED_USE_ENV_VAR`
-- **测试脚本用环境变量**：`smoke-fill-samples.py` 和 `test-failover.py` 通过 `BLIND_LLM_EYES_API_KEY` 环境变量读取 key
+- **goreleaser 交叉编译**：CGO_ENABLED=0（全依赖纯 Go，含 modernc.org/sqlite），6 目标：linux/darwin/windows × amd64/arm64；ldflags 注入 `buildinfo.Version`
+- **发布阻塞**：GITHUB_TOKEN 未设置时无法上传 GitHub Release Assets；本地 `goreleaser build --snapshot` 验证构建全通过
 
 ## 11. 相关文档
 
 | 文件 | 内容 |
 |------|------|
+| [RELEASE_NOTES-v1.0.0.md](./RELEASE_NOTES-v1.0.0.md) | **v1.0.0 发布说明**：7 大新功能 / 改进 / 5 E2E 用例表格 / 发布基础设施 / 升级指引 / 12 提交完整列表 / 已知限制 / 验证总结 |
 | [CONCURRENCY_DESIGN.md](./CONCURRENCY_DESIGN.md) | errgroup 并发优化 + concurrency_limit 设计文档 |
 | [docs/superpowers/specs/2026-08-12-multi-vision-provider-pool-design.md](./docs/superpowers/specs/2026-08-12-multi-vision-provider-pool-design.md) | P3 多 Provider 池设计规格文档 |
 | [vision-fallback-architecture.md](./vision-fallback-architecture.md) | 原始架构设计 v1 |
 | [vision-fallback-notes.md](./vision-fallback-notes.md) | 决策时间线 + 调研记录 |
+| [SMOKE_TEST_REPORT.md](./SMOKE_TEST_REPORT.md) | 生产冒烟测试报告（20 样本延迟数据 + AIMD 决策） |
 | [CONTEXT.md](./CONTEXT.md) | 项目上下文 |
-| [.trae/documents/plan-onboarding-productize.md](./.trae/documents/plan-onboarding-productize.md) | **产品化 onboarding 实施计划（已批准待实施）**：预编译二进制 + setup 向导 + connect/disconnect 接线 + cc-switch 导入 + [1m] 剥离，T1-T11 TDD 任务清单（注：.trae/ 在 gitignore，仅本地可见） |
+| [.trae/documents/plan-onboarding-productize.md](./.trae/documents/plan-onboarding-productize.md) | **产品化 onboarding 实施计划（已全部完成 2026-08-13）**：T1-T11 实际完成情况与 commit 对照表，验证总结（注：.trae/ 在 gitignore，仅本地可见） |
+| [.goreleaser.yaml](./.goreleaser.yaml) | goreleaser 6 平台交叉编译 + ldflags 配置 |
+| [.github/workflows/release.yml](./.github/workflows/release.yml) | GitHub Release CI：`v*` tag push → goreleaser release |
+| [Makefile](./Makefile) | Dev targets：`test` / `vet` / `build` / `snapshot` / `goreleaser-check` / `release` / `clean` |
