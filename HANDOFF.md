@@ -1,7 +1,7 @@
 # 交接文档 — blind-llm-eyes 视觉代理
 
-> **最近更新**：2026-08-13（代码审查 11 个问题修复 + 并发压力测试）
-> **状态**：MVP → P1 → P2 → P3 全部完成 + 代码审查修复。多 Vision Provider 池支持优先级故障转移 + 三态熔断器 + OpenAI 兼容客户端，端到端验证通过。代码审查发现 5 严重 + 4 中等 + 2 低优先级共 11 个问题全部修复，含 singleflight 数据竞争、HTTP 超时、缓存污染、Header 泄露、base64 解码冗余、递归深度限制等。跨请求并发压力测试通过 `-race` 检测。安全修复：API key 泄露清理 + pre-commit hook 防护。本地领先 origin/master 5 个 commit（待推送）
+> **最近更新**：2026-08-13（P5 上下文感知描述实现 + maxChars 截断 bug 修复）
+> **状态**：MVP → P1 → P2 → P3 → P5 全部完成。P5 上下文感知图片描述：新增 ContextualVisionProvider 接口 + 对话上下文提取（messages/context.go）+ MiMo/OpenAI client 上下文注入 + Pool 透传 + 配置化（context_rounds/context_max_chars）+ Handler 集成 + 详细日志（context_extract_complete / vision_call_dispatch / prompt_built）。9 个单元测试覆盖。maxChars 截断 bug 修复（i>0 → i<len-1 保护最新而非最旧消息）。go build + go vet + go test -race ./... 全绿。本地与 origin/master 同步
 
 ---
 
@@ -153,7 +153,7 @@
 - **多 Provider 池已验证**：故障转移 + 熔断器 + 跳过逻辑端到端通过
 - **安全防护已就位**：pre-commit hook 阻止 key 泄露，git 历史已清理
 - **并发安全已验证**：跨请求压力测试（20 goroutine + 100 并发采样）`-race` 无报告
-- **本地领先 origin/master 5 个 commit**（待推送）
+- **本地与 origin/master 同步**
 
 ### 下一步建议（按优先级）
 | 优先级 | 任务 | 说明 |
@@ -168,11 +168,10 @@
 | ✅ | ~~请求体大小上限~~ | **已完成**：MaxBodyBytes 413 + 配置化 |
 | ✅ | ~~核心流程日志增强~~ | **已完成**：9 个 stage 日志 + request_id 关联 |
 | ✅ | ~~代码审查 11 个问题~~ | **已完成**：5 严重 + 4 中等 + 2 低优先级全部修复 |
-| — | 推送到远程 | 本地领先 origin/master 5 个 commit |
+| ✅ P5 | ~~上下文感知描述~~ | **已完成**：ContextualVisionProvider 接口 + 上下文提取 + client 注入 + Pool 透传 + 配置化 + Handler 集成 + 日志增强 + maxChars 截断 bug 修复 |
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
-| **P5** | **上下文感知描述** | **下一迭代规划，详见第 12 节** |
 
 ---
 
@@ -445,17 +444,16 @@ c14d1a5 feat(vision): multi-provider pool with circuit breaker failover
 | ✅ 完成 | ~~安全修复~~ | key 泄露清理 + pre-commit hook + git 历史清理 |
 | ✅ 完成 | ~~代码审查 11 个问题~~ | 5 严重 + 4 中等 + 2 低优先级全部修复，含并发安全、性能优化、防御性编程 |
 | ✅ 完成 | ~~并发压力测试~~ | 跨请求 20 goroutine + AdaptiveConcurrency 100 并发采样，`-race` 无报告 |
-| — | 推送到远程 | 本地领先 origin/master 5 个 commit（待推送） |
+| ✅ 完成 | ~~P5 上下文感知描述~~ | ContextualVisionProvider 接口 + 上下文提取 + client/Pool 透传 + 配置化 + Handler 集成 + 日志增强 + maxChars bug 修复，详见第 12 节 |
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
-| **P5** | **上下文感知描述** | **下一迭代规划，详见下方第 12 节设计方案** |
 
 ---
 
-## 12. P5 设计方案：上下文感知图片描述
+## 12. P5 上下文感知图片描述（已实现）
 
-> **状态**：规划中，尚未实施。plan 文档（`.trae/documents/plan-tool-result-and-body-limit.md`）中标注为延后的 B 项。
+> **状态**：✅ 已完成。4 个 commit（`5329945` 接口层 → `d1a2db8` client 层 → `885852b` 配置+集成 → `aee0b15` bug 修复），go build + go vet + go test -race ./... 全绿。
 
 ### 问题
 
@@ -586,6 +584,22 @@ vision:
 - **singleflight**：同一张图的 singleflight key 不变（仍只 hash 图片内容），上下文不参与去重 key
 - **向后兼容**：`context_rounds: 0` 完全禁用，行为与当前一致；旧 provider 不实现新方法也能工作（默认实现回退）
 - **上下文泄露**：上下文文本会发送给 vision provider，需确认无敏感信息（与图片本身发送给 vision provider 的风险一致）
+
+#### 9. 实现总结（2026-08-13）
+
+**实际实现与设计方案的差异**：
+- 接口设计：未使用 `BaseProvider` 嵌入结构体，改为独立 `ContextualVisionProvider` 接口 + 调用方类型断言回退。更简洁，不侵入现有 provider。
+- 上下文提取：输出格式为 `[user] ...\n[assistant] ...`，递归收集 `tool_result` 内嵌套 text（深度限制 16），跳过所有 image 块。最后一条含 image 的 user 消息整体跳过。
+- 配置：支持环境变量 `BLIND_VISION_CONTEXT_ROUNDS` / `BLIND_VISION_CONTEXT_MAX_CHARS` 覆盖 YAML。`context_rounds < 0` 在 handler 中规范化为 0（禁用）。
+
+**新增日志 stage**：
+- `context_extract_complete`：status=ok/empty/disabled，含 message_count、context_chars、duration_ms
+- `vision_call_dispatch`：method=DescribeImageWithContext/DescribeImage，含 has_context、context_text
+- `prompt_built`（client 层）：system_prompt、context_block_text、desc_instruction，打印实际传给 vision 模型的完整文本 prompt
+
+**Bug 修复**：maxChars 截断逻辑 `i > 0` 保护的是最旧消息而非最新，改为 `i < len(formatted)-1`。回归测试 `TestExtract_MaxChars_TwoMessages_BothExceed`。
+
+**测试覆盖**：9 个单元测试（nil/empty、rounds=0、单轮、多轮截断、maxChars 截断、双消息超限、跳过 image、嵌套 tool_result、最后 user 含 image 跳过）。
 
 ## 10. 环境事实
 
