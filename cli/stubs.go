@@ -9,11 +9,3 @@ import "io"
 func runSetup(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return notImplemented("setup", stderr)
 }
-
-func runConnect(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	return notImplemented("connect", stderr)
-}
-
-func runDisconnect(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	return notImplemented("disconnect", stderr)
-}
