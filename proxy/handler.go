@@ -38,6 +38,8 @@ type HandlerDeps struct {
 	MaxBodyBytes        int64                // 请求体上限字节，<=0 时 NewHandler 兜底 20MB
 	ConcurrencyLimit    int                  // 单请求并发 vision 上限，<=0 时 NewHandler 兜底为 4
 	AdaptiveConcurrency *AdaptiveConcurrency // 自适应限流控制器；nil 等价于 static 行为
+	ContextRounds       int                  // P5：最近 N 轮对话，<=0 时禁用上下文感知（>0 才提取）
+	ContextMaxChars     int                  // P5：上下文最大字符数，<=0 时 NewHandler 兜底 2000
 	Log                 *slog.Logger
 	WG                  *sync.WaitGroup
 	Metrics             *metrics.Metrics // 可选：Prometheus 指标
@@ -59,6 +61,14 @@ func NewHandler(deps HandlerDeps) http.Handler {
 	}
 	if deps.LargeImageThreshold <= 0 {
 		deps.LargeImageThreshold = 1 << 20 // 1MB
+	}
+	// ContextRounds：仅当 >0 时启用上下文感知（config 中写 -1 或 0 都会被 handler 视为禁用）
+	// 注意：config loader 默认 3，如用户在 yaml 中写 -1 会被传为 -1，这里不改动
+	if deps.ContextRounds < 0 {
+		deps.ContextRounds = 0 // 规范化：负数统一视为 0（禁用），避免 ExtractConversationContext 参数混淆
+	}
+	if deps.ContextMaxChars <= 0 {
+		deps.ContextMaxChars = 2000
 	}
 	if deps.Log == nil {
 		deps.Log = slog.Default()
@@ -289,6 +299,46 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			"has_nested_source", toolResultCount > 0,
 		)
 
+		// 3.5) P5：预提取对话上下文（所有图片共享同一份上下文，只读不写无并发安全问题）
+		var contextText string
+		if h.deps.ContextRounds > 0 && len(req.Messages) > 0 {
+			ctxStart := time.Now()
+			contextText = messages.ExtractConversationContext(&req, h.deps.ContextRounds, h.deps.ContextMaxChars)
+			if len(contextText) > 0 {
+				log.Info("conversation context extracted",
+					"stage", "context_extract_complete",
+					"status", "ok",
+					"context_rounds_config", h.deps.ContextRounds,
+					"context_max_chars_config", h.deps.ContextMaxChars,
+					"context_chars", len(contextText),
+					"message_count", len(req.Messages),
+					"duration_ms", time.Since(ctxStart).Milliseconds(),
+				)
+			} else {
+				log.Warn("conversation context extracted but empty",
+					"stage", "context_extract_complete",
+					"status", "empty",
+					"context_rounds_config", h.deps.ContextRounds,
+					"context_max_chars_config", h.deps.ContextMaxChars,
+					"message_count", len(req.Messages),
+					"reason", "no text content found in recent messages (only images/tool results)",
+					"duration_ms", time.Since(ctxStart).Milliseconds(),
+				)
+			}
+		} else {
+			disableReason := "no messages in request"
+			if h.deps.ContextRounds <= 0 {
+				disableReason = "context_rounds<=0 (explicitly disabled)"
+			}
+			log.Info("context-aware description disabled",
+				"stage", "context_extract_complete",
+				"status", "disabled",
+				"context_rounds_config", h.deps.ContextRounds,
+				"reason", disableReason,
+				"message_count", len(req.Messages),
+			)
+		}
+
 		// 4) 并行处理图片：查缓存 → 未命中调视觉
 		// 用 errgroup 并发执行。singleflight fn 内部用独立 ctx，不依赖 gctx，
 		// 所以用普通 errgroup.Group 即可（无需 WithContext 的 cancel 语义）。
@@ -428,7 +478,32 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 					dedupCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 					defer cancel()
 					dedupCtx = logging.WithRequestID(dedupCtx, requestID)
-					res.Desc, res.Err = h.deps.VisionProvider.DescribeImage(dedupCtx, blk.Source.Data, blk.Source.MediaType, imageSize)
+					// P5：优先调用带上下文的方法；provider 未实现时回退到无上下文的 DescribeImage
+					if cvp, ok := h.deps.VisionProvider.(vision.ContextualVisionProvider); ok {
+						log.Info("dispatching vision call with context",
+							"stage", "vision_call_dispatch",
+							"index", i,
+							"hash", hash,
+							"method", "DescribeImageWithContext",
+							"has_context", contextText != "",
+							"context_chars", len(contextText),
+							"context_text", contextText,
+							"image_size_bytes", imageSize,
+							"is_large", isLarge,
+						)
+						res.Desc, res.Err = cvp.DescribeImageWithContext(dedupCtx, blk.Source.Data, blk.Source.MediaType, imageSize, contextText)
+					} else {
+						log.Info("dispatching vision call without context (fallback)",
+							"stage", "vision_call_dispatch",
+							"index", i,
+							"hash", hash,
+							"method", "DescribeImage",
+							"reason", "provider does not implement ContextualVisionProvider",
+							"image_size_bytes", imageSize,
+							"is_large", isLarge,
+						)
+						res.Desc, res.Err = h.deps.VisionProvider.DescribeImage(dedupCtx, blk.Source.Data, blk.Source.MediaType, imageSize)
+					}
 					res.FnEnd = time.Now()
 					// fn 内部写缓存：确保等待者从 SF.Do 返回时缓存已就绪，
 					// 避免 errgroup 释放 semaphore 后下一个 goroutine 查缓存 miss
@@ -461,6 +536,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 					"sf_total_ms", visionMs,
 					"fn_exec_ms", fnExecMs,
 					"sf_wait_ms", sfWaitMs,
+					"has_context", contextText != "",
 				)
 
 				// 只让 singleflight executor（非等待者）上报 fn_exec_ms 样本，

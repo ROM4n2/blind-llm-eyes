@@ -8,6 +8,9 @@ vision:
   model: "mimo-v2.5"                                # 有视觉的那个（opus 等级）
   timeout: "60s"
   description_cap: 1000                            # max_tokens；thinking 已禁用，实测生成 1000-1300 chars，1000 足够
+  # ── P5 上下文感知描述（默认 3 轮 / 2000 字） ──
+  context_rounds: 3                                # 最近 N 轮对话传给 vision provider。0/不写 → 默认 3；写 -1 → 显式禁用
+  context_max_chars: 2000                          # 上下文最大字符数（约 500 tokens），超出时整轮次截断早期对话，保留最新
 cache:
   max_entries: 500                                  # 纯内存 LRU 容量
 concurrency_limit: 6                                # 单请求内并发 vision 调用上限（errgroup.SetLimit），覆盖典型 2-6 图场景；也作为 adaptive 的初始值

@@ -51,6 +51,9 @@ func main() {
 		"adaptive_range", fmt.Sprintf("[%d, %d]", cfg.AdaptiveConcurrency.MinLimit, cfg.AdaptiveConcurrency.MaxLimit),
 		"adaptive_threshold_ms", fmt.Sprintf("fast=%d slow=%d",
 			cfg.AdaptiveConcurrency.FastThresholdMs, cfg.AdaptiveConcurrency.SlowThresholdMs),
+		"context_rounds", cfg.Vision.ContextRounds,
+		"context_max_chars", cfg.Vision.ContextMaxChars,
+		"context_enabled", cfg.Vision.ContextRounds > 0,
 	)
 
 	// 初始化 Prometheus Metrics
@@ -158,6 +161,8 @@ func main() {
 		MaxBodyBytes:        cfg.MaxBodyBytes,
 		ConcurrencyLimit:    cfg.ConcurrencyLimit,
 		AdaptiveConcurrency: ac,
+		ContextRounds:       cfg.Vision.ContextRounds,
+		ContextMaxChars:     cfg.Vision.ContextMaxChars,
 		Log:                 logger,
 		WG:                  &wg,
 		Metrics:             m,
