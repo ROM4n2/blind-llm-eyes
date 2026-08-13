@@ -113,6 +113,10 @@ func (b *ContentBlock) UnmarshalJSON(data []byte) error {
 // tool_result 特殊处理：从 raw 提取所有原始字段，只覆盖 content（嵌套 image
 // 替换后 raw 中的旧 content 已过期）。保留 tool_use_id 等未知字段。
 // 如果 raw 为空（极端情况），回退到结构体字段。
+//
+// 注意：仅当 b.Content 非空时才覆盖 raw["content"]。若 Content 为 nil，
+// json.Marshal 会产生 "null"，这会破坏 API 契约（上游期望 content 为数组，
+// 或原始 JSON 中本就没有 content 字段），因此保留 raw 中的原值。
 func (b ContentBlock) MarshalJSON() ([]byte, error) {
 	// tool_result：合并 raw + 覆盖 content
 	if b.Type == ContentTypeToolResult && len(b.raw) > 0 {
@@ -121,11 +125,14 @@ func (b ContentBlock) MarshalJSON() ([]byte, error) {
 			// raw 损坏，回退到结构体字段重建
 			return b.marshalFromFields()
 		}
-		contentBytes, err := json.Marshal(b.Content)
-		if err != nil {
-			return nil, err
+		// 仅当 Content 有实际内容时才覆盖，避免用 null 覆盖原始数组
+		if len(b.Content) > 0 {
+			contentBytes, err := json.Marshal(b.Content)
+			if err != nil {
+				return nil, err
+			}
+			raw["content"] = contentBytes
 		}
-		raw["content"] = contentBytes
 		return json.Marshal(raw)
 	}
 

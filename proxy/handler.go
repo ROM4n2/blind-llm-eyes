@@ -259,9 +259,12 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		// 3) 找图
 		imgs := messages.FindImageBlocks(&req)
 		var totalImageBytes int64
-		for _, blk := range imgs {
-			raw, _ := base64.StdEncoding.DecodeString(blk.Source.Data)
-			totalImageBytes += int64(len(raw))
+		// 预解码所有图片的 base64 数据，后续 hash 和 goroutine 复用，避免重复解码
+		decodedImages := make([][]byte, len(imgs))
+		decodeErrors := make([]error, len(imgs))
+		for idx, blk := range imgs {
+			decodedImages[idx], decodeErrors[idx] = base64.StdEncoding.DecodeString(blk.Source.Data)
+			totalImageBytes += int64(len(decodedImages[idx]))
 		}
 		// 统计 tool_result 块数量，判断是否有嵌套图片来源
 		toolResultCount := 0
@@ -324,8 +327,12 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 					"total_images", len(imgs),
 				)
 
-				hash, herr := cache.HashFromBase64Data(blk.Source.Data)
-				rawBytes, _ := base64.StdEncoding.DecodeString(blk.Source.Data)
+				rawBytes := decodedImages[i]
+				herr := decodeErrors[i]
+				var hash string
+				if herr == nil {
+					hash = cache.HashFromRawBytes(rawBytes)
+				}
 				imageSize := int64(len(rawBytes))
 				isLarge := imageSize >= h.deps.LargeImageThreshold
 
@@ -608,7 +615,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			"status", "failed_passthrough",
 			"err", parseErr,
 			"body_bytes", len(rawBody),
-			"body_preview", truncate(string(rawBody), 200),
+			"body_preview", truncateBytes(rawBody, 200),
 		)
 	}
 
@@ -913,4 +920,13 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// truncateBytes 直接操作字节切片，只把需要的前 n 字节转换为字符串，
+// 避免把整个 rawBody（可能数 MB）一次性转为字符串造成大块内存分配。
+func truncateBytes(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "..."
 }
