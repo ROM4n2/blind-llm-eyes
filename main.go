@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ROM4n2/blind-llm-eyes/admin"
 	"github.com/ROM4n2/blind-llm-eyes/cache"
 	"github.com/ROM4n2/blind-llm-eyes/cli"
 	"github.com/ROM4n2/blind-llm-eyes/config"
@@ -155,6 +156,28 @@ func runServer(args []string) {
 		w.Write([]byte("ok"))
 	})
 
+	// Admin shutdown endpoint + pidfile (used by the status/stop subcommands).
+	// The token is generated per-start and written to the pidfile so "stop" can
+	// authenticate. bind 127.0.0.1 (default listen) keeps the endpoint local.
+	pidfilePath, err := cli.DefaultPidfilePath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "locate pidfile path: %v\n", err)
+		os.Exit(1)
+	}
+	adminToken := admin.MustGenerateToken(32)
+	adminH := admin.NewShutdownHandler(adminToken)
+	mux.Handle("/admin/shutdown", adminH)
+	pid := os.Getpid()
+	if err := cli.WritePidfile(pidfilePath, cli.PidfileData{
+		PID:       pid,
+		Addr:      cfg.Listen,
+		Token:     adminH.Token(),
+		StartedAt: time.Now(),
+	}); err != nil {
+		logger.Error("write pidfile", "err", err)
+	}
+	defer os.Remove(pidfilePath)
+
 	srv := &http.Server{
 		Addr:         cfg.Listen,
 		Handler:      mux,
@@ -173,30 +196,33 @@ func runServer(args []string) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	select {
-	case err := <-errCh:
-		logger.Error("server failed", "err", err)
-		logWriter.Close()
-		os.Exit(1)
-	case sig := <-sigCh:
+	// gracefulShutdown stops accepting new requests, drains in-flight work, then
+	// returns so the deferred pidfile removal + log flush run. Shared by the
+	// signal and admin-requested shutdown paths.
+	gracefulShutdown := func(reason string) {
 		logger.Info("shutting down gracefully",
-			"signal", sig,
+			"reason", reason,
 			"waiting_for_inflight_requests", true,
 		)
-
-		// 1) 停止接受新请求（给在途请求 15s 时间完成）
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
 			logger.Error("server shutdown error", "err", err)
 		}
-
-		// 2) 等待所有在途请求完成
 		logger.Info("waiting for in-flight requests to complete...")
 		wg.Wait()
 		logger.Info("all in-flight requests completed, shutting down")
+	}
 
-		// 3) 刷新日志缓冲
+	select {
+	case err := <-errCh:
+		logger.Error("server failed", "err", err)
+		os.Remove(pidfilePath) // defers don't run before os.Exit
 		logWriter.Close()
+		os.Exit(1)
+	case sig := <-sigCh:
+		gracefulShutdown(fmt.Sprintf("signal %s", sig))
+	case <-adminH.Done():
+		gracefulShutdown("admin request")
 	}
 }

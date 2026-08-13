@@ -75,8 +75,6 @@ func TestRun_Routing(t *testing.T) {
 		{"doctor not implemented", []string{"doctor"}, 2, "not implemented", "unknown command"},
 		{"connect not implemented", []string{"connect"}, 2, "not implemented", "unknown command"},
 		{"disconnect not implemented", []string{"disconnect"}, 2, "not implemented", "unknown command"},
-		{"status not implemented", []string{"status"}, 2, "not implemented", "unknown command"},
-		{"stop not implemented", []string{"stop"}, 2, "not implemented", "unknown command"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
