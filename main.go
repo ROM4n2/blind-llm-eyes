@@ -92,49 +92,7 @@ func main() {
 	// 构造 VisionProvider：多 provider 池模式（vision_providers 非空）或单 provider 模式（向后兼容）
 	var visionProvider vision.VisionProvider
 	if len(cfg.VisionProviders) > 0 {
-		entries := make([]vision.PoolEntry, 0, len(cfg.VisionProviders))
-		for _, pc := range cfg.VisionProviders {
-			var p vision.VisionProvider
-			switch pc.Type {
-			case "mimo":
-				p = vision.NewClient(
-					strings.TrimRight(pc.BaseURL, "/"),
-					pc.APIKey,
-					pc.Model,
-					pc.Timeout,
-					pc.LargeTimeout,
-					pc.LargeImageThreshold,
-					pc.DescriptionCap,
-					pc.SupportedFormats,
-					logger,
-				)
-			case "openai_compatible":
-				p = vision.NewOpenAIClient(
-					strings.TrimRight(pc.BaseURL, "/"),
-					pc.APIKey,
-					pc.Model,
-					pc.Timeout,
-					pc.LargeTimeout,
-					pc.LargeImageThreshold,
-					pc.DescriptionCap,
-					pc.SupportedFormats,
-					logger,
-				)
-			default:
-				fmt.Fprintf(os.Stderr, "unknown provider type %q for %q\n", pc.Type, pc.Name)
-				os.Exit(1)
-			}
-			entries = append(entries, vision.PoolEntry{
-				Name:                pc.Name,
-				Provider:            p,
-				Priority:            pc.Priority,
-				CB:                  vision.NewCircuitBreaker(pc.CircuitBreaker.FailureThreshold, pc.CircuitBreaker.ResetTimeout),
-				Timeout:             pc.Timeout,
-				LargeTimeout:        pc.LargeTimeout,
-				LargeImageThreshold: pc.LargeImageThreshold,
-			})
-		}
-		pool, err := vision.NewPool(entries, logger, m)
+		pool, err := vision.BuildPool(cfg.VisionProviders, logger, m)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "build vision pool: %v\n", err)
 			os.Exit(1)
@@ -145,17 +103,12 @@ func main() {
 			"mode", "pool",
 		)
 	} else {
-		visionProvider = vision.NewClient(
-			strings.TrimRight(cfg.Vision.BaseURL, "/"),
-			cfg.Vision.APIKey,
-			cfg.Vision.Model,
-			cfg.Vision.Timeout,
-			cfg.Vision.LargeTimeout,
-			cfg.Vision.LargeImageThreshold,
-			cfg.Vision.DescriptionCap,
-			cfg.Vision.SupportedFormats,
-			logger,
-		)
+		p, err := vision.BuildSingleProvider(cfg.Vision, logger)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "build vision provider: %v\n", err)
+			os.Exit(1)
+		}
+		visionProvider = p
 		logger.Info("single-provider mode",
 			"mode", "single",
 			"vision_model", cfg.Vision.Model,
