@@ -1,7 +1,7 @@
 # 交接文档 — blind-llm-eyes 视觉代理
 
-> **最近更新**：2026-08-13（P3 多 Provider 池 + 熔断故障转移 + 安全修复 + 日志增强）
-> **状态**：MVP → P1 → P2 → P3 全部完成。多 Vision Provider 池支持优先级故障转移 + 三态熔断器 + OpenAI 兼容客户端，端到端验证通过。安全修复：API key 泄露清理 + pre-commit hook 防护。已推送到 origin/master（git 历史已用 git filter-repo 清理）
+> **最近更新**：2026-08-13（代码审查 11 个问题修复 + 并发压力测试）
+> **状态**：MVP → P1 → P2 → P3 全部完成 + 代码审查修复。多 Vision Provider 池支持优先级故障转移 + 三态熔断器 + OpenAI 兼容客户端，端到端验证通过。代码审查发现 5 严重 + 4 中等 + 2 低优先级共 11 个问题全部修复，含 singleflight 数据竞争、HTTP 超时、缓存污染、Header 泄露、base64 解码冗余、递归深度限制等。跨请求并发压力测试通过 `-race` 检测。安全修复：API key 泄露清理 + pre-commit hook 防护。本地领先 origin/master 5 个 commit（待推送）
 
 ---
 
@@ -117,13 +117,43 @@
       - Req 4-5：primary 被跳过（circuit open），直接命中 fallback
     - Metrics 验证：`circuit_breaker_state{provider="mimo-broken"}=1`(OPEN) / `failover_events_total=3` / `provider_calls_total{result="skipped"}=2`
 
+19. **tool_result 嵌套 image 支持** (commit `4fa5821` 前置)
+    - `messages/content.go` MarshalJSON 合并 raw 策略：tool_result 保留原始字段，仅覆盖 content
+    - `messages/parse.go` FindImageBlocks 递归查找 tool_result 内嵌 image 块
+    - `messages/rewrite.go` ReplaceImageWithDescription 先 Marshal 再赋值，保证状态一致
+    - `proxy/handler.go` 请求体大小上限 413（MaxBodyBytes 默认 20MB）
+    - Validate 放行未知 content block 类型（删除白名单）
+
+20. **核心流程日志增强** (commit `4fa5821` 前置)
+    - 9 个 stage 日志：request_start / body_read_complete / json_parse_complete / system_normalize_complete / validate_complete / find_images_complete / image_cache_hit / image_cache_miss / remarshal_complete
+    - 每条含 request_id 关联，支持 grep 按 stage 过滤
+
+21. **代码审查：5 个严重问题修复** (commit `4fa5821`)
+    - **singleflight 数据竞争**：fnStart/fnEnd 在 executor 写入、waiter 读取导致竞态 → 新增 `visionResult` 结构体封装返回值，耗时数据与业务数据一起通过返回值传递
+    - **上游 HTTP 无超时**：`http.DefaultClient` 无超时，上游挂起时代理永久阻塞 → 自定义 `http.Client`（30s 连接超时 + 90s 空闲超时 + 连接池）
+    - **ReplaceImageWithDescription 静默丢失 Marshal 错误**：先改 blk.Type 再 Marshal，失败时状态不一致 → 先 Marshal 成功再修改字段
+    - **Hash 失败污染缓存**：空 hash key 导致所有 hash 失败的图片去重到同一 key → hash 失败时提前返回，不进入缓存和 singleflight
+    - **Authorization Header 泄露**：客户端 Authorization 被转发到上游 → 显式过滤 Authorization / Proxy-Authorization / Cookie
+
+22. **代码审查：4 个中等问题修复** (commit `467f6c7`)
+    - **三次 base64 解码冗余**：统计/hash/goroutine 各解码一次 → 新增 `HashFromRawBytes`，预解码所有图片存入 `decodedImages` 复用
+    - **truncate 内存分配**：`truncate(string(rawBody),200)` 将整个请求体转为字符串 → 新增 `truncateBytes` 直接操作字节切片，仅转换前 N 字节
+    - **collectImageBlocks 无界递归**：恶意构造深度嵌套可栈溢出 → 新增 `maxCollectDepth=16` 限制
+    - **MarshalJSON 空 Content 覆盖 null**：空 Content 数组被 marshal 为 `null` 覆盖原始 JSON → 仅 `len(Content)>0` 时才覆盖
+
+23. **代码审查：2 个低优先级问题修复 + 并发压力测试** (commit `c0a2fa7`)
+    - **合并 message 遍历**：toolResultCount 合并到统计遍历中，消除一次完整 req.Messages 遍历
+    - **NewHandler nil 检查补全**：新增 `UpstreamBaseURL` 空字符串 panic + `LargeImageThreshold` 默认 1MB
+    - **跨请求并发压力测试**：20 goroutine 混合 3 种图片组合（含嵌套 tool_result），vision 调用从潜在 40 次去重到 3 次；AdaptiveConcurrency 100 次并发 RecordSample 无竞态
+
 ### 当前状态
-- **MVP → P1 → P2 → P3 全部完成**，已推送到 origin/master
+- **MVP → P1 → P2 → P3 全部完成 + 代码审查 11 个问题全部修复**
 - **go test -race ./... 全绿**，`go build` / `go vet` 零警告
 - **服务可运行**：`go run . -config config.yaml` 启动后监听 127.0.0.1:8790
 - **多 Provider 池已验证**：故障转移 + 熔断器 + 跳过逻辑端到端通过
 - **安全防护已就位**：pre-commit hook 阻止 key 泄露，git 历史已清理
-- **handler.go 零改动**：P3 透明注入 Pool，singleflight / errgroup / AIMD 全部不变
+- **并发安全已验证**：跨请求压力测试（20 goroutine + 100 并发采样）`-race` 无报告
+- **本地领先 origin/master 5 个 commit**（待推送）
 
 ### 下一步建议（按优先级）
 | 优先级 | 任务 | 说明 |
@@ -134,6 +164,11 @@
 | ✅ P3 | ~~多 vision provider 池~~ | **已完成**：Provider 池 + 熔断器 + OpenAI 客户端 + 故障转移验证 |
 | ✅ | ~~安全修复~~ | **已完成**：key 泄露清理 + pre-commit hook + git 历史清理 |
 | ✅ | ~~system message 修复~~ | **已完成**：NormalizeSystemMessages 修复 Claude Code 400 错误 |
+| ✅ | ~~tool_result 嵌套 image~~ | **已完成**：递归查找 + 合并 raw 序列化 + round-trip 测试 |
+| ✅ | ~~请求体大小上限~~ | **已完成**：MaxBodyBytes 413 + 配置化 |
+| ✅ | ~~核心流程日志增强~~ | **已完成**：9 个 stage 日志 + request_id 关联 |
+| ✅ | ~~代码审查 11 个问题~~ | **已完成**：5 严重 + 4 中等 + 2 低优先级全部修复 |
+| — | 推送到远程 | 本地领先 origin/master 5 个 commit |
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
@@ -179,6 +214,12 @@ Pool 内部（vision/pool.go）:
 | 熔断器 | 三态（Closed/Open/Half-open） | 连续失败达阈值 → 开启跳过；reset_timeout 后半开试探；成功恢复 / 失败重开 |
 | 故障转移策略 | 优先级 failover | 简单可靠，backup 仅在 primary 故障时启用；加权 LB 留作 P4 |
 | 配置兼容 | `vision_providers` 缺省 = 单 provider | 向后兼容，现有 config.yaml 无需改动 |
+| singleflight 返回值 | `visionResult` 结构体封装 | 消除 executor/waiter 间 fnStart/fnEnd 数据竞争 |
+| 上游 HTTP 客户端 | 自定义 `http.Client` + 30s 连接超时 | 防止上游挂起时代理永久阻塞；不设整体超时以支持 SSE 流式 |
+| base64 解码 | 预解码一次复用 `decodedImages` | 消除统计/hash/goroutine 三次冗余解码 |
+| 递归深度限制 | `maxCollectDepth=16` | 防止恶意深度嵌套 tool_result 导致栈溢出 |
+| 日志预览截断 | `truncateBytes` 直接操作字节 | 避免 `string(rawBody)` 分配完整请求体内存 |
+| 请求头过滤 | 显式剥离 Authorization/Cookie | 防止客户端凭据泄露到上游（当 UpstreamAPIKey 已配置时） |
 
 ## 3. 代码结构
 
@@ -204,9 +245,12 @@ blind-llm-eyes/
 │   ├── pool_test.go            # 池测试（优先级/故障转移/熔断/并发）
 │   └── circuit_breaker_test.go # 熔断器测试（状态转换/半开/并发）
 ├── proxy/
-│   ├── handler.go              # 核心代理逻辑（errgroup + singleflight + AIMD）
+│   ├── handler.go              # 核心代理逻辑（errgroup + singleflight + AIMD + 安全过滤）
 │   ├── adaptive.go             # AIMD 自适应限流控制器
-│   └── passthrough.go          # 流式响应透传
+│   ├── passthrough.go          # 流式响应透传
+│   ├── handler_integration_fix_test.go  # 5 个严重问题修复集成测试
+│   ├── handler_medium_fix_test.go       # 4 个中等问题修复 + 端到端嵌套测试
+│   └── handler_race_stress_test.go      # 跨请求并发压力测试（-race）
 ├── cache/
 │   ├── lru.go                  # LRU 缓存
 │   └── hash.go                 # SHA-256 内容哈希
@@ -358,9 +402,12 @@ go test -race -v -run TestHandler_ ./proxy/
 - `proxy/handler_test.go` — 基础代理逻辑
 - `proxy/handler_concurrency_test.go` — errgroup 并行（5 图 × 2s mock，验证 4+1 批次）+ concurrency_limit 配置化 + 自适应限流跨请求集成测试
 - `proxy/handler_singleflight_test.go` — singleflight 去重（stampede / cross-request / ctx 隔离）
+- `proxy/handler_integration_fix_test.go` — 5 个严重问题修复集成测试（race / timeout / marshal / cache pollution / header leak）
+- `proxy/handler_medium_fix_test.go` — 4 个中等问题修复 + 嵌套 tool_result 端到端测试
+- `proxy/handler_race_stress_test.go` — 跨请求并发压力测试（20 goroutine 混合图片 + AdaptiveConcurrency 100 并发采样）
 - `proxy/adaptive_test.go` — AIMD 控制器单元测试（increase / decrease / error-trigger / hysteresis / disabled-is-static）
 - `vision/client_test.go` — MiMo Anthropic API 调用
-- `messages/*_test.go` — 请求解析/改写/校验
+- `messages/*_test.go` — 请求解析/改写/校验（含嵌套 tool_result round-trip 测试）
 - `cache/lru_test.go` — LRU 缓存
 - `logging/logging_test.go` — 异步日志
 - `metrics/metrics_test.go` — Prometheus 指标
@@ -375,14 +422,14 @@ go test -race -v -run TestHandler_ ./proxy/
 ## 8. 最近 commit
 
 ```
+c0a2fa7 fix(proxy): merge message traversals and add missing nil checks in NewHandler
+467f6c7 fix: resolve 4 medium-priority issues in image processing pipeline
+4fa5821 fix(proxy): resolve 5 critical bugs in image processing pipeline
+206f1d6 feat(messages): add support for tool_result content type
+6b7dde0 feat(vision): add circuit breaker stats and improve failover logging
 c8dd7b9 chore(pre-commit): update api key detection pattern to cover more services
 c14d1a5 feat(vision): multi-provider pool with circuit breaker failover
 14858c0 fix(proxy): normalize system messages before validation
-ecdcb8c chore: remove leaked API key and add pre-commit guard
-04665a0 chore: initial project setup and configuration
-02ecff5 docs: update handoff for session handoff
-c5cd7a6 chore(config): tune adaptive parameters based on smoke test data
-870981c docs: add adaptive concurrency smoke test report
 ```
 
 > 注：commit hash 在 git filter-repo 清理后已变更，旧 hash 不再有效。
@@ -395,6 +442,9 @@ c5cd7a6 chore(config): tune adaptive parameters based on smoke test data
 | ✅ 完成 | ~~P2 自适应限流~~ | AIMD 控制器 + 单测 + 集成测试 + 端到端验证 + 冒烟测试 + 配置调优 |
 | ✅ 完成 | ~~P3 多 Provider 池~~ | Provider 池 + 熔断器 + OpenAI 客户端 + 故障转移验证 + 详细日志 |
 | ✅ 完成 | ~~安全修复~~ | key 泄露清理 + pre-commit hook + git 历史清理 |
+| ✅ 完成 | ~~代码审查 11 个问题~~ | 5 严重 + 4 中等 + 2 低优先级全部修复，含并发安全、性能优化、防御性编程 |
+| ✅ 完成 | ~~并发压力测试~~ | 跨请求 20 goroutine + AdaptiveConcurrency 100 并发采样，`-race` 无报告 |
+| — | 推送到远程 | 本地领先 origin/master 5 个 commit（待推送） |
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
