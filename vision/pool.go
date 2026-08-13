@@ -17,6 +17,21 @@ type PoolEntry struct {
 	Provider VisionProvider
 	Priority int             // 数值越小优先级越高（越先尝试）
 	CB       *CircuitBreaker // 可为 nil（单 provider 场景下不熔断）
+	// Timeout / LargeTimeout / LargeImageThreshold 用于在 Pool 层为每次 provider
+	// 尝试创建独立的 WithTimeout 子 ctx，避免共享 parent deadline 饿死 fallback。
+	// 都 <=0 时 Pool 不设独立超时，直接透传 parent ctx（由 provider 内部自行管理超时）。
+	Timeout             time.Duration
+	LargeTimeout        time.Duration
+	LargeImageThreshold int64
+}
+
+// selectTimeout 按 imageSize 选择该 entry 的超时：大图用 LargeTimeout，否则 Timeout。
+// 返回 0 表示不设独立超时。
+func selectTimeout(entry *PoolEntry, imageSize int64) time.Duration {
+	if entry.LargeImageThreshold > 0 && imageSize >= entry.LargeImageThreshold && entry.LargeTimeout > 0 {
+		return entry.LargeTimeout
+	}
+	return entry.Timeout
 }
 
 // Pool 是多 Vision Provider 池，实现 VisionProvider 接口。
@@ -154,6 +169,9 @@ func (p *Pool) describeImageInternal(ctx context.Context, base64Data, mediaType 
 		if _, ok := entry.Provider.(ContextualVisionProvider); ok {
 			isContextual = true
 		}
+		// 为本次尝试选择独立 timeout：大图用 LargeTimeout，否则 Timeout。
+		// Pool 层设独立 WithTimeout 子 ctx，避免共享 parent deadline 饿死 fallback。
+		selectedTimeout := selectTimeout(entry, imageSize)
 		log.Info("provider call started",
 			"stage", "provider_call_start",
 			"status", "info",
@@ -165,19 +183,14 @@ func (p *Pool) describeImageInternal(ctx context.Context, base64Data, mediaType 
 			"total_providers", len(p.providers),
 			"context_chars", len(contextText),
 			"contextual", isContextual,
+			"timeout_ms", selectedTimeout.Milliseconds(),
 		)
 
-		// 3. 调用 provider — 根据是否实现 ContextualVisionProvider 分流
-		pStart := time.Now()
-		var desc string
-		var pErr error
-		if cvp, ok := entry.Provider.(ContextualVisionProvider); ok {
-			desc, pErr = cvp.DescribeImageWithContext(ctx, base64Data, mediaType, imageSize, contextText)
-		} else {
-			desc, pErr = entry.Provider.DescribeImage(ctx, base64Data, mediaType, imageSize)
-		}
+		// 3. 调用 provider — 提取到 callProvider 方法，每次尝试用独立 WithTimeout
+		//    子 ctx，且 defer cancel() 在方法返回时立即执行（避免循环内 defer 累积
+		//    导致 ctx timer 存活到 describeImageInternal 结束的反模式）。
+		desc, pErr, pElapsed := p.callProvider(ctx, entry, selectedTimeout, base64Data, mediaType, imageSize, contextText)
 		err := pErr
-		pElapsed := time.Since(pStart)
 
 		// 4. 记录结果
 		if err == nil {
@@ -283,6 +296,26 @@ func (p *Pool) describeImageInternal(ctx context.Context, base64Data, mediaType 
 		"failover_count", failoverCount,
 	)
 	return "", fmt.Errorf("all %d providers failed or circuit-open (last: %w)", len(p.providers), lastErr)
+}
+
+// callProvider 调用单个 provider，用独立 WithTimeout 子 ctx 管理本次尝试的超时。
+// 提取为独立方法确保 defer cancel() 在每次调用返回时立即执行，避免循环内 defer
+// 累积（Go 反模式）：否则 N 个 provider 的 ctx timer 会存活到 describeImageInternal
+// 结束才被清理。timeout <= 0 时直接透传 parent ctx（由 provider 内部自行管理超时）。
+func (p *Pool) callProvider(ctx context.Context, entry *PoolEntry, timeout time.Duration, base64Data, mediaType string, imageSize int64, contextText string) (desc string, err error, elapsed time.Duration) {
+	callCtx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		callCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	start := time.Now()
+	if cvp, ok := entry.Provider.(ContextualVisionProvider); ok {
+		desc, err = cvp.DescribeImageWithContext(callCtx, base64Data, mediaType, imageSize, contextText)
+	} else {
+		desc, err = entry.Provider.DescribeImage(callCtx, base64Data, mediaType, imageSize)
+	}
+	return desc, err, time.Since(start)
 }
 
 // ProviderNames 返回池中所有 provider 的名称（按优先级顺序），用于启动日志。

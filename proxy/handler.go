@@ -468,14 +468,17 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 
 				vStart := time.Now()
 				// singleflight：同 hash 并发调用合并为一次 vision 请求
-				// fn 内部用独立 ctx（context.Background + 120s timeout），避免某个调用者
-				// 取消请求导致其他等待者也失败
+				// fn 内部用独立 ctx（context.Background + WithCancel），避免某个调用者
+				// 取消请求导致其他等待者也失败。
+				// 注意：这里不再设共享硬截止 deadline —— per-provider 的 timeout 由 Pool 层
+				// 用独立 WithTimeout 子 ctx 管理，否则共享父 deadline 会饿死 fallback
+				// （第一个 provider 耗满预算后，后续 provider 拿到已过期 ctx 瞬间失败）。
 				// 耗时数据（FnStart/FnEnd）封装在 visionResult 中返回，
 				// 消除 executor 与 waiter goroutine 之间的数据竞争
 				v, verr, shared := h.sf.Do(hash, func() (any, error) {
 					res := &visionResult{}
 					res.FnStart = time.Now()
-					dedupCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+					dedupCtx, cancel := context.WithCancel(context.Background())
 					defer cancel()
 					dedupCtx = logging.WithRequestID(dedupCtx, requestID)
 					// P5：优先调用带上下文的方法；provider 未实现时回退到无上下文的 DescribeImage

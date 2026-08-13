@@ -353,3 +353,128 @@ func TestPool_ProviderNames(t *testing.T) {
 		}
 	}
 }
+
+// deadlineCheckingProvider 检查传入的 ctx 是否已过期，用于验证 fallback 是否被共享
+// deadline 饿死。若 ctx 已过期则记录 ctxAlreadyExpired=true 并返回 ctx.Err()。
+type deadlineCheckingProvider struct {
+	name              string
+	result            string
+	callCount         atomic.Int64
+	ctxAlreadyExpired bool
+}
+
+func (p *deadlineCheckingProvider) DescribeImage(ctx context.Context, base64Data, mediaType string, imageSize int64) (string, error) {
+	p.callCount.Add(1)
+	select {
+	case <-ctx.Done():
+		p.ctxAlreadyExpired = true
+		return "", ctx.Err()
+	default:
+		return p.result, nil
+	}
+}
+
+// TestPool_FailoverNotStarvedBySharedDeadline 验证修复：第一个 provider 耗满自己的
+// timeout 后，fallback 拿到从 parent 派生的全新子 ctx（未过期），能正常尝试。
+//
+// 回归 bug：handler.go singleflight fn 用 WithTimeout(Background, 120s) 作为共享父
+// deadline，Pool 把同一 ctx 顺序传给所有 provider。当第一个 provider 的 timeout ==
+// 父 deadline 时，耗满后 fallback 拿到已过期 ctx 瞬间 context.DeadlineExceeded。
+//
+// 修复：parent 只做 cancel 传播（WithCancel），Pool 每次尝试用独立 WithTimeout 创建
+// 子 ctx，互不影响。
+func TestPool_FailoverNotStarvedBySharedDeadline(t *testing.T) {
+	// p1 阻塞到 ctx 超时（模拟 provider 耗满自己的 timeout）
+	p1 := &mockProvider{name: "primary", delay: 1 * time.Second}
+	// p2 检查传入的 ctx 是否已过期
+	p2 := &deadlineCheckingProvider{name: "fallback", result: "fallback-ok"}
+
+	entries := []PoolEntry{
+		{Name: "primary", Provider: p1, Priority: 1, CB: NewCircuitBreaker(5, 30*time.Second), Timeout: 100 * time.Millisecond},
+		{Name: "fallback", Provider: p2, Priority: 2, CB: NewCircuitBreaker(5, 30*time.Second), Timeout: 100 * time.Millisecond},
+	}
+	pool, _ := NewPool(entries, slog.Default(), nil)
+
+	// parent ctx 无 deadline，模拟 handler.go 修复后的 WithCancel(Background)
+	start := time.Now()
+	desc, err := pool.DescribeImage(context.Background(), "data", "image/png", 100)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("want fallback success, got err: %v", err)
+	}
+	if desc != "fallback-ok" {
+		t.Errorf("want %q, got %q", "fallback-ok", desc)
+	}
+	if p2.callCount.Load() != 1 {
+		t.Errorf("fallback call count: want 1, got %d", p2.callCount.Load())
+	}
+	if p2.ctxAlreadyExpired {
+		t.Errorf("fallback received an already-expired ctx — shared deadline starvation bug not fixed")
+	}
+	// p1 必须真的阻塞到 Pool 设的 100ms 超时
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("expected p1 to block >= 100ms, got %v", elapsed)
+	}
+	// 但不应被额外拖延（p2 拿到全新 ctx 立即返回）
+	if elapsed > 2*time.Second {
+		t.Errorf("fallback took too long: %v", elapsed)
+	}
+}
+
+// TestPool_PerProviderTimeoutSelectsLarge 验证 selectTimeout 在大图时用 LargeTimeout。
+func TestPool_PerProviderTimeoutSelectsLarge(t *testing.T) {
+	p1 := &mockProvider{name: "primary", delay: 1 * time.Second}
+	p2 := &deadlineCheckingProvider{name: "fallback", result: "fallback-ok"}
+
+	entries := []PoolEntry{
+		// 普通图 timeout=50ms，大图 timeout=500ms，阈值 1MB
+		{Name: "primary", Provider: p1, Priority: 1, CB: NewCircuitBreaker(5, 30*time.Second),
+			Timeout: 50 * time.Millisecond, LargeTimeout: 500 * time.Millisecond, LargeImageThreshold: 1_000_000},
+		{Name: "fallback", Provider: p2, Priority: 2, CB: NewCircuitBreaker(5, 30*time.Second),
+			Timeout: 50 * time.Millisecond, LargeTimeout: 500 * time.Millisecond, LargeImageThreshold: 1_000_000},
+	}
+	pool, _ := NewPool(entries, slog.Default(), nil)
+
+	// imageSize=2MB >= 1MB 阈值 → 应使用 LargeTimeout=500ms
+	start := time.Now()
+	desc, err := pool.DescribeImage(context.Background(), "data", "image/png", 2_000_000)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("want fallback success, got err: %v", err)
+	}
+	if desc != "fallback-ok" {
+		t.Errorf("want %q, got %q", "fallback-ok", desc)
+	}
+	// p1 阻塞到 LargeTimeout=500ms 超时（而非普通 Timeout=50ms）
+	if elapsed < 500*time.Millisecond {
+		t.Errorf("expected p1 to block >= 500ms (large timeout), got %v", elapsed)
+	}
+	if p2.ctxAlreadyExpired {
+		t.Errorf("fallback received an already-expired ctx")
+	}
+}
+
+// TestPool_NoTimeoutFallsBackToParentCtx 验证 PoolEntry.Timeout=0 时 Pool 不设独立
+// 超时，直接透传 parent ctx（兼容旧测试和未配置 timeout 的场景）。
+func TestPool_NoTimeoutFallsBackToParentCtx(t *testing.T) {
+	p1 := newMock("primary", "primary-ok", nil)
+	entries := []PoolEntry{
+		// 不设 Timeout — Pool 应透传 parent ctx
+		{Name: "primary", Provider: p1, Priority: 1, CB: NewCircuitBreaker(5, 30*time.Second)},
+	}
+	pool, _ := NewPool(entries, slog.Default(), nil)
+
+	// parent ctx 有 200ms deadline
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	desc, err := pool.DescribeImage(ctx, "data", "image/png", 100)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if desc != "primary-ok" {
+		t.Errorf("want %q, got %q", "primary-ok", desc)
+	}
+}

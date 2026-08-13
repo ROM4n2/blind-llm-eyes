@@ -169,6 +169,7 @@
 | ✅ | ~~核心流程日志增强~~ | **已完成**：9 个 stage 日志 + request_id 关联 |
 | ✅ | ~~代码审查 11 个问题~~ | **已完成**：5 严重 + 4 中等 + 2 低优先级全部修复 |
 | ✅ P5 | ~~上下文感知描述~~ | **已完成**：ContextualVisionProvider 接口 + 上下文提取 + client 注入 + Pool 透传 + 配置化 + Handler 集成 + 日志增强 + maxChars 截断 bug 修复 |
+| 🔴 BUG | failover 时间预算被共享 deadline 饿死 | 详见第 9 节「遗留 bug」：singleflight 单一 120s 父 ctx 顺序传给所有 provider，大图或 N 个 provider 顺序失败时 fallback 拿到已过期 ctx |
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
@@ -445,6 +446,7 @@ c14d1a5 feat(vision): multi-provider pool with circuit breaker failover
 | ✅ 完成 | ~~代码审查 11 个问题~~ | 5 严重 + 4 中等 + 2 低优先级全部修复，含并发安全、性能优化、防御性编程 |
 | ✅ 完成 | ~~并发压力测试~~ | 跨请求 20 goroutine + AdaptiveConcurrency 100 并发采样，`-race` 无报告 |
 | ✅ 完成 | ~~P5 上下文感知描述~~ | ContextualVisionProvider 接口 + 上下文提取 + client/Pool 透传 + 配置化 + Handler 集成 + 日志增强 + maxChars bug 修复，详见第 12 节 |
+| ✅ 完成 | ~~failover 时间预算被共享 deadline 饿死~~ | **2026-08-13 修复（采用修法②）。** ① [handler.go:481](proxy/handler.go#L481) singleflight fn 的 dedupCtx 从 `WithTimeout(Background, 120s)` 改为 `WithCancel(Background)`，parent 只做 cancel 传播、不设硬截止；② [pool.go](vision/pool.go) 每次尝试用独立 `WithTimeout(parent, 该 provider timeout)` 创建子 ctx（PoolEntry 新增 `Timeout`/`LargeTimeout`/`LargeImageThreshold` 字段，由 `selectTimeout` 按 imageSize 选 large/normal），第一个 provider 耗满自己的 timeout 后 fallback 拿到从 parent 派生的全新子 ctx，不受前者耗时影响。新增 3 个回归测试（`TestPool_FailoverNotStarvedBySharedDeadline` / `TestPool_PerProviderTimeoutSelectsLarge` / `TestPool_NoTimeoutFallsBackToParentCtx`），`go test -race ./...` 全绿 |
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
@@ -621,3 +623,4 @@ vision:
 | [vision-fallback-architecture.md](./vision-fallback-architecture.md) | 原始架构设计 v1 |
 | [vision-fallback-notes.md](./vision-fallback-notes.md) | 决策时间线 + 调研记录 |
 | [CONTEXT.md](./CONTEXT.md) | 项目上下文 |
+| [.trae/documents/plan-onboarding-productize.md](./.trae/documents/plan-onboarding-productize.md) | **产品化 onboarding 实施计划（已批准待实施）**：预编译二进制 + setup 向导 + connect/disconnect 接线 + cc-switch 导入 + [1m] 剥离，T1-T11 TDD 任务清单（注：.trae/ 在 gitignore，仅本地可见） |

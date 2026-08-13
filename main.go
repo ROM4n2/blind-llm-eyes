@@ -117,10 +117,13 @@ func main() {
 				os.Exit(1)
 			}
 			entries = append(entries, vision.PoolEntry{
-				Name:     pc.Name,
-				Provider: p,
-				Priority: pc.Priority,
-				CB:       vision.NewCircuitBreaker(pc.CircuitBreaker.FailureThreshold, pc.CircuitBreaker.ResetTimeout),
+				Name:                pc.Name,
+				Provider:            p,
+				Priority:            pc.Priority,
+				CB:                  vision.NewCircuitBreaker(pc.CircuitBreaker.FailureThreshold, pc.CircuitBreaker.ResetTimeout),
+				Timeout:             pc.Timeout,
+				LargeTimeout:        pc.LargeTimeout,
+				LargeImageThreshold: pc.LargeImageThreshold,
 			})
 		}
 		pool, err := vision.NewPool(entries, logger, m)
