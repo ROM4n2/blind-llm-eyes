@@ -28,6 +28,18 @@ type ContextualVisionProvider interface {
 	DescribeImageWithContext(ctx context.Context, base64Data, mediaType string, imageSize int64, contextText string) (string, error)
 }
 
+// Pinger is an optional interface for providers that support a lightweight
+// connectivity/auth check without sending an image. The doctor/setup flows
+// type-assert to Pinger; providers that don't implement it are skipped.
+//
+// Ping semantics: a network/timeout error or a 401/403 response is a failure
+// (endpoint unreachable or auth invalid). Any other HTTP response is a pass
+// (endpoint reachable + auth OK). A model-level 400 (e.g. max_tokens too small)
+// is NOT a failure — it proves the endpoint accepted and authenticated the call.
+type Pinger interface {
+	Ping(ctx context.Context) error
+}
+
 // BuildProvider constructs a single VisionProvider from a pool-style ProviderCfg.
 // It validates the required fields (base_url, api_key, model) and dispatches on
 // Type ("mimo" = Anthropic Messages API, "openai_compatible" = /v1/chat/completions).

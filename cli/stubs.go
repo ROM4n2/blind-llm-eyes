@@ -10,10 +10,6 @@ func runSetup(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return notImplemented("setup", stderr)
 }
 
-func runDoctor(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	return notImplemented("doctor", stderr)
-}
-
 func runConnect(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return notImplemented("connect", stderr)
 }

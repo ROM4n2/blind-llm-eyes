@@ -72,7 +72,7 @@ func TestRun_Routing(t *testing.T) {
 		{"unknown command", []string{"bogus"}, 2, "unknown command", ""},
 		{"start advisory", []string{"start"}, 0, "server", "unknown command"},
 		{"setup not implemented", []string{"setup"}, 2, "not implemented", "unknown command"},
-		{"doctor not implemented", []string{"doctor"}, 2, "not implemented", "unknown command"},
+		{"doctor missing config", []string{"doctor"}, 1, "config.yaml", "unknown command"},
 		{"connect not implemented", []string{"connect"}, 2, "not implemented", "unknown command"},
 		{"disconnect not implemented", []string{"disconnect"}, 2, "not implemented", "unknown command"},
 	}
