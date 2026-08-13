@@ -2,7 +2,8 @@
 //
 // Run is the testable entry point: it takes the argument list (excluding the
 // program name), the standard streams, and returns a process exit code. main.go
-// delegates to Run for every non-server subcommand.
+// delegates to Run for every non-server subcommand (the server path — no args,
+// "start", or -flags — stays in main.go's runServer).
 package cli
 
 import (
@@ -22,11 +23,30 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return 2
 	}
-	switch args[0] {
+	cmd := args[0]
+	rest := args[1:]
+	switch cmd {
 	case "version":
 		return runVersion(stdout)
+	case "start":
+		// "start" is normally intercepted by main.go's runServer. If it reaches
+		// here (e.g. invoked via cli.Run directly), advise the user.
+		fmt.Fprintln(stderr, "the server is launched by running 'blind-llm-eyes' or 'blind-llm-eyes start'")
+		return 0
+	case "setup":
+		return runSetup(rest, stdin, stdout, stderr)
+	case "doctor":
+		return runDoctor(rest, stdin, stdout, stderr)
+	case "connect":
+		return runConnect(rest, stdin, stdout, stderr)
+	case "disconnect":
+		return runDisconnect(rest, stdin, stdout, stderr)
+	case "status":
+		return runStatus(rest, stdin, stdout, stderr)
+	case "stop":
+		return runStop(rest, stdin, stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "blind-llm-eyes: unknown command %q\n\n", args[0])
+		fmt.Fprintf(stderr, "blind-llm-eyes: unknown command %q\n\n", cmd)
 		printUsage(stderr)
 		return 2
 	}
@@ -36,6 +56,12 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 func runVersion(stdout io.Writer) int {
 	fmt.Fprintf(stdout, "blind-llm-eyes %s (go %s)\n", buildinfo.Version, runtime.Version())
 	return 0
+}
+
+// notImplemented reports that a subcommand is not yet available.
+func notImplemented(cmd string, stderr io.Writer) int {
+	fmt.Fprintf(stderr, "blind-llm-eyes %s: not implemented yet\n", cmd)
+	return 2
 }
 
 // printUsage writes the command summary to w.

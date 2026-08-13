@@ -23,15 +23,27 @@ import (
 )
 
 func main() {
-	// Minimal subcommand dispatch. Non-server subcommands are handled by cli.Run;
-	// the server path (no args / start / -config / -* flags) falls through below.
-	// (Full dispatch is added in T3.)
-	if len(os.Args) > 1 && os.Args[1] == "version" {
-		os.Exit(cli.Run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	args := os.Args[1:]
+	// Server path: no args (backward compat), "start", or any -flag (e.g. -config).
+	// Everything else is a subcommand handled by cli.Run.
+	if len(args) == 0 || args[0] == "start" || strings.HasPrefix(args[0], "-") {
+		runServer(args)
+		return
 	}
+	os.Exit(cli.Run(args, os.Stdin, os.Stdout, os.Stderr))
+}
 
-	configPath := flag.String("config", "config.yaml", "path to config yaml")
-	flag.Parse()
+// runServer starts the proxy server in the foreground. It parses the -config
+// flag (default config.yaml), stripping an optional leading "start" subcommand
+// so both "blind-llm-eyes" and "blind-llm-eyes start [-config ...]" work.
+func runServer(args []string) {
+	flagArgs := args
+	if len(flagArgs) > 0 && flagArgs[0] == "start" {
+		flagArgs = flagArgs[1:]
+	}
+	fs := flag.NewFlagSet("blind-llm-eyes", flag.ExitOnError)
+	configPath := fs.String("config", "config.yaml", "path to config yaml")
+	fs.Parse(flagArgs)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
