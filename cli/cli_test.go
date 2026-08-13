@@ -71,7 +71,7 @@ func TestRun_Routing(t *testing.T) {
 	}{
 		{"unknown command", []string{"bogus"}, 2, "unknown command", ""},
 		{"start advisory", []string{"start"}, 0, "server", "unknown command"},
-		{"setup not implemented", []string{"setup"}, 2, "not implemented", "unknown command"},
+		{"setup recognized", []string{"setup"}, 1, "", "unknown command"},
 		{"doctor missing config", []string{"doctor"}, 1, "config.yaml", "unknown command"},
 		{"connect missing config", []string{"connect"}, 1, "config.yaml", "unknown command"},
 		{"disconnect no backup", []string{"disconnect"}, 1, "backup", "unknown command"},
@@ -97,10 +97,10 @@ func TestRun_Routing(t *testing.T) {
 // to the handler (here: setup -config foo.yaml reaches runSetup with rest).
 func TestRun_ArgPassThrough(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	// setup is still a stub, but it must not be treated as unknown.
+	// setup runs the wizard; with nil stdin it fails doctor and doesn't save.
 	code := Run([]string{"setup", "-config", "foo.yaml"}, nil, &stdout, &stderr)
 	if code == 0 {
-		t.Fatal("expected non-zero for not-implemented setup")
+		t.Fatal("expected non-zero for setup with nil stdin (doctor fails)")
 	}
 	if strings.Contains(stderr.String(), "unknown command") {
 		t.Errorf("setup with flags must not be 'unknown command': %q", stderr.String())
