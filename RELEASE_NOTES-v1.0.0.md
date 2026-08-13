@@ -214,7 +214,6 @@ ad70a9f  refactor(vision): extract provider builders from main.go
 
 Carried over from pre-v1.0.0 (not introduced by this release):
 
-- **Top-level image blocks only.** Images nested inside `tool_result` blocks pass through undescribed — next planned change.
 - **Anthropic Messages format only** (no OpenAI Chat Completions input).
 - **In-memory cache** — descriptions are lost on restart.
 - No client auth on `/metrics` or `/healthz` — expose only locally.

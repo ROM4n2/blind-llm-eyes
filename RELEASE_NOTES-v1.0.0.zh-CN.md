@@ -217,7 +217,6 @@ ad70a9f  refactor(vision): extract provider builders from main.go
 
 沿用自 v1.0.0 之前（非本次发布引入）：
 
-- **仅顶层 image 块。** `tool_result` 内嵌的图片透传不做描述——下一项计划中的改动。
 - **仅 Anthropic Messages 格式**（不接受 OpenAI Chat Completions 输入）。
 - **内存缓存** —— 描述在重启后丢失。
 - `/metrics` 与 `/healthz` 无客户端鉴权——请只在本地暴露。

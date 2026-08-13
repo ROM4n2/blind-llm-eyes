@@ -22,6 +22,8 @@ DeepSeek has no vision. Using it from Claude Code means pasting a screenshot get
 
 - **Anthropic Messages passthrough** — accepts `/v1/messages`, rewrites the request, forwards to any Anthropic-compatible upstream, and streams the SSE response back byte-for-byte.
 - **Image → description replacement** — image blocks are replaced in place with `<BLIND_LLM_EYES_IMAGE>`-wrapped text, and a system instruction tells the model to treat the description as its own observation.
+- **Nested `tool_result` images** — recursively finds images nested inside `tool_result` blocks (where real Claude Code screenshots usually live) and describes them like top-level ones (recursion depth capped at 16 to prevent stack overflow).
+- **Conversation-context-aware descriptions** *(optional)* — feeds the last N turns of conversation (`context_rounds`, default 3 rounds / `context_max_chars` 2000 chars) to the vision model so descriptions match intent (e.g. "how do I fix this error?" focuses on the error text).
 - **Content-hash LRU cache** — the same image re-sent across turns triggers zero vision calls (the typical multi-turn resend case).
 - **`singleflight` in-flight dedup** — concurrent requests carrying the same image share a single vision call.
 - **Parallel image processing** — images in one request are described concurrently via `errgroup`, bounded by `concurrency_limit`.
@@ -165,7 +167,7 @@ blind-llm-eyes status
 Common gotchas:
 
 | Symptom | Cause | Fix |
-|---|---|---|
+| --- | --- | --- |
 | `doctor` reports vision `PASS` but L4 returns 502 with `"vision call failed"` | Real `DescribeImage` (larger payload + longer timeout) fails where `Ping` (1-token) succeeds. Common when vision timeout is too small. | Raise `vision.timeout` (default 30s) and confirm the vision model accepts images at its configured endpoint. |
 | `status` returns `NOT RUNNING` even though `start` is running in foreground | On Windows Trae IDE terminals, `os.CreateTemp` for the pidfile is blocked by the sandbox (sandbox error: `Not allow operate files: ...pidfile-*.tmp`). This only affects the IDE-integrated terminal. | Run `status` / `stop` from a standalone PowerShell window. The foreground `start` itself works everywhere, including inside Trae. |
 | Upstream returns 400 `"model: deepseek-chat[1m] not found"` | `[1m]` suffix reached upstream (model sanitization is not active). Older pre-v1.0.0 builds didn't strip the suffix; or a reverse proxy in front of blind-llm-eyes is re-injecting the original model. | Upgrade to v1.0.0+ (`blind-llm-eyes version` confirms). Confirm the `ANTHROPIC_MODEL` env in Claude Code / cc-switch doesn't override the model field sent through the proxy — the sanitization only runs *inside* the proxy on the parsed request body. |
@@ -196,6 +198,8 @@ Common gotchas:
 | `vision.large_image_threshold` | `1048576` | Bytes; images at/above this get the large timeout |
 | `vision.description_cap` | `1000` | `max_tokens` for descriptions |
 | `vision.supported_formats` | png/jpeg/webp/gif | Allowed media types |
+| `vision.context_rounds` | `3` | Context-aware descriptions: last N turns; `0`/`-1` disables |
+| `vision.context_max_chars` | `2000` | Max context chars (~500 tokens) |
 | `cache.max_entries` | `500` | In-memory LRU capacity |
 | `concurrency_limit` | `4` | Max parallel vision calls per request; also the adaptive initial value |
 | `adaptive_concurrency.*` | disabled | AIMD controller (see below) |
@@ -216,12 +220,16 @@ Disabled by default; when disabled, behavior is identical to a static `concurren
 
 ```text
 config      YAML + env loading, defaults
-messages    Anthropic Messages parsing, validation, image→text rewriting
+messages    Anthropic Messages parsing, validation, image→text rewriting, context extraction
 cache       content-hash (sha256) key + thread-safe LRU
-vision      VisionProvider interface + MiMo Anthropic-format client
+vision      VisionProvider interface + MiMo Anthropic-format / OpenAI-compatible clients + provider pool + circuit breaker
 proxy       request pipeline: parse → find images → cache → describe → replace → forward
 logging     structured JSON logs, async writer, request IDs
 metrics     Prometheus registry
+cli         subcommands: setup / doctor / connect / disconnect / status / stop / version
+admin       /admin/shutdown graceful-shutdown endpoint (token-authed)
+modelutil   model-name sanitization ([1m] stripping)
+buildinfo   build version (ldflags injection)
 ```
 
 Request path: parse → scan image blocks → hash lookup in LRU → miss → `singleflight` dedup → vision model describes → replace image with text → append system instruction → forward upstream → stream response.
@@ -242,7 +250,6 @@ The core concurrency follows Go's practical model rather than the slogan: channe
 
 ## Limitations
 
-- **Top-level image blocks only.** Images nested inside `tool_result` blocks are passed through untouched (not yet described) — real traffic support for nested tool-result images is the next planned change.
 - **Anthropic Messages format only** (no OpenAI Chat Completions input).
 - **In-memory cache** — descriptions are lost on restart (acceptable for a personal proxy).
 - No client auth on `/metrics` or `/healthz` — expose only locally.
@@ -263,9 +270,8 @@ The test suite covers parsing/rewrite round-trips (including preserving unknown 
 
 ## Roadmap
 
-- Nested `tool_result` image support (protocol correctness for real Claude Code traffic)
-- Conversation-context-aware descriptions (feed recent messages to the vision model for intent-aware descriptions)
 - Global cross-request concurrency / upstream rate limiting
+- Weighted load balancing + active health checks (multi-provider scenarios)
 
 ## License
 

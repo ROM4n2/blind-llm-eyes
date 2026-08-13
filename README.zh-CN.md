@@ -22,6 +22,8 @@ DeepSeek 没有视觉能力。在 Claude Code 里用它，粘贴截图只会得�
 
 - **Anthropic Messages 透传** — 接收 `/v1/messages`，改写请求后转发给任意 Anthropic 兼容上游，SSE 响应逐字节流式回传。
 - **图片 → 描述替换** — 图片块原位替换为 `<BLIND_LLM_EYES_IMAGE>` 包裹的文本，并追加一条 system 指令，让模型把描述当作自己的视觉观察。
+- **嵌套 `tool_result` 图片** — 递归扫描 `tool_result` 内嵌图片（真实 Claude Code 截图多藏在此），与顶层图片同等处理，深度限制 16 防栈溢出。
+- **会话上下文感知描述** *(可选)* — 把最近 N 轮对话（`context_rounds`，默认 3 轮 / `context_max_chars` 2000 字）注入视觉模型，让描述贴合上下文（如"这个报错怎么解决"能聚焦到报错信息）。
 - **内容哈希 LRU 缓存** — 多轮对话中同一张图重复发送时，零视觉调用（命中典型的多轮重发场景）。
 - **`singleflight` 在途去重** — 并发请求携带同一张图时，合并为一次视觉调用。
 - **并行图片处理** — 单请求内多图通过 `errgroup` 并发描述，受 `concurrency_limit` 限制。
@@ -30,24 +32,42 @@ DeepSeek 没有视觉能力。在 Claude Code 里用它，粘贴截图只会得�
 - **WebP → PNG 转换** — 发送前自动把 WebP 图片转为 PNG。
 - **自适应超时** — 大图使用更长的超时（`large_image_timeout`）。
 - **可观测性** — 结构化 JSON 日志（异步写入）、基于 `httptrace` 的分阶段耗时、`/metrics` Prometheus 指标、贯穿全链路的 request ID、优雅关闭。
-- **可插拔视觉后端** — 任何实现 `vision.VisionProvider` 的后端都能接入。
-- **单一静态二进制** — 无运行时依赖，约 10 MB。
+- **可插拔视觉后端** — 任何实现 `vision.VisionProvider` 的后端都能接入；内置多 provider 池 + 三态熔断器故障转移。
+- **单一静态二进制** — 无运行时依赖，约 10 MB，无需 Go 编译器。
+- **模型名净化** — 转发上游前自动剥离厂商上下文长度后缀（`deepseek-chat[1m]` → `deepseek-chat`）；请求路径与 cc-switch 导入双重保险。
+- **CLI 生命周期** — 8 个子命令覆盖全生命周期：`setup`（交互配置 + doctor）、`doctor`（连通性自检）、`connect`/`disconnect`（Claude Code settings.json 接线）、`start`、`status`、`stop`、`version`。
+- **cc-switch 一键导入** — 直接从 cc-switch SQLite 数据库读取 provider（尽力而为：DB 被锁时回退临时拷贝，任何错误回退手动输入）。
+- **安全的 settings 管理** — `connect` 改写 Claude Code 的 `settings.json` 时先整文件备份且只备份一次（重复 `connect` 永不覆盖备份）；`disconnect` 经原子写从备份逐字节还原。
 
 ## 快速开始
 
-### 1. 构建
+三个子命令完成重活：`setup`（交互配置）、`connect`（把 Claude Code 接到代理）、`start`（运行代理）。整个流程是 下载 → `setup` → `connect` → `start`。
+
+### 1. 安装
+
+从 [releases 页面](../../releases) 下载预编译二进制（Windows / Linux / macOS，amd64 + arm64），或从源码构建：
 
 ```bash
+go install github.com/ROM4n2/blind-llm-eyes@latest
+# 或在 checkout 里：
 go build -o blind-llm-eyes .
 ```
 
-### 2. 配置
+验证安装：
 
 ```bash
-cp config.example.yaml config.yaml   # 然后填入真实 key
+blind-llm-eyes version   # blind-llm-eyes <版本> (go <运行时>)
 ```
 
-最小可用配置（生产真实值）：
+### 2. 配置（`setup`）
+
+运行交互式向导。它可以从你已有的 [cc-switch](https://github.com/farion1231/cc-switch) 数据库导入 provider，保存前还会跑一遍连通性自检（`doctor`）：
+
+```bash
+blind-llm-eyes setup
+```
+
+向导收集一个上游（纯文本）与一个视觉 provider——base URL、API key 与视觉模型——ping 两者后写出 `config.yaml`。偏好手动编辑？把 `config.example.yaml` 复制为 `config.yaml` 填入真实 key。最小可用配置：
 
 ```yaml
 listen: "127.0.0.1:8790"
@@ -64,17 +84,35 @@ log_level: "info"
 
 `config.yaml` 已被 git 忽略；`config.example.yaml` 提交的是占位符。密钥也可用环境变量提供（`BLIND_VISION_API_KEY`、`BLIND_UPSTREAM_BASE_URL`、`BLIND_UPSTREAM_API_KEY`、`BLIND_LISTEN`）。
 
-### 3. 运行
+### 3. 连接 Claude Code（`connect`）
+
+通过改写 `~/.claude/settings.json` 的 `env.ANTHROPIC_BASE_URL` 把 Claude Code 指向代理：
 
 ```bash
-./blind-llm-eyes -config config.yaml
+blind-llm-eyes connect
 ```
 
-### 4. 让 Claude Code 指向它
+会先写整文件备份到 `~/.claude/.bak-before-connect`（重复 `connect` 永不覆盖）。重启 Claude Code 使其重新读取 `settings.json`。撤销用 `blind-llm-eyes disconnect`——它从备份逐字节还原 `settings.json`。
 
-把供应商的 `ANTHROPIC_BASE_URL` 设为 `http://127.0.0.1:8790`（在 CC Switch 的环境变量 override 或供应商 base URL 设置里配），然后粘贴截图，纯文本模型就能回答关于图片的问题了。
+### 4. 运行（`start`）
 
-单请求验证：
+```bash
+blind-llm-eyes            # 无参数 = start（向后兼容）
+blind-llm-eyes start      # 显式
+blind-llm-eyes -config /path/to/config.yaml
+```
+
+管理运行中的代理：
+
+```bash
+blind-llm-eyes status     # pidfile + GET /healthz → RUNNING / STALE
+blind-llm-eyes stop       # POST /admin/shutdown（token 鉴权）→ 优雅排空
+blind-llm-eyes doctor     # 全链路连通性自检（上游 + 每个视觉 provider）
+```
+
+### 5. 验证
+
+往 Claude Code 里粘贴截图——纯文本模型现在应该能回答关于它的问题。或直接 curl：
 
 ```bash
 curl -N http://127.0.0.1:8790/v1/messages \
@@ -86,6 +124,64 @@ curl -N http://127.0.0.1:8790/v1/messages \
 ```
 
 响应头 `X-Blind-Llm-Eyes` 报告结果：`rewritten=1 cached=0`。
+
+> **关于 CC Switch：** 把供应商的 `ANTHROPIC_BASE_URL` 设为 `http://127.0.0.1:8790`。**不要**用 CC Switch 的代理模式——它会截断图片 body。
+
+### 验证与故障排查
+
+用 5 步渐进验证隔离问题，不用瞎猜：
+
+```powershell
+# L1 — 二进制与版本注入
+blind-llm-eyes version
+# → blind-llm-eyes 1.0.0 (go go1.26.5)
+
+# L2 — 连通性（几乎不耗 token）
+blind-llm-eyes doctor
+# → upstream=PASS  vision=PASS   (exit 0)
+# 若任一 FAIL：检查 base_url（无尾斜杠、正确 /anthropic vs /v1）、
+#              检查 API key（环境变量或 config.yaml）
+
+# L3 — 进程存活
+# 终端 A：blind-llm-eyes start
+# 终端 B：
+blind-llm-eyes status
+curl -s http://127.0.0.1:8790/healthz
+# → status: RUNNING pid=1234 addr=127.0.0.1:8790
+# → healthz: ok
+
+# L4 — 端到端（消耗少量 API 配额）
+curl -N http://127.0.0.1:8790/v1/messages `
+  -H "Authorization: Bearer <upstream-key>" -H "Content-Type: application/json" `
+  -d '{\"model\":\"deepseek-chat\",\"max_tokens\":500,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What color is this?\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==\"}}]}]}' `
+  -D - 2>&1 | Select-Object -First 50
+# 找：HTTP/1.1 200 OK  +  X-Blind-Llm-Eyes: rewritten=1 cached=0
+#     然后是包含视觉描述文本的 SSE 流
+
+# L5 — 优雅关闭
+blind-llm-eyes stop
+blind-llm-eyes status
+# → NOT RUNNING
+```
+
+常见坑：
+
+| 症状 | 原因 | 解决 |
+| --- | --- | --- |
+| `doctor` 报 vision `PASS` 但 L4 返回 502 `"vision call failed"` | 真实 `DescribeImage`（更大 payload + 更长超时）在 `Ping`（1 token）成功的地方失败。常见于视觉超时过小。 | 调大 `vision.timeout`（默认 30s），确认视觉模型在其配置端点接受图片。 |
+| `status` 返回 `NOT RUNNING` 但 `start` 在前台运行 | Windows Trae IDE 终端里，pidfile 的 `os.CreateTemp` 被沙箱拦截（sandbox error: `Not allow operate files: ...pidfile-*.tmp`）。只影响 IDE 集成终端。 | 从独立 PowerShell 窗口跑 `status` / `stop`。前台 `start` 在任何地方（含 Trae 内）都能工作。 |
+| 上游返回 400 `"model: deepseek-chat[1m] not found"` | `[1m]` 后缀到达了上游（模型净化未生效）。v1.0.0 之前的旧构建不剥离后缀；或盲-llm-eyes 前面的反向代理重新注入了原始 model。 | 升级到 v1.0.0+（`blind-llm-eyes version` 确认）。确认 Claude Code / cc-switch 里的 `ANTHROPIC_MODEL` env 不会覆盖经代理发送的 model 字段——净化只发生在**代理内部**解析后的请求体上。 |
+| `connect` 后 Claude Code 仍说"看不到图片" | Claude Code 只在启动时读 `settings.json`；或 `connect` 之后跑了 cc-switch 切换器，把 `ANTHROPIC_BASE_URL` 覆盖回去了。 | 重启 Claude Code。重跑 `connect`，用代理期间**别**在 cc-switch 里切供应商。 |
+| 图片被截断 / 视觉 hash 不匹配 | 用了 CC Switch **代理模式**（而非 base_url 覆盖）。它会在转发前静默截断 >200 字节的请求体。 | 直接设 `ANTHROPIC_BASE_URL=http://127.0.0.1:8790`。别在 cc-switch 开代理模式。`blind-llm-eyes connect` 写的就是这个设置。 |
+| `go install github.com/ROM4n2/blind-llm-eyes@latest` 报 "invalid version: unknown revision" | `@latest` 需要远端仓库至少有一个已发布的 semver tag。`v1.0.0` tag 本地存在但还没推。 | 从 releases 页下载预编译压缩包，或从 checkout 构建：`go build -ldflags "-X github.com/ROM4n2/blind-llm-eyes/buildinfo.Version=1.0.0" .` |
+
+### 安全考虑
+
+- **Admin token** — 每次 `start` 从 `crypto/rand` 新生成，写入 `<UserConfigDir>/blind-llm-eyes/pidfile.json`，`stop` 时删除。绝不持久化到别处（无环境变量、无配置键）。
+- **绑定地址** — 默认监听 `127.0.0.1:8790`（仅回环）。暴露 `0.0.0.0` 或局域网 IP 会把你的上游 API key 转发给任何能触达该端口的人——切勿在不可信网络上这样做。`/metrics` 与 `/healthz` 也无客户端鉴权。
+- **config vs env 的 key** — `config.yaml` 里设的 API key 会覆盖客户端的 `Authorization` 头。配置了 `UpstreamAPIKey` 时，handler 转发上游前会剥离客户端的 `Authorization` / `Proxy-Authorization` / `Cookie` 头，避免泄露客户端凭据。
+- **Pidfile 权限** — Windows 上 pidfile 目录默认 `%AppData%\blind-llm-eyes\`（继承 AppData 的用户级 ACL）。不要跨账户共享 `%AppData%` 或放在公共可读的共享盘。
+- **`connect` 备份** — `~/.claude/.bak-before-connect` 是你原始 `settings.json` 的逐字副本。它包含 `settings.json` 里原有的任何秘密（如 `ANTHROPIC_API_KEY`）。请像对待真实文件一样对待它。
 
 ## 配置参考
 
@@ -102,10 +198,12 @@ curl -N http://127.0.0.1:8790/v1/messages \
 | `vision.large_image_threshold` | `1048576` | 字节数；达到/超过该值的图片用大图超时 |
 | `vision.description_cap` | `1000` | 描述的 `max_tokens` |
 | `vision.supported_formats` | png/jpeg/webp/gif | 允许的媒体类型 |
+| `vision.context_rounds` | `3` | 上下文感知描述：最近 N 轮对话；`0`/`-1` 禁用 |
+| `vision.context_max_chars` | `2000` | 上下文最大字符数（约 500 tokens） |
 | `cache.max_entries` | `500` | 内存 LRU 容量 |
-| `concurrency_limit` | `4` | 单请求内最大并行视觉调用数；也是 adaptive 的初始值 |
+| `concurrency_limit` | `6` | 单请求内最大并行视觉调用数；也是 adaptive 的初始值 |
 | `adaptive_concurrency.*` | 关闭 | AIMD 控制器（见下） |
-| `fail_open` | `false` | 视觉失败 → 占位文字而非 502 |
+| `fail_open` | `true` | 视觉失败 → 占位文字而非 502 |
 | `log_level` | `info` | `debug`/`info`/`warn`/`error` |
 
 ### 自适应并发
@@ -122,15 +220,19 @@ curl -N http://127.0.0.1:8790/v1/messages \
 
 ```text
 config      YAML + env 加载、默认值
-messages    Anthropic Messages 解析、校验、图片→文本改写
+messages    Anthropic Messages 解析、校验、图片→文本改写、上下文提取
 cache       内容哈希（sha256）key + 线程安全 LRU
-vision      VisionProvider 接口 + MiMo Anthropic 格式客户端
+vision      VisionProvider 接口 + MiMo Anthropic 客户端 / OpenAI 兼容客户端 + 多 provider 池 + 熔断器
 proxy       请求管线：解析 → 找图 → 缓存 → 描述 → 替换 → 转发
 logging     结构化 JSON 日志、异步写入、request ID
 metrics     Prometheus registry
+cli         子命令：setup / doctor / connect / disconnect / status / stop / version
+admin       /admin/shutdown 优雅关闭端点（token 鉴权）
+modelutil   模型名净化（[1m] 剥离）
+buildinfo   构建版本（ldflags 注入）
 ```
 
-请求路径：解析 → 扫描图片块 → LRU 哈希查询 → miss → `singleflight` 去重 → 视觉模型描述 → 图片替换为文本 → 追加 system 指令 → 转发上游 → 流式回传。
+请求路径：解析 → 扫描图片块（含 tool_result 嵌套）→ LRU 哈希查询 → miss → `singleflight` 去重 → 提取对话上下文 → 视觉模型描述 → 图片替换为文本 → 追加 system 指令 → 转发上游 → 流式回传。
 
 让它省钱的三个设计：
 
@@ -141,32 +243,34 @@ metrics     Prometheus registry
 ## 可观测性
 
 - **JSON 日志** — 每个阶段带 `stage`、`node_name`、`request_id` 与耗时字段。视觉调用拆出 `sf_total_ms` / `fn_exec_ms` / `sf_wait_ms`，可区分去重等待与实际上游耗时。
-- **`/metrics`** — Prometheus：HTTP 请求/耗时、图片处理、视觉调用/耗时、上游请求、缓存命中率、自适应上限 gauge。
+- **`/metrics`** — Prometheus：HTTP 请求/耗时、图片处理、视觉调用/耗时、上游请求、缓存命中率、自适应上限 gauge、per-provider 熔断器状态。
 - **`/healthz`** — 存活探针。
 - **`X-Blind-Llm-Eyes` 头** — 每个响应 `rewritten=N cached=M`。
 
 ## 已知限制
 
-- **仅顶层 image 块。** `tool_result` 内嵌的图片原样透传（暂不描述）——支持真实流量的嵌套 tool-result 图片是下一步计划。
 - **仅 Anthropic Messages 格式**（不支持 OpenAI Chat Completions 输入）。
 - **纯内存缓存** — 重启后描述丢失（个人自用可接受）。
-- `/metrics`、`/healthz` 无客户端鉴权 — 建议仅本地暴露。
+- **`/metrics`、`/healthz` 无客户端鉴权** — 建议仅本地暴露。
 
 ## 开发
 
 ```bash
-go build ./...     # 编译
-go vet ./...       # 静态检查
-go test -race ./...  # 带竞态检测的测试
+make test          # go test -race -count=1 ./...  （CI 门禁）
+make vet           # go vet ./...
+make build         # 带版本 ldflags 的本地二进制
+make snapshot      # goreleaser build --snapshot —— 编译全部平台目标
+make goreleaser-check  # 校验 .goreleaser.yaml
 ```
 
-测试覆盖：解析/改写 round-trip（含未知字段保留）、LRU 行为、视觉客户端（mock server）、完整 handler 管线（mock 视觉 + 上游）、并发边界、跨请求 `singleflight` 去重、自适应限流行为。
+发布是 tag 驱动：推送 `v*` tag，`release` 工作流运行 `goreleaser release`，把压缩包 + 校验和发布到 GitHub release。维护者也可本地 `make release`（需设 `GITHUB_TOKEN`）。
+
+测试覆盖：解析/改写 round-trip（含未知字段保留、嵌套 tool_result）、LRU 行为、视觉客户端（mock server）、完整 handler 管线（mock 视觉 + 上游）、并发边界、跨请求 `singleflight` 去重、自适应限流行为、E2E 全链路（含 FailOpen/FailClosed 网络超时场景）。
 
 ## Roadmap
 
-- 嵌套 `tool_result` 图片支持（真实 Claude Code 流量的协议正确性）
-- 会话上下文感知描述（把最近消息喂给视觉模型，实现带意图的描述）
 - 跨请求全局并发 / 上游限流
+- 加权负载均衡 + 主动健康检查（多 provider 场景）
 
 ## License
 
