@@ -54,9 +54,23 @@ func NewClient(baseURL, apiKey, model string, timeout, largeTimeout time.Duratio
 	}
 }
 
-// DescribeImage 把一张 base64 图片变成文字描述。
+// DescribeImage 把一张 base64 图片变成文字描述（无上下文）。
 // imageSize 是原始 base64 解码后的字节数，用于决定超时。
+// 等价于 DescribeImageWithContext(ctx, base64Data, mediaType, imageSize, "").
 func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string, imageSize int64) (string, error) {
+	return c.describeImageInternal(ctx, base64Data, mediaType, imageSize, "")
+}
+
+// DescribeImageWithContext 带对话上下文描述图片，实现 ContextualVisionProvider 接口。
+// contextText 为 "" 时行为完全等价于 DescribeImage。
+func (c *Client) DescribeImageWithContext(ctx context.Context, base64Data, mediaType string, imageSize int64, contextText string) (string, error) {
+	return c.describeImageInternal(ctx, base64Data, mediaType, imageSize, contextText)
+}
+
+// describeImageInternal 是描述图片的内部实现，被两个公开方法共用。
+// 当 contextText != "" 时会在 user content 前插入上下文提示 text block，
+// 让视觉模型聚焦于与对话相关的细节。
+func (c *Client) describeImageInternal(ctx context.Context, base64Data, mediaType string, imageSize int64, contextText string) (string, error) {
 	if c.BaseURL == "" || c.APIKey == "" || c.Model == "" {
 		return "", fmt.Errorf("vision client not configured")
 	}
@@ -80,6 +94,7 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 		"timeout", c.Timeout.String(),
 		"large_timeout", c.LargeTimeout.String(),
 		"large_image_threshold", c.LargeImageThreshold,
+		"context_chars", len(contextText),
 	)
 
 	// ── stage: preprocessing (WebP → PNG) ──
@@ -140,26 +155,53 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 	// ── stage: 构造请求 (Anthropic Messages API 格式) ──
 	systemPrompt := "You are a visual description assistant. Describe the provided image in detail in Chinese. Focus on objects, layout, colors, text visible in the image, and any code snippets or UI elements. Keep the description under 400 words but be precise."
 
+	// 构造 user content：如有上下文，先插入上下文 text block；再插入图片块；最后指令 text block
+	userContent := make([]map[string]any, 0, 3)
+	var contextBlockText string
+	if contextText != "" {
+		contextBlockText = "对话上下文（请结合以下对话内容更精准地描述图片，聚焦与上下文相关的细节，尤其是报错信息和代码片段）：\n" + contextText
+		userContent = append(userContent, map[string]any{
+			"type": "text",
+			"text": contextBlockText,
+		})
+	}
+	userContent = append(userContent,
+		map[string]any{
+			"type": "image",
+			"source": map[string]string{
+				"type":       "base64",
+				"media_type": actualMediaType,
+				"data":       actualData,
+			},
+		},
+	)
+	descInstruction := "Describe this image in detail."
+	if contextText != "" {
+		descInstruction = "Describe this image in detail, focusing on details relevant to the conversation context provided above (especially error messages, code snippets, and UI elements mentioned in the context)."
+	}
+	userContent = append(userContent, map[string]any{
+		"type": "text",
+		"text": descInstruction,
+	})
+
+	// 日志：打印完整文本 prompt（不含图片 base64），便于排查上下文拼接
+	if c.Log != nil {
+		c.Log.Info("vision prompt constructed",
+			"stage", "prompt_built",
+			"system_prompt", systemPrompt,
+			"has_context_block", contextBlockText != "",
+			"context_block_text", contextBlockText,
+			"desc_instruction", descInstruction,
+		)
+	}
+
 	reqBody := map[string]any{
 		"model":  c.Model,
 		"system": systemPrompt,
 		"messages": []map[string]any{
 			{
-				"role": "user",
-				"content": []map[string]any{
-					{
-						"type": "image",
-						"source": map[string]string{
-							"type":       "base64",
-							"media_type": actualMediaType,
-							"data":       actualData,
-						},
-					},
-					{
-						"type": "text",
-						"text": "Describe this image in detail.",
-					},
-				},
+				"role":    "user",
+				"content": userContent,
 			},
 		},
 		"max_tokens":  c.DescriptionCap,
@@ -188,6 +230,8 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 		"status", "ok",
 		"payload_bytes", len(bodyBytes),
 		"duration_ms", marshalMs,
+		"context_chars", len(contextText),
+		"user_content_blocks", len(userContent),
 	)
 
 	// ── stage: http_request_start ──

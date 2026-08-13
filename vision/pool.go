@@ -71,10 +71,22 @@ func NewPool(entries []PoolEntry, log *slog.Logger, m *metrics.Metrics) (*Pool, 
 	}, nil
 }
 
-// DescribeImage 实现 VisionProvider 接口。
+// DescribeImage 实现 VisionProvider 接口（无上下文）。
 // 按优先级遍历 provider，跳过熔断器开启的，在失败时故障转移到下一个。
-// 所有 provider 都失败或熔断时返回错误。
+// 等价于 DescribeImageWithContext(ctx, base64Data, mediaType, imageSize, "").
 func (p *Pool) DescribeImage(ctx context.Context, base64Data, mediaType string, imageSize int64) (string, error) {
+	return p.describeImageInternal(ctx, base64Data, mediaType, imageSize, "")
+}
+
+// DescribeImageWithContext 带对话上下文调用 provider 池，实现 ContextualVisionProvider 接口。
+// 若底层 provider 实现 ContextualVisionProvider 则带上下文调用，否则回退到 DescribeImage。
+func (p *Pool) DescribeImageWithContext(ctx context.Context, base64Data, mediaType string, imageSize int64, contextText string) (string, error) {
+	return p.describeImageInternal(ctx, base64Data, mediaType, imageSize, contextText)
+}
+
+// describeImageInternal 是池的内部实现，被 DescribeImage 和 DescribeImageWithContext 共用。
+// 按优先级遍历 provider，熔断跳过，失败故障转移，日志/metrics/CB 统一处理。
+func (p *Pool) describeImageInternal(ctx context.Context, base64Data, mediaType string, imageSize int64, contextText string) (string, error) {
 	requestID := logging.GetRequestID(ctx)
 	log := p.log.With("node_name", "vision_pool", "request_id", requestID)
 
@@ -88,6 +100,7 @@ func (p *Pool) DescribeImage(ctx context.Context, base64Data, mediaType string, 
 		"media_type", mediaType,
 		"provider_count", len(p.providers),
 		"providers", p.ProviderNames(),
+		"context_chars", len(contextText),
 	)
 
 	var lastErr error
@@ -137,6 +150,10 @@ func (p *Pool) DescribeImage(ctx context.Context, base64Data, mediaType string, 
 		}
 
 		// 2. 日志：provider 调用开始 — 记录调用前的上下文
+		isContextual := false
+		if _, ok := entry.Provider.(ContextualVisionProvider); ok {
+			isContextual = true
+		}
 		log.Info("provider call started",
 			"stage", "provider_call_start",
 			"status", "info",
@@ -146,11 +163,20 @@ func (p *Pool) DescribeImage(ctx context.Context, base64Data, mediaType string, 
 			"image_size_bytes", imageSize,
 			"provider_index", i,
 			"total_providers", len(p.providers),
+			"context_chars", len(contextText),
+			"contextual", isContextual,
 		)
 
-		// 3. 调用 provider
+		// 3. 调用 provider — 根据是否实现 ContextualVisionProvider 分流
 		pStart := time.Now()
-		desc, err := entry.Provider.DescribeImage(ctx, base64Data, mediaType, imageSize)
+		var desc string
+		var pErr error
+		if cvp, ok := entry.Provider.(ContextualVisionProvider); ok {
+			desc, pErr = cvp.DescribeImageWithContext(ctx, base64Data, mediaType, imageSize, contextText)
+		} else {
+			desc, pErr = entry.Provider.DescribeImage(ctx, base64Data, mediaType, imageSize)
+		}
+		err := pErr
 		pElapsed := time.Since(pStart)
 
 		// 4. 记录结果
