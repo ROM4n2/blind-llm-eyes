@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ROM4n2/blind-llm-eyes/cache"
+	"github.com/ROM4n2/blind-llm-eyes/cli"
 	"github.com/ROM4n2/blind-llm-eyes/config"
 	"github.com/ROM4n2/blind-llm-eyes/logging"
 	"github.com/ROM4n2/blind-llm-eyes/metrics"
@@ -22,6 +23,13 @@ import (
 )
 
 func main() {
+	// Minimal subcommand dispatch. Non-server subcommands are handled by cli.Run;
+	// the server path (no args / start / -config / -* flags) falls through below.
+	// (Full dispatch is added in T3.)
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		os.Exit(cli.Run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	}
+
 	configPath := flag.String("config", "config.yaml", "path to config yaml")
 	flag.Parse()
 
