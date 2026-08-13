@@ -8,11 +8,11 @@ import (
 // 合法值白名单
 const (
 	RoleUser      = "user"
-	RoleAssistant  = "assistant"
+	RoleAssistant = "assistant"
 
-	ContentTypeText      = "text"
-	ContentTypeImage     = "image"
-	ContentTypeThinking  = "thinking"
+	ContentTypeText       = "text"
+	ContentTypeImage      = "image"
+	ContentTypeThinking   = "thinking"
 	ContentTypeToolResult = "tool_result"
 
 	ImageSourceTypeBase64 = "base64"
@@ -26,16 +26,9 @@ var validMediaTypes = map[string]bool{
 	"image/gif":  true,
 }
 
-// validContentTypes 允许的 content block 类型
-var validContentTypes = map[string]bool{
-	ContentTypeText:    true,
-	ContentTypeImage:   true,
-	ContentTypeThinking: true,
-}
-
 // validRoles 允许的消息角色
 var validRoles = map[string]bool{
-	RoleUser:     true,
+	RoleUser:      true,
 	RoleAssistant: true,
 }
 
@@ -79,18 +72,12 @@ func (m *Message) Validate() error {
 }
 
 // Validate 校验 ContentBlock 结构。
+// 只校验代理实际消费的 text / image 块；tool_use、tool_result 及一切未知
+// 类型直接放行——通用代理必须能 round-trip 不消费的块（保留其 raw JSON）。
 func (b *ContentBlock) Validate() error {
 	if b.Type == "" {
 		return fmt.Errorf("content_block.type is required")
 	}
-	if !validContentTypes[b.Type] {
-		allowed := make([]string, 0, len(validContentTypes))
-		for t := range validContentTypes {
-			allowed = append(allowed, t)
-		}
-		return fmt.Errorf("content_block.type must be one of %v, got %q", allowed, b.Type)
-	}
-
 	switch b.Type {
 	case ContentTypeText:
 		if b.Text == "" {

@@ -155,6 +155,7 @@ func main() {
 		Cache:               cache.NewLRU(cfg.Cache.MaxEntries),
 		FailOpen:            cfg.FailOpen,
 		LargeImageThreshold: cfg.Vision.LargeImageThreshold,
+		MaxBodyBytes:        cfg.MaxBodyBytes,
 		ConcurrencyLimit:    cfg.ConcurrencyLimit,
 		AdaptiveConcurrency: ac,
 		Log:                 logger,

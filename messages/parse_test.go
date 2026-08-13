@@ -72,3 +72,28 @@ func TestFindImageBlocks_StringContent(t *testing.T) {
 		t.Errorf("want 0 images, got %d", len(FindImageBlocks(&req)))
 	}
 }
+
+func TestFindImageBlocks_NestedInToolResult(t *testing.T) {
+	body := `{
+		"messages": [{"role":"user","content":[
+			{"type":"text","text":"screenshot:"},
+			{"type":"tool_result","content":[
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}},
+				{"type":"text","text":"done"}
+			]},
+			{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"def"}}
+		]}]
+	}`
+	var req Request
+	if err := json.NewDecoder(strings.NewReader(body)).Decode(&req); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	imgs := FindImageBlocks(&req)
+	if len(imgs) != 2 {
+		t.Fatalf("want 2 images (1 nested + 1 top), got %d", len(imgs))
+	}
+	// 顺序：嵌套的在前，顶层的在后
+	if imgs[0].Source.Data != "abc" || imgs[1].Source.Data != "def" {
+		t.Errorf("image order/data wrong: %s / %s", imgs[0].Source.Data, imgs[1].Source.Data)
+	}
+}

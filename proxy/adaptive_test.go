@@ -103,7 +103,7 @@ func TestAdaptive_ErrorTriggeredDecrease(t *testing.T) {
 		SlowThresholdMs: 10000,
 		SampleWindow:    20,
 		CooldownMs:      tinyCooldown,
-		DecreaseRatio:   0.8, // 10 × 0.8 = 8
+		DecreaseRatio:   0.8,  // 10 × 0.8 = 8
 		ErrorThreshold:  0.05, // 5%
 	}, nil, nil)
 
@@ -214,9 +214,9 @@ func TestAdaptive_ScriptScenario_FullLifecycle(t *testing.T) {
 		MinLimit:        1,
 		MaxLimit:        4,
 		InitialLimit:    4,
-		FastThresholdMs: 1000,  // MiMo 8s >> 1s → 永远不会触发 increase
-		SlowThresholdMs: 3000,  // MiMo 8s > 3s → 每批都判定 tooSlow
-		SampleWindow:    4,     // 1 轮 = 4 张图 = 正好填满窗口
+		FastThresholdMs: 1000, // MiMo 8s >> 1s → 永远不会触发 increase
+		SlowThresholdMs: 3000, // MiMo 8s > 3s → 每批都判定 tooSlow
+		SampleWindow:    4,    // 1 轮 = 4 张图 = 正好填满窗口
 		CooldownMs:      tinyCooldown,
 		DecreaseRatio:   0.75,
 		ErrorThreshold:  0.1,
@@ -310,7 +310,7 @@ func TestAdaptive_ScriptScenario_MixedLatency(t *testing.T) {
 	tinySleep()
 	ac.RecordSample(8000, false) // 触发评估
 
-	assertLimit(t, ac, 3)                     // P90=8s > slow=3s → MD 下降
+	assertLimit(t, ac, 3)                            // P90=8s > slow=3s → MD 下降
 	assertMetric(t, m.AdaptiveVisionP90Seconds, 8.0) // P90 = 8000ms = 8.0s
 }
 

@@ -82,3 +82,42 @@ func TestPreserveUnknownFields(t *testing.T) {
 		t.Errorf("role field lost: %s", string(out)[:300])
 	}
 }
+
+func TestReplaceNestedImageInToolResult(t *testing.T) {
+	body := `{
+		"messages": [{"role":"user","content":[
+			{"type":"text","text":"看图"},
+			{"type":"tool_result","tool_use_id":"toolu_1","content":[
+				{"type":"text","text":"screenshot:"},
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}
+			]}
+		]}]
+	}`
+	var req Request
+	if err := json.NewDecoder(strings.NewReader(body)).Decode(&req); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	imgs := FindImageBlocks(&req)
+	if len(imgs) != 1 {
+		t.Fatalf("want 1 image, got %d", len(imgs))
+	}
+	ReplaceImageWithDescription(imgs[0], "描述：一个红色界面")
+
+	out, err := json.Marshal(&req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	outStr := string(out)
+	if !strings.Contains(outStr, `"type":"tool_result"`) {
+		t.Errorf("tool_result wrapper lost: %s", outStr[:300])
+	}
+	if !strings.Contains(outStr, "描述：一个红色界面") {
+		t.Errorf("description missing after replace: %s", outStr[:300])
+	}
+	if strings.Contains(outStr, `"type":"image"`) {
+		t.Errorf("image block still present after replace: %s", outStr[:300])
+	}
+	if !strings.Contains(outStr, `"tool_use_id":"toolu_1"`) {
+		t.Errorf("tool_use_id lost: %s", outStr[:300])
+	}
+}

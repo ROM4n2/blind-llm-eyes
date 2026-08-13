@@ -13,22 +13,29 @@ func WrapImageDescription(description string) string {
 
 // ReplaceImageWithDescription 把一个 image ContentBlock 原位替换为 text 描述块。
 // 调用方需保证 blk 来自 FindImageBlocks（即其 Type == "image" 且 Source != nil）。
-func ReplaceImageWithDescription(blk *ContentBlock, description string) {
-	blk.Type = "text"
-	blk.Text = WrapImageDescription(description)
-	blk.Source = nil
+// 返回 error 表示 Marshal 失败，此时 blk 保持原始状态不变。
+func ReplaceImageWithDescription(blk *ContentBlock, description string) error {
+	// 先构造包装好的描述文本，Marshal 和赋值复用同一份
+	wrapped := WrapImageDescription(description)
 
-	// 重建 raw JSON，确保 Marshal 时输出的是新的 text block（不是旧的 image block）
+	// 先 Marshal 得到新的 raw JSON，成功后再修改 blk 字段
+	// 这样避免 Marshal 失败时 blk.Type 已被改为 "text" 但 blk.raw 仍是旧 image JSON 的不一致状态
 	newRaw, err := json.Marshal(struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	}{
 		Type: "text",
-		Text: blk.Text,
+		Text: wrapped,
 	})
-	if err == nil {
-		blk.raw = newRaw
+	if err != nil {
+		return err
 	}
+
+	blk.Type = "text"
+	blk.Text = wrapped
+	blk.Source = nil
+	blk.raw = newRaw
+	return nil
 }
 
 // NormalizeSystemMessages 把 messages 数组中 role=="system" 的消息提取出来，

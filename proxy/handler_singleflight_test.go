@@ -132,9 +132,9 @@ func TestHandler_Singleflight_CrossRequest(t *testing.T) {
 	reqBody := buildNImageRequestWithSameData(1)
 
 	var (
-		wg       sync.WaitGroup
-		code1    int
-		code2    int
+		wg    sync.WaitGroup
+		code1 int
+		code2 int
 	)
 	wg.Add(2)
 	go func() {

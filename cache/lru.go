@@ -9,7 +9,7 @@ import (
 type LRU struct {
 	mu    sync.Mutex
 	cap   int
-	ll    *list.List            // 最近用的在 front
+	ll    *list.List // 最近用的在 front
 	items map[string]*list.Element
 }
 

@@ -144,11 +144,14 @@ func TestValidate_ImageBlockValid(t *testing.T) {
 	}
 }
 
-func TestValidate_ContentTypeInvalid(t *testing.T) {
-	blk := &ContentBlock{Type: "video"}
-	err := blk.Validate()
-	if err == nil {
-		t.Fatal("expected error for invalid content type")
+func TestValidate_UnknownTypePasses(t *testing.T) {
+	// 未知类型（如 video、tool_use、tool_result）应放行：
+	// 通用代理必须能 round-trip 不消费的块（保留其 raw JSON）
+	for _, typ := range []string{"video", "tool_use", "tool_result"} {
+		blk := &ContentBlock{Type: typ}
+		if err := blk.Validate(); err != nil {
+			t.Errorf("type %q should pass validation, got: %v", typ, err)
+		}
 	}
 }
 

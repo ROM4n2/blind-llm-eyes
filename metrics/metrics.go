@@ -32,10 +32,10 @@ type Metrics struct {
 	AdaptiveVisionP90Seconds       prometheus.Gauge
 
 	// 多 Provider 池指标
-	ProviderCallsTotal   *prometheus.CounterVec
-	ProviderDuration     *prometheus.HistogramVec
-	CircuitBreakerState  *prometheus.GaugeVec
-	FailoverEventsTotal  prometheus.Counter
+	ProviderCallsTotal  *prometheus.CounterVec
+	ProviderDuration    *prometheus.HistogramVec
+	CircuitBreakerState *prometheus.GaugeVec
+	FailoverEventsTotal prometheus.Counter
 }
 
 // NewMetrics 创建并注册所有指标。

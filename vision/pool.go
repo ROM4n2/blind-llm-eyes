@@ -15,7 +15,7 @@ import (
 type PoolEntry struct {
 	Name     string
 	Provider VisionProvider
-	Priority int            // 数值越小优先级越高（越先尝试）
+	Priority int             // 数值越小优先级越高（越先尝试）
 	CB       *CircuitBreaker // 可为 nil（单 provider 场景下不熔断）
 }
 

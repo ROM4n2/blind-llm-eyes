@@ -1,8 +1,8 @@
 package proxy
 
 import (
-	"math"
 	"log/slog"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -139,7 +139,7 @@ func (a *AdaptiveConcurrency) RecordSample(fnExecMs int64, isErr bool) {
 		}
 	}
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-	p90Idx := int(math.Ceil(0.9 * float64(n))) - 1
+	p90Idx := int(math.Ceil(0.9*float64(n))) - 1
 	if p90Idx < 0 {
 		p90Idx = 0
 	}

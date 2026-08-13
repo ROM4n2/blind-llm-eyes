@@ -6,9 +6,11 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"strconv"
@@ -33,7 +35,8 @@ type HandlerDeps struct {
 	Cache               *cache.LRU
 	FailOpen            bool
 	LargeImageThreshold int64
-	ConcurrencyLimit    int // 单请求并发 vision 上限，<=0 时 NewHandler 兜底为 4
+	MaxBodyBytes        int64                // 请求体上限字节，<=0 时 NewHandler 兜底 20MB
+	ConcurrencyLimit    int                  // 单请求并发 vision 上限，<=0 时 NewHandler 兜底为 4
 	AdaptiveConcurrency *AdaptiveConcurrency // 自适应限流控制器；nil 等价于 static 行为
 	Log                 *slog.Logger
 	WG                  *sync.WaitGroup
@@ -48,6 +51,18 @@ func NewHandler(deps HandlerDeps) http.Handler {
 	if deps.ConcurrencyLimit <= 0 {
 		deps.ConcurrencyLimit = 4
 	}
+	if deps.MaxBodyBytes <= 0 {
+		deps.MaxBodyBytes = 20 << 20 // 20MB
+	}
+	if deps.Log == nil {
+		deps.Log = slog.Default()
+	}
+	if deps.VisionProvider == nil {
+		panic("NewHandler: VisionProvider must not be nil")
+	}
+	if deps.Cache == nil {
+		deps.Cache = cache.NewLRU(1000)
+	}
 	if deps.AdaptiveConcurrency == nil {
 		deps.AdaptiveConcurrency = NewAdaptiveConcurrency(AdaptiveConcurrencyCfg{
 			Enabled:      false,
@@ -56,8 +71,23 @@ func NewHandler(deps HandlerDeps) http.Handler {
 			MaxLimit:     deps.ConcurrencyLimit,
 		}, deps.Metrics, deps.Log)
 	}
+
+	// 自定义 HTTP 客户端：连接超时 30s，连接池复用，空闲连接 90s 超时
+	// 不设整体请求超时以支持 SSE 长流式响应，依赖 r.Context() 的取消语义
+	upstreamClient := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 20,
+			IdleConnTimeout:     90 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		},
+	}
+
 	mux := http.NewServeMux()
-	h := &requestHandler{deps: deps}
+	h := &requestHandler{deps: deps, client: upstreamClient}
 	mux.HandleFunc("/v1/messages", h.handleMessages)
 	return mux
 }
@@ -69,9 +99,20 @@ func Shutdown(deps HandlerDeps) {
 	}
 }
 
+// visionResult 封装 singleflight vision 调用的返回值，
+// 将耗时数据（FnStart/FnEnd）与业务数据（Desc/Err）一起传递，
+// 消除 singleflight executor 与 waiter 之间的数据竞争。
+type visionResult struct {
+	Desc    string
+	Err     error
+	FnStart time.Time
+	FnEnd   time.Time
+}
+
 type requestHandler struct {
-	deps HandlerDeps
-	sf   singleflight.Group // 进程级 in-flight 去重，跨请求合并同 hash vision 调用
+	deps   HandlerDeps
+	sf     singleflight.Group // 进程级 in-flight 去重，跨请求合并同 hash vision 调用
+	client *http.Client       // 上游 HTTP 客户端，带连接超时和连接池
 }
 
 func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -89,6 +130,16 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	// 用于记录最终状态码的闭包
 	statusCode := http.StatusOK
 
+	log.Info("request received",
+		"stage", "request_start",
+		"method", r.Method,
+		"path", r.URL.Path,
+		"content_length", r.ContentLength,
+		"remote_addr", r.RemoteAddr,
+		"user_agent", r.UserAgent(),
+		"has_auth", r.Header.Get("Authorization") != "",
+	)
+
 	if r.Method != http.MethodPost {
 		log.Warn("method not allowed",
 			"method", r.Method,
@@ -100,10 +151,22 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 1) 读原始 body
+	// 1) 读原始 body（加上限保护）
 	readStart := time.Now()
+	r.Body = http.MaxBytesReader(w, r.Body, h.deps.MaxBodyBytes)
 	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			log.Error("request body too large",
+				"err", err,
+				"max_bytes", h.deps.MaxBodyBytes,
+			)
+			statusCode = http.StatusRequestEntityTooLarge
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			h.recordRequestMetrics(r.Method, route, statusCode, requestStart)
+			return
+		}
 		log.Error("read request body failed",
 			"err", err,
 			"read_elapsed", time.Since(readStart).String(),
@@ -113,9 +176,11 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		h.recordRequestMetrics(r.Method, route, statusCode, requestStart)
 		return
 	}
-	log.Debug("request body read",
+	log.Info("request body read",
+		"stage", "body_read_complete",
 		"body_bytes", len(rawBody),
-		"read_elapsed", time.Since(readStart).String(),
+		"max_body_bytes", h.deps.MaxBodyBytes,
+		"read_elapsed_ms", time.Since(readStart).Milliseconds(),
 	)
 
 	// 2) 解析 JSON
@@ -131,8 +196,24 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	var cacheHits atomic.Int64
 
 	if parseErr == nil {
-		log.Debug("request JSON parsed",
+		// 统计各角色消息数和 content block 类型分布
+		roleCounts := map[string]int{}
+		blockTypeCounts := map[string]int{}
+		for i := range req.Messages {
+			roleCounts[req.Messages[i].Role]++
+			for j := range req.Messages[i].Content {
+				blockTypeCounts[req.Messages[i].Content[j].Type]++
+			}
+		}
+		log.Info("request JSON parsed",
+			"stage", "json_parse_complete",
+			"model", req.Model,
 			"messages", len(req.Messages),
+			"system_blocks", len(req.System),
+			"max_tokens", req.MaxTokens,
+			"stream", req.Stream,
+			"role_counts", roleCounts,
+			"block_type_counts", blockTypeCounts,
 			"body_bytes", len(rawBody),
 		)
 
@@ -140,15 +221,27 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		systemMoved := messages.NormalizeSystemMessages(&req)
 		if systemMoved > 0 {
 			log.Info("system messages normalized",
+				"stage", "system_normalize_complete",
+				"status", "moved",
 				"moved_count", systemMoved,
 				"messages_after", len(req.Messages),
 				"system_blocks_after", len(req.System),
+			)
+		} else {
+			log.Info("system messages normalized",
+				"stage", "system_normalize_complete",
+				"status", "noop",
+				"moved_count", 0,
+				"messages", len(req.Messages),
+				"system_blocks", len(req.System),
 			)
 		}
 
 		// 2.5) 校验请求结构
 		if verr := req.Validate(); verr != nil {
 			log.Warn("request validation failed",
+				"stage", "validate_complete",
+				"status", "failed",
 				"err", verr,
 				"body_bytes", len(rawBody),
 			)
@@ -157,6 +250,11 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			h.recordRequestMetrics(r.Method, route, statusCode, requestStart)
 			return
 		}
+		log.Info("request validation passed",
+			"stage", "validate_complete",
+			"status", "ok",
+			"messages", len(req.Messages),
+		)
 
 		// 3) 找图
 		imgs := messages.FindImageBlocks(&req)
@@ -165,10 +263,25 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			raw, _ := base64.StdEncoding.DecodeString(blk.Source.Data)
 			totalImageBytes += int64(len(raw))
 		}
+		// 统计 tool_result 块数量，判断是否有嵌套图片来源
+		toolResultCount := 0
+		for i := range req.Messages {
+			if req.Messages[i].Role != "user" {
+				continue
+			}
+			for j := range req.Messages[i].Content {
+				if req.Messages[i].Content[j].Type == messages.ContentTypeToolResult {
+					toolResultCount++
+				}
+			}
+		}
 		log.Info("image blocks found in request",
+			"stage", "find_images_complete",
 			"count", len(imgs),
 			"total_image_bytes", totalImageBytes,
 			"is_large_request", totalImageBytes >= h.deps.LargeImageThreshold,
+			"tool_result_blocks", toolResultCount,
+			"has_nested_source", toolResultCount > 0,
 		)
 
 		// 4) 并行处理图片：查缓存 → 未命中调视觉
@@ -184,7 +297,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			"status", "info",
 			"image_count", len(imgs),
 			"concurrency_limit", h.deps.ConcurrencyLimit, // 静态配置值（参考）
-			"effective_limit", effectiveLimit,            // 实际生效值（自适应）
+			"effective_limit", effectiveLimit, // 实际生效值（自适应）
 			"total_image_bytes", totalImageBytes,
 		)
 
@@ -228,29 +341,69 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 
 				totalLookups.Add(1)
 
-				if herr == nil {
-					if desc, ok := h.deps.Cache.Get(hash); ok {
-						messages.ReplaceImageWithDescription(blk, desc)
+				if herr != nil {
+					log.Warn("hash computation failed, skipping cache and vision",
+						"stage", "image_hash_failed",
+						"index", i,
+						"err", herr,
+						"data_len", len(blk.Source.Data),
+					)
+					if h.deps.FailOpen {
+						if err := messages.ReplaceImageWithDescription(blk, "[Image hash failed, unable to compute cache key]"); err != nil {
+							log.Error("replace image failed after hash failure",
+								"stage", "image_replace_error",
+								"index", i,
+								"err", err,
+							)
+							retErr = fmt.Errorf("replace image after hash failure (index=%d): %w", i, err)
+							outcome = "hash_fail_error"
+							return retErr
+						}
 						rewritten.Add(1)
-						cached.Add(1)
-						cacheHits.Add(1)
-						h.recordImageMetric("cached")
-						log.Debug("cache hit for image",
-							"index", i,
-							"hash", hash,
-							"desc_len", len(desc),
-							"cache_elapsed", time.Since(imgStart).String(),
-						)
-						outcome = "cache_hit"
+						h.recordImageMetric("rewritten")
+						outcome = "hash_fail_open"
 						return nil
 					}
+					retErr = fmt.Errorf("hash computation failed (index=%d): %w", i, herr)
+					outcome = "hash_fail_error"
+					return retErr
 				}
 
-				// 缓存 miss / hash 失败 → 调视觉
-				log.Debug("cache miss, calling vision",
+				if desc, ok := h.deps.Cache.Get(hash); ok {
+					if err := messages.ReplaceImageWithDescription(blk, desc); err != nil {
+						log.Error("replace image failed on cache hit",
+							"stage", "image_replace_error",
+							"index", i,
+							"err", err,
+						)
+						retErr = fmt.Errorf("replace image on cache hit (index=%d): %w", i, err)
+						outcome = "cache_hit_error"
+						return retErr
+					}
+					rewritten.Add(1)
+					cached.Add(1)
+					cacheHits.Add(1)
+					h.recordImageMetric("cached")
+					log.Info("cache hit for image",
+						"stage", "image_cache_hit",
+						"index", i,
+						"hash", hash,
+						"image_size_bytes", imageSize,
+						"desc_len", len(desc),
+						"cache_elapsed_ms", time.Since(imgStart).Milliseconds(),
+					)
+					outcome = "cache_hit"
+					return nil
+				}
+
+				// 缓存 miss → 调视觉
+				log.Info("cache miss, calling vision",
+					"stage", "image_cache_miss",
 					"index", i,
 					"hash", hash,
+					"hash_err", fmt.Sprintf("%v", herr),
 					"image_size_bytes", imageSize,
+					"is_large", isLarge,
 					"timeout_override", isLarge,
 				)
 
@@ -258,22 +411,27 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 				// singleflight：同 hash 并发调用合并为一次 vision 请求
 				// fn 内部用独立 ctx（context.Background + 120s timeout），避免某个调用者
 				// 取消请求导致其他等待者也失败
-				var fnStart, fnEnd time.Time
+				// 耗时数据（FnStart/FnEnd）封装在 visionResult 中返回，
+				// 消除 executor 与 waiter goroutine 之间的数据竞争
 				v, verr, shared := h.sf.Do(hash, func() (any, error) {
-					fnStart = time.Now()
-					defer func() { fnEnd = time.Now() }()
+					res := &visionResult{}
+					res.FnStart = time.Now()
 					dedupCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 					defer cancel()
 					dedupCtx = logging.WithRequestID(dedupCtx, requestID)
-					desc, err := h.deps.VisionProvider.DescribeImage(dedupCtx, blk.Source.Data, blk.Source.MediaType, imageSize)
+					res.Desc, res.Err = h.deps.VisionProvider.DescribeImage(dedupCtx, blk.Source.Data, blk.Source.MediaType, imageSize)
+					res.FnEnd = time.Now()
 					// fn 内部写缓存：确保等待者从 SF.Do 返回时缓存已就绪，
 					// 避免 errgroup 释放 semaphore 后下一个 goroutine 查缓存 miss
-					if err == nil && herr == nil {
-						h.deps.Cache.Put(hash, desc)
+					if res.Err == nil {
+						h.deps.Cache.Put(hash, res.Desc)
 					}
-					return desc, err
+					return res, res.Err
 				})
-				desc, _ := v.(string)
+				res, _ := v.(*visionResult)
+				desc := res.Desc
+				fnStart := res.FnStart
+				fnEnd := res.FnEnd
 				visionElapsed := time.Since(vStart)
 				visionMs := visionElapsed.Milliseconds()
 
@@ -331,7 +489,16 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 						"fn_exec_ms", fnExecMs,
 						"sf_wait_ms", sfWaitMs,
 					)
-					messages.ReplaceImageWithDescription(blk, "[Image could not be described by vision model]")
+					if err := messages.ReplaceImageWithDescription(blk, "[Image could not be described by vision model]"); err != nil {
+						log.Error("replace image failed after vision failure",
+							"stage", "image_replace_error",
+							"index", i,
+							"err", err,
+						)
+						retErr = fmt.Errorf("replace image after vision failure (index=%d): %w", i, err)
+						outcome = "vision_fail_error"
+						return retErr
+					}
 					rewritten.Add(1)
 					h.recordVisionMetric("fail_open", visionElapsed)
 					h.recordImageMetric("rewritten")
@@ -340,7 +507,16 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 				}
 
 				// 成功：缓存已在 singleflight fn 内部写入，无需重复写
-				messages.ReplaceImageWithDescription(blk, desc)
+				if err := messages.ReplaceImageWithDescription(blk, desc); err != nil {
+					log.Error("replace image failed after vision success",
+						"stage", "image_replace_error",
+						"index", i,
+						"err", err,
+					)
+					retErr = fmt.Errorf("replace image after vision success (index=%d): %w", i, err)
+					outcome = "vision_replace_error"
+					return retErr
+				}
 				rewritten.Add(1)
 				h.recordVisionMetric("success", visionElapsed)
 				h.recordImageMetric("rewritten")
@@ -406,15 +582,21 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			newBody, merr := json.Marshal(&req)
 			if merr != nil {
 				log.Error("re-marshal request failed",
+					"stage", "remarshal_complete",
+					"status", "error",
 					"err", merr,
 					"rewritten_count", rewritten.Load(),
 					"system_moved", systemMoved,
 				)
 			} else {
+				oldBytes := len(rawBody)
 				rawBody = newBody
-				log.Debug("request re-marshaled for upstream",
-					"original_bytes", len(rawBody),
+				log.Info("request re-marshaled for upstream",
+					"stage", "remarshal_complete",
+					"status", "ok",
+					"original_bytes", oldBytes,
 					"new_bytes", len(newBody),
+					"delta_bytes", len(newBody)-oldBytes,
 					"rewritten_count", rewritten.Load(),
 					"system_moved", systemMoved,
 				)
@@ -422,8 +604,11 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		}
 	} else {
 		log.Warn("request JSON parse failed, passthrough raw",
+			"stage", "json_parse_complete",
+			"status", "failed_passthrough",
 			"err", parseErr,
 			"body_bytes", len(rawBody),
+			"body_preview", truncate(string(rawBody), 200),
 		)
 	}
 
@@ -459,9 +644,15 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Header 处理
+	// Header 处理：显式过滤安全头，防止敏感信息泄露
 	for k, vs := range r.Header {
-		if k == "Host" {
+		switch {
+		case k == "Host":
+			continue
+		case k == "Authorization", k == "Proxy-Authorization", k == "Cookie":
+			log.Debug("stripping sensitive header before forwarding",
+				"header", k,
+			)
 			continue
 		}
 		for _, v := range vs {
@@ -574,7 +765,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	upstreamReq = upstreamReq.WithContext(traceCtx)
 
 	upstreamStart := time.Now()
-	upstreamResp, err := http.DefaultClient.Do(upstreamReq)
+	upstreamResp, err := h.client.Do(upstreamReq)
 	upstreamElapsed := time.Since(upstreamStart)
 	upstreamMs := upstreamElapsed.Milliseconds()
 	if err != nil {

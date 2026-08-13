@@ -15,22 +15,23 @@ type Config struct {
 	VisionProviders     []ProviderCfg          `yaml:"vision_providers"` // 多 provider 池配置；非空时覆盖 vision 字段
 	Cache               CacheCfg               `yaml:"cache"`
 	FailOpen            bool                   `yaml:"fail_open"`
-	LogLevel            string                 `yaml:"log_level"` // debug|info|warn|error
+	LogLevel            string                 `yaml:"log_level"`         // debug|info|warn|error
 	ConcurrencyLimit    int                    `yaml:"concurrency_limit"` // 单请求内并发 vision 调用上限
+	MaxBodyBytes        int64                  `yaml:"max_body_bytes"`    // 请求体大小上限（字节），默认 20MB
 	AdaptiveConcurrency AdaptiveConcurrencyCfg `yaml:"adaptive_concurrency"`
 }
 
 type AdaptiveConcurrencyCfg struct {
-	Enabled          bool    `yaml:"enabled"`
-	MinLimit         int     `yaml:"min_limit"`
-	MaxLimit         int     `yaml:"max_limit"`
-	FastThresholdMs  int     `yaml:"fast_threshold_ms"`
-	SlowThresholdMs  int     `yaml:"slow_threshold_ms"`
-	SampleWindow     int     `yaml:"sample_window"`
-	CooldownMs       int     `yaml:"cooldown_ms"`
-	IncreaseStep     int     `yaml:"increase_step"`
-	DecreaseRatio    float64 `yaml:"decrease_ratio"` // 0.0~1.0，乘以 limit
-	ErrorThreshold   float64 `yaml:"error_threshold"`  // 0.0~1.0
+	Enabled         bool    `yaml:"enabled"`
+	MinLimit        int     `yaml:"min_limit"`
+	MaxLimit        int     `yaml:"max_limit"`
+	FastThresholdMs int     `yaml:"fast_threshold_ms"`
+	SlowThresholdMs int     `yaml:"slow_threshold_ms"`
+	SampleWindow    int     `yaml:"sample_window"`
+	CooldownMs      int     `yaml:"cooldown_ms"`
+	IncreaseStep    int     `yaml:"increase_step"`
+	DecreaseRatio   float64 `yaml:"decrease_ratio"`  // 0.0~1.0，乘以 limit
+	ErrorThreshold  float64 `yaml:"error_threshold"` // 0.0~1.0
 }
 
 type UpstreamCfg struct {
@@ -39,16 +40,16 @@ type UpstreamCfg struct {
 }
 
 type VisionCfg struct {
-	BaseURL            string        `yaml:"base_url"`
-	APIKey             string        `yaml:"api_key"`
-	Model              string        `yaml:"model"`
-	TimeoutStr         string        `yaml:"timeout"`
-	Timeout            time.Duration `yaml:"-"`
-	LargeTimeoutStr    string        `yaml:"large_image_timeout"`
-	LargeTimeout       time.Duration `yaml:"-"`
-	LargeImageThreshold int64       `yaml:"large_image_threshold"` // bytes; images >= this use large timeout
-	DescriptionCap     int           `yaml:"description_cap"`
-	SupportedFormats   []string      `yaml:"supported_formats"`
+	BaseURL             string        `yaml:"base_url"`
+	APIKey              string        `yaml:"api_key"`
+	Model               string        `yaml:"model"`
+	TimeoutStr          string        `yaml:"timeout"`
+	Timeout             time.Duration `yaml:"-"`
+	LargeTimeoutStr     string        `yaml:"large_image_timeout"`
+	LargeTimeout        time.Duration `yaml:"-"`
+	LargeImageThreshold int64         `yaml:"large_image_threshold"` // bytes; images >= this use large timeout
+	DescriptionCap      int           `yaml:"description_cap"`
+	SupportedFormats    []string      `yaml:"supported_formats"`
 }
 
 type CacheCfg struct {
@@ -75,8 +76,8 @@ type ProviderCfg struct {
 
 // CircuitBreakerCfg 是单个 provider 的熔断器配置。
 type CircuitBreakerCfg struct {
-	FailureThreshold int    `yaml:"failure_threshold"`
-	ResetTimeoutStr  string `yaml:"reset_timeout"`
+	FailureThreshold int           `yaml:"failure_threshold"`
+	ResetTimeoutStr  string        `yaml:"reset_timeout"`
 	ResetTimeout     time.Duration `yaml:"-"`
 }
 
@@ -128,6 +129,9 @@ func Load(path string) (*Config, error) {
 	}
 	if c.ConcurrencyLimit <= 0 {
 		c.ConcurrencyLimit = 4
+	}
+	if c.MaxBodyBytes <= 0 {
+		c.MaxBodyBytes = 20 << 20 // 20MB
 	}
 	if v := os.Getenv("BLIND_LISTEN"); v != "" {
 		c.Listen = v
