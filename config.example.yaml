@@ -33,3 +33,44 @@ adaptive_concurrency:
   error_threshold: 0.10               # 错误率 > 10% → 触发降并发
 fail_open: true                                     # 视觉失败 → 替换为占位文字，不阻塞主链路
 log_level: "info"                                   # debug / info / warn / error
+
+# ────────────────────────────────────────────────────────────────────────────
+# 多 Vision Provider 池（P3 新增，可选）
+# 启用后覆盖上方 vision 字段；池按 priority 升序遍历 provider，失败自动故障转移。
+# 每个 provider 配备独立的熔断器：连续失败达 failure_threshold 后开启，
+# 经过 reset_timeout 后进入半开态放行一个试探请求。
+#
+# 向后兼容：不配置 vision_providers 时，系统使用上方 vision 字段（单 provider 模式），
+# 行为与 P2 完全一致。
+#
+# vision_providers:
+#   - name: "mimo"                              # 标识符，用于日志和指标
+#     type: "mimo"                              # "mimo" = Anthropic Messages API 格式
+#     priority: 1                               # 数值越小越先尝试
+#     base_url: "https://api.xiaomimimo.com/anthropic"
+#     api_key: "sk-mimo-placeholder"
+#     model: "mimo-v2.5"
+#     timeout: "60s"
+#     large_image_timeout: "120s"
+#     large_image_threshold: 1000000
+#     description_cap: 1000
+#     supported_formats: ["image/png", "image/jpeg", "image/webp", "image/gif"]
+#     circuit_breaker:
+#       failure_threshold: 5                    # 连续失败 5 次后熔断
+#       reset_timeout: "30s"                    # 熔断 30s 后半开放行试探
+#
+#   - name: "openai-fallback"
+#     type: "openai_compatible"                 # OpenAI Chat Completions 格式
+#     priority: 2
+#     base_url: "https://api.openai.com/v1"
+#     api_key: "sk-openai-placeholder"
+#     model: "gpt-4o"
+#     timeout: "30s"
+#     large_image_timeout: "60s"
+#     large_image_threshold: 1000000
+#     description_cap: 1000
+#     supported_formats: ["image/png", "image/jpeg", "image/webp"]
+#     circuit_breaker:
+#       failure_threshold: 3
+#       reset_timeout: "30s"
+# ────────────────────────────────────────────────────────────────────────────

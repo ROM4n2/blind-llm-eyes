@@ -12,6 +12,7 @@ type Config struct {
 	Listen              string                 `yaml:"listen"`
 	Upstream            UpstreamCfg            `yaml:"upstream"`
 	Vision              VisionCfg              `yaml:"vision"`
+	VisionProviders     []ProviderCfg          `yaml:"vision_providers"` // 多 provider 池配置；非空时覆盖 vision 字段
 	Cache               CacheCfg               `yaml:"cache"`
 	FailOpen            bool                   `yaml:"fail_open"`
 	LogLevel            string                 `yaml:"log_level"` // debug|info|warn|error
@@ -52,6 +53,31 @@ type VisionCfg struct {
 
 type CacheCfg struct {
 	MaxEntries int `yaml:"max_entries"`
+}
+
+// ProviderCfg 是 vision_providers 列表中单个 provider 的配置。
+type ProviderCfg struct {
+	Name                string            `yaml:"name"`
+	Type                string            `yaml:"type"` // "mimo" | "openai_compatible"
+	Priority            int               `yaml:"priority"`
+	BaseURL             string            `yaml:"base_url"`
+	APIKey              string            `yaml:"api_key"`
+	Model               string            `yaml:"model"`
+	TimeoutStr          string            `yaml:"timeout"`
+	Timeout             time.Duration     `yaml:"-"`
+	LargeTimeoutStr     string            `yaml:"large_image_timeout"`
+	LargeTimeout        time.Duration     `yaml:"-"`
+	LargeImageThreshold int64             `yaml:"large_image_threshold"`
+	DescriptionCap      int               `yaml:"description_cap"`
+	SupportedFormats    []string          `yaml:"supported_formats"`
+	CircuitBreaker      CircuitBreakerCfg `yaml:"circuit_breaker"`
+}
+
+// CircuitBreakerCfg 是单个 provider 的熔断器配置。
+type CircuitBreakerCfg struct {
+	FailureThreshold int    `yaml:"failure_threshold"`
+	ResetTimeoutStr  string `yaml:"reset_timeout"`
+	ResetTimeout     time.Duration `yaml:"-"`
 }
 
 // Load 从路径加载 YAML；env 覆盖对应字段（BLIND_ 前缀）。
@@ -154,8 +180,88 @@ func Load(path string) (*Config, error) {
 			c.AdaptiveConcurrency.FastThresholdMs, c.AdaptiveConcurrency.SlowThresholdMs)
 	}
 
-	if c.Upstream.BaseURL == "" || c.Vision.BaseURL == "" {
-		return nil, fmt.Errorf("upstream.base_url and vision.base_url are required")
+	// ── vision_providers 多 provider 配置解析与默认值 ──
+	if len(c.VisionProviders) > 0 {
+		names := make(map[string]bool, len(c.VisionProviders))
+		for i := range c.VisionProviders {
+			p := &c.VisionProviders[i]
+
+			// 必填字段校验
+			if p.Name == "" {
+				return nil, fmt.Errorf("vision_providers[%d]: name is required", i)
+			}
+			if names[p.Name] {
+				return nil, fmt.Errorf("vision_providers[%d]: duplicate name %q", i, p.Name)
+			}
+			names[p.Name] = true
+
+			if p.Type == "" {
+				p.Type = "mimo"
+			}
+			if p.Type != "mimo" && p.Type != "openai_compatible" {
+				return nil, fmt.Errorf("vision_providers[%d] %q: type must be \"mimo\" or \"openai_compatible\", got %q",
+					i, p.Name, p.Type)
+			}
+			if p.BaseURL == "" {
+				return nil, fmt.Errorf("vision_providers[%d] %q: base_url is required", i, p.Name)
+			}
+			if p.APIKey == "" {
+				return nil, fmt.Errorf("vision_providers[%d] %q: api_key is required", i, p.Name)
+			}
+			if p.Model == "" {
+				return nil, fmt.Errorf("vision_providers[%d] %q: model is required", i, p.Name)
+			}
+
+			// 默认值（与 VisionCfg 一致）
+			if p.TimeoutStr == "" {
+				p.TimeoutStr = "60s"
+			}
+			d, err := time.ParseDuration(p.TimeoutStr)
+			if err != nil {
+				return nil, fmt.Errorf("vision_providers[%d] %q: timeout: %w", i, p.Name, err)
+			}
+			p.Timeout = d
+
+			if p.LargeTimeoutStr == "" {
+				p.LargeTimeoutStr = "120s"
+			}
+			ld, err := time.ParseDuration(p.LargeTimeoutStr)
+			if err != nil {
+				return nil, fmt.Errorf("vision_providers[%d] %q: large_image_timeout: %w", i, p.Name, err)
+			}
+			p.LargeTimeout = ld
+
+			if p.LargeImageThreshold <= 0 {
+				p.LargeImageThreshold = 1_000_000
+			}
+			if p.DescriptionCap <= 0 {
+				p.DescriptionCap = 1000
+			}
+			if len(p.SupportedFormats) == 0 {
+				p.SupportedFormats = []string{"image/png", "image/jpeg", "image/webp", "image/gif"}
+			}
+
+			// 熔断器默认值
+			if p.CircuitBreaker.FailureThreshold <= 0 {
+				p.CircuitBreaker.FailureThreshold = 5
+			}
+			if p.CircuitBreaker.ResetTimeoutStr == "" {
+				p.CircuitBreaker.ResetTimeoutStr = "30s"
+			}
+			rd, err := time.ParseDuration(p.CircuitBreaker.ResetTimeoutStr)
+			if err != nil {
+				return nil, fmt.Errorf("vision_providers[%d] %q: circuit_breaker.reset_timeout: %w", i, p.Name, err)
+			}
+			p.CircuitBreaker.ResetTimeout = rd
+		}
+	}
+
+	// upstream.base_url 始终必填；vision 配置在多 provider 模式下不要求
+	if c.Upstream.BaseURL == "" {
+		return nil, fmt.Errorf("upstream.base_url is required")
+	}
+	if len(c.VisionProviders) == 0 && c.Vision.BaseURL == "" {
+		return nil, fmt.Errorf("vision.base_url or vision_providers is required")
 	}
 	return &c, nil
 }

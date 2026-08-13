@@ -78,10 +78,60 @@ func main() {
 	}
 	ac := proxy.NewAdaptiveConcurrency(acCfg, m, logger)
 
-	deps := proxy.HandlerDeps{
-		UpstreamBaseURL: strings.TrimRight(cfg.Upstream.BaseURL, "/"),
-		UpstreamAPIKey:  cfg.Upstream.APIKey,
-		VisionProvider: vision.NewClient(
+	// 构造 VisionProvider：多 provider 池模式（vision_providers 非空）或单 provider 模式（向后兼容）
+	var visionProvider vision.VisionProvider
+	if len(cfg.VisionProviders) > 0 {
+		entries := make([]vision.PoolEntry, 0, len(cfg.VisionProviders))
+		for _, pc := range cfg.VisionProviders {
+			var p vision.VisionProvider
+			switch pc.Type {
+			case "mimo":
+				p = vision.NewClient(
+					strings.TrimRight(pc.BaseURL, "/"),
+					pc.APIKey,
+					pc.Model,
+					pc.Timeout,
+					pc.LargeTimeout,
+					pc.LargeImageThreshold,
+					pc.DescriptionCap,
+					pc.SupportedFormats,
+					logger,
+				)
+			case "openai_compatible":
+				p = vision.NewOpenAIClient(
+					strings.TrimRight(pc.BaseURL, "/"),
+					pc.APIKey,
+					pc.Model,
+					pc.Timeout,
+					pc.LargeTimeout,
+					pc.LargeImageThreshold,
+					pc.DescriptionCap,
+					pc.SupportedFormats,
+					logger,
+				)
+			default:
+				fmt.Fprintf(os.Stderr, "unknown provider type %q for %q\n", pc.Type, pc.Name)
+				os.Exit(1)
+			}
+			entries = append(entries, vision.PoolEntry{
+				Name:     pc.Name,
+				Provider: p,
+				Priority: pc.Priority,
+				CB:       vision.NewCircuitBreaker(pc.CircuitBreaker.FailureThreshold, pc.CircuitBreaker.ResetTimeout),
+			})
+		}
+		pool, err := vision.NewPool(entries, logger, m)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "build vision pool: %v\n", err)
+			os.Exit(1)
+		}
+		visionProvider = pool
+		logger.Info("multi-provider pool enabled",
+			"providers", pool.ProviderNames(),
+			"mode", "pool",
+		)
+	} else {
+		visionProvider = vision.NewClient(
 			strings.TrimRight(cfg.Vision.BaseURL, "/"),
 			cfg.Vision.APIKey,
 			cfg.Vision.Model,
@@ -91,7 +141,17 @@ func main() {
 			cfg.Vision.DescriptionCap,
 			cfg.Vision.SupportedFormats,
 			logger,
-		),
+		)
+		logger.Info("single-provider mode",
+			"mode", "single",
+			"vision_model", cfg.Vision.Model,
+		)
+	}
+
+	deps := proxy.HandlerDeps{
+		UpstreamBaseURL:     strings.TrimRight(cfg.Upstream.BaseURL, "/"),
+		UpstreamAPIKey:      cfg.Upstream.APIKey,
+		VisionProvider:      visionProvider,
 		Cache:               cache.NewLRU(cfg.Cache.MaxEntries),
 		FailOpen:            cfg.FailOpen,
 		LargeImageThreshold: cfg.Vision.LargeImageThreshold,

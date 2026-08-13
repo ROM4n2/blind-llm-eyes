@@ -30,6 +30,12 @@ type Metrics struct {
 	AdaptiveConcurrencyCurrent     prometheus.Gauge
 	AdaptiveConcurrencyAdjustments *prometheus.CounterVec
 	AdaptiveVisionP90Seconds       prometheus.Gauge
+
+	// 多 Provider 池指标
+	ProviderCallsTotal   *prometheus.CounterVec
+	ProviderDuration     *prometheus.HistogramVec
+	CircuitBreakerState  *prometheus.GaugeVec
+	FailoverEventsTotal  prometheus.Counter
 }
 
 // NewMetrics 创建并注册所有指标。
@@ -124,6 +130,38 @@ func NewMetrics() *Metrics {
 			prometheus.GaugeOpts{
 				Name: "blind_llm_eyes_adaptive_vision_p90_seconds",
 				Help: "P90 vision latency (seconds) from the most recent evaluation window.",
+			},
+		),
+
+		ProviderCallsTotal: promauto.With(reg).NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "blind_llm_eyes_provider_calls_total",
+				Help: "Total vision provider calls, labeled by provider name and result.",
+			},
+			[]string{"provider", "result"}, // result: "success" | "error" | "skipped"
+		),
+
+		ProviderDuration: promauto.With(reg).NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "blind_llm_eyes_provider_duration_seconds",
+				Help:    "Duration of vision provider calls in seconds, labeled by provider.",
+				Buckets: append(prometheus.DefBuckets, 30, 60, 120, 180),
+			},
+			[]string{"provider"},
+		),
+
+		CircuitBreakerState: promauto.With(reg).NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "blind_llm_eyes_circuit_breaker_state",
+				Help: "Circuit breaker state per provider: 0=closed, 1=open, 2=half_open.",
+			},
+			[]string{"provider"},
+		),
+
+		FailoverEventsTotal: promauto.With(reg).NewCounter(
+			prometheus.CounterOpts{
+				Name: "blind_llm_eyes_failover_events_total",
+				Help: "Total number of provider failover events (a provider failed and the next was tried).",
 			},
 		),
 	}
