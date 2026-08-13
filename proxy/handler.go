@@ -22,6 +22,7 @@ import (
 	"github.com/ROM4n2/blind-llm-eyes/logging"
 	"github.com/ROM4n2/blind-llm-eyes/messages"
 	"github.com/ROM4n2/blind-llm-eyes/metrics"
+	"github.com/ROM4n2/blind-llm-eyes/modelutil"
 	"github.com/ROM4n2/blind-llm-eyes/vision"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
@@ -212,6 +213,13 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	var cacheHits atomic.Int64
 
 	if parseErr == nil {
+		// ── Model sanitization: strip trailing [1m]/[1M]/[1K] suffixes ──
+		// DeepSeek and other vendors may append context-length markers to the
+		// model name; these must not be forwarded to the upstream endpoint.
+		origModel := req.Model
+		req.Model = modelutil.SanitizeModel(req.Model)
+		modelSanitized := req.Model != origModel
+
 		// 统计各角色消息数、content block 类型分布、tool_result 块数量
 		// 合并为一次遍历，避免后续重复迭代 req.Messages
 		roleCounts := map[string]int{}
@@ -230,6 +238,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		log.Info("request JSON parsed",
 			"stage", "json_parse_complete",
 			"model", req.Model,
+			"model_sanitized", modelSanitized,
 			"messages", len(req.Messages),
 			"system_blocks", len(req.System),
 			"max_tokens", req.MaxTokens,
@@ -665,8 +674,8 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			req.System = append(req.System, postfix)
 		}
 
-		// 6) 改写了图片或规范化了 system 消息 → 重新序列化请求体
-		if rewritten.Load() > 0 || systemMoved > 0 {
+		// 6) 改写了图片、规范化了 system 消息、或 sanitize 了 model → 重新序列化请求体
+		if rewritten.Load() > 0 || systemMoved > 0 || modelSanitized {
 			newBody, merr := json.Marshal(&req)
 			if merr != nil {
 				log.Error("re-marshal request failed",
