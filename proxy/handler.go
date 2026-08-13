@@ -45,6 +45,9 @@ type HandlerDeps struct {
 
 // NewHandler 返回一个标准 http.Handler，处理 /v1/messages 所有请求。
 func NewHandler(deps HandlerDeps) http.Handler {
+	if deps.UpstreamBaseURL == "" {
+		panic("NewHandler: UpstreamBaseURL must not be empty")
+	}
 	if deps.WG == nil {
 		deps.WG = &sync.WaitGroup{}
 	}
@@ -53,6 +56,9 @@ func NewHandler(deps HandlerDeps) http.Handler {
 	}
 	if deps.MaxBodyBytes <= 0 {
 		deps.MaxBodyBytes = 20 << 20 // 20MB
+	}
+	if deps.LargeImageThreshold <= 0 {
+		deps.LargeImageThreshold = 1 << 20 // 1MB
 	}
 	if deps.Log == nil {
 		deps.Log = slog.Default()
@@ -196,13 +202,19 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	var cacheHits atomic.Int64
 
 	if parseErr == nil {
-		// 统计各角色消息数和 content block 类型分布
+		// 统计各角色消息数、content block 类型分布、tool_result 块数量
+		// 合并为一次遍历，避免后续重复迭代 req.Messages
 		roleCounts := map[string]int{}
 		blockTypeCounts := map[string]int{}
+		toolResultCount := 0
 		for i := range req.Messages {
 			roleCounts[req.Messages[i].Role]++
 			for j := range req.Messages[i].Content {
-				blockTypeCounts[req.Messages[i].Content[j].Type]++
+				t := req.Messages[i].Content[j].Type
+				blockTypeCounts[t]++
+				if t == messages.ContentTypeToolResult {
+					toolResultCount++
+				}
 			}
 		}
 		log.Info("request JSON parsed",
@@ -214,6 +226,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			"stream", req.Stream,
 			"role_counts", roleCounts,
 			"block_type_counts", blockTypeCounts,
+			"tool_result_blocks", toolResultCount,
 			"body_bytes", len(rawBody),
 		)
 
@@ -266,18 +279,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			decodedImages[idx], decodeErrors[idx] = base64.StdEncoding.DecodeString(blk.Source.Data)
 			totalImageBytes += int64(len(decodedImages[idx]))
 		}
-		// 统计 tool_result 块数量，判断是否有嵌套图片来源
-		toolResultCount := 0
-		for i := range req.Messages {
-			if req.Messages[i].Role != "user" {
-				continue
-			}
-			for j := range req.Messages[i].Content {
-				if req.Messages[i].Content[j].Type == messages.ContentTypeToolResult {
-					toolResultCount++
-				}
-			}
-		}
+		// toolResultCount 已在 json_parse_complete 阶段统计，无需重复遍历
 		log.Info("image blocks found in request",
 			"stage", "find_images_complete",
 			"count", len(imgs),
