@@ -1,0 +1,38 @@
+# Build and publish precompiled binaries on every `v*` tag push.
+# goreleaser handles cross-compilation (Windows/Linux/macOS, amd64/arm64),
+# archive packaging, checksums, and the GitHub Release. CGO is disabled so
+# the toolchain is hermetic on the ubuntu runner.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # full history so goreleaser can build the changelog
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run goreleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

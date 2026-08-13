@@ -1,0 +1,68 @@
+# goreleaser config for blind-llm-eyes.
+#
+# Produces precompiled binaries for Windows / Linux / macOS on amd64 + arm64.
+# CGO is disabled (all deps are pure Go, incl. modernc.org/sqlite) so the
+# cross-compile is hermetic. The version string is injected into
+# buildinfo.Version via ldflags, surfaced by `blind-llm-eyes version`.
+#
+# Validate locally:   goreleaser check
+# Dry-run build:      goreleaser build --snapshot --clean
+# Full release:       goreleaser release --clean   (triggered by CI on tag v*)
+
+version: 2
+
+project_name: blind-llm-eyes
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: blind-llm-eyes
+    main: .
+    binary: blind-llm-eyes
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X github.com/ROM4n2/blind-llm-eyes/buildinfo.Version={{.Version}}
+
+archives:
+  - id: default
+    # blind-llm-eyes_1.2.3_linux_amd64.tar.gz / .zip on windows
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^Merge pull request"
+      - "^Merge branch"
+
+release:
+  draft: false
+  prerelease: auto
+  name_template: "{{ .Tag }}"

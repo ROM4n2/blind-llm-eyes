@@ -12,7 +12,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ROM4n2/blind-llm-eyes/admin"
 	"github.com/ROM4n2/blind-llm-eyes/cache"
+	"github.com/ROM4n2/blind-llm-eyes/cli"
 	"github.com/ROM4n2/blind-llm-eyes/config"
 	"github.com/ROM4n2/blind-llm-eyes/logging"
 	"github.com/ROM4n2/blind-llm-eyes/metrics"
@@ -22,8 +24,27 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "config.yaml", "path to config yaml")
-	flag.Parse()
+	args := os.Args[1:]
+	// Server path: no args (backward compat), "start", or any -flag (e.g. -config).
+	// Everything else is a subcommand handled by cli.Run.
+	if len(args) == 0 || args[0] == "start" || strings.HasPrefix(args[0], "-") {
+		runServer(args)
+		return
+	}
+	os.Exit(cli.Run(args, os.Stdin, os.Stdout, os.Stderr))
+}
+
+// runServer starts the proxy server in the foreground. It parses the -config
+// flag (default config.yaml), stripping an optional leading "start" subcommand
+// so both "blind-llm-eyes" and "blind-llm-eyes start [-config ...]" work.
+func runServer(args []string) {
+	flagArgs := args
+	if len(flagArgs) > 0 && flagArgs[0] == "start" {
+		flagArgs = flagArgs[1:]
+	}
+	fs := flag.NewFlagSet("blind-llm-eyes", flag.ExitOnError)
+	configPath := fs.String("config", "config.yaml", "path to config yaml")
+	fs.Parse(flagArgs)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -84,49 +105,7 @@ func main() {
 	// 构造 VisionProvider：多 provider 池模式（vision_providers 非空）或单 provider 模式（向后兼容）
 	var visionProvider vision.VisionProvider
 	if len(cfg.VisionProviders) > 0 {
-		entries := make([]vision.PoolEntry, 0, len(cfg.VisionProviders))
-		for _, pc := range cfg.VisionProviders {
-			var p vision.VisionProvider
-			switch pc.Type {
-			case "mimo":
-				p = vision.NewClient(
-					strings.TrimRight(pc.BaseURL, "/"),
-					pc.APIKey,
-					pc.Model,
-					pc.Timeout,
-					pc.LargeTimeout,
-					pc.LargeImageThreshold,
-					pc.DescriptionCap,
-					pc.SupportedFormats,
-					logger,
-				)
-			case "openai_compatible":
-				p = vision.NewOpenAIClient(
-					strings.TrimRight(pc.BaseURL, "/"),
-					pc.APIKey,
-					pc.Model,
-					pc.Timeout,
-					pc.LargeTimeout,
-					pc.LargeImageThreshold,
-					pc.DescriptionCap,
-					pc.SupportedFormats,
-					logger,
-				)
-			default:
-				fmt.Fprintf(os.Stderr, "unknown provider type %q for %q\n", pc.Type, pc.Name)
-				os.Exit(1)
-			}
-			entries = append(entries, vision.PoolEntry{
-				Name:                pc.Name,
-				Provider:            p,
-				Priority:            pc.Priority,
-				CB:                  vision.NewCircuitBreaker(pc.CircuitBreaker.FailureThreshold, pc.CircuitBreaker.ResetTimeout),
-				Timeout:             pc.Timeout,
-				LargeTimeout:        pc.LargeTimeout,
-				LargeImageThreshold: pc.LargeImageThreshold,
-			})
-		}
-		pool, err := vision.NewPool(entries, logger, m)
+		pool, err := vision.BuildPool(cfg.VisionProviders, logger, m)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "build vision pool: %v\n", err)
 			os.Exit(1)
@@ -137,17 +116,12 @@ func main() {
 			"mode", "pool",
 		)
 	} else {
-		visionProvider = vision.NewClient(
-			strings.TrimRight(cfg.Vision.BaseURL, "/"),
-			cfg.Vision.APIKey,
-			cfg.Vision.Model,
-			cfg.Vision.Timeout,
-			cfg.Vision.LargeTimeout,
-			cfg.Vision.LargeImageThreshold,
-			cfg.Vision.DescriptionCap,
-			cfg.Vision.SupportedFormats,
-			logger,
-		)
+		p, err := vision.BuildSingleProvider(cfg.Vision, logger)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "build vision provider: %v\n", err)
+			os.Exit(1)
+		}
+		visionProvider = p
 		logger.Info("single-provider mode",
 			"mode", "single",
 			"vision_model", cfg.Vision.Model,
@@ -182,6 +156,28 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
+	// Admin shutdown endpoint + pidfile (used by the status/stop subcommands).
+	// The token is generated per-start and written to the pidfile so "stop" can
+	// authenticate. bind 127.0.0.1 (default listen) keeps the endpoint local.
+	pidfilePath, err := cli.DefaultPidfilePath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "locate pidfile path: %v\n", err)
+		os.Exit(1)
+	}
+	adminToken := admin.MustGenerateToken(32)
+	adminH := admin.NewShutdownHandler(adminToken)
+	mux.Handle("/admin/shutdown", adminH)
+	pid := os.Getpid()
+	if err := cli.WritePidfile(pidfilePath, cli.PidfileData{
+		PID:       pid,
+		Addr:      cfg.Listen,
+		Token:     adminH.Token(),
+		StartedAt: time.Now(),
+	}); err != nil {
+		logger.Error("write pidfile", "err", err)
+	}
+	defer os.Remove(pidfilePath)
+
 	srv := &http.Server{
 		Addr:         cfg.Listen,
 		Handler:      mux,
@@ -200,30 +196,33 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	select {
-	case err := <-errCh:
-		logger.Error("server failed", "err", err)
-		logWriter.Close()
-		os.Exit(1)
-	case sig := <-sigCh:
+	// gracefulShutdown stops accepting new requests, drains in-flight work, then
+	// returns so the deferred pidfile removal + log flush run. Shared by the
+	// signal and admin-requested shutdown paths.
+	gracefulShutdown := func(reason string) {
 		logger.Info("shutting down gracefully",
-			"signal", sig,
+			"reason", reason,
 			"waiting_for_inflight_requests", true,
 		)
-
-		// 1) 停止接受新请求（给在途请求 15s 时间完成）
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
 			logger.Error("server shutdown error", "err", err)
 		}
-
-		// 2) 等待所有在途请求完成
 		logger.Info("waiting for in-flight requests to complete...")
 		wg.Wait()
 		logger.Info("all in-flight requests completed, shutting down")
+	}
 
-		// 3) 刷新日志缓冲
+	select {
+	case err := <-errCh:
+		logger.Error("server failed", "err", err)
+		os.Remove(pidfilePath) // defers don't run before os.Exit
 		logWriter.Close()
+		os.Exit(1)
+	case sig := <-sigCh:
+		gracefulShutdown(fmt.Sprintf("signal %s", sig))
+	case <-adminH.Done():
+		gracefulShutdown("admin request")
 	}
 }
