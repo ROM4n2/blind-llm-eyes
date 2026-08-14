@@ -106,6 +106,7 @@ func NewHandler(deps HandlerDeps) http.Handler {
 	mux := http.NewServeMux()
 	h := &requestHandler{deps: deps, client: upstreamClient}
 	mux.HandleFunc("/v1/messages", h.handleMessages)
+	mux.HandleFunc("/v1/messages/count_tokens", h.handleCountTokens)
 	return mux
 }
 
@@ -130,6 +131,62 @@ type requestHandler struct {
 	deps   HandlerDeps
 	sf     singleflight.Group // 进程级 in-flight 去重，跨请求合并同 hash vision 调用
 	client *http.Client       // 上游 HTTP 客户端，带连接超时和连接池
+}
+
+// handleCountTokens forwards POST /v1/messages/count_tokens to upstream
+// verbatim — no image rewriting, no vision calls, no caching. Claude Code
+// calls this endpoint to display token counts in its UI; a 404 breaks the
+// counter. The handler reads the body, forwards it with the same headers
+// (plus upstream API key if configured), and copies the response back.
+func (h *requestHandler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
+	if h.deps.WG != nil {
+		h.deps.WG.Add(1)
+		defer h.deps.WG.Done()
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, h.deps.MaxBodyBytes))
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	upstreamURL := h.deps.UpstreamBaseURL + "/v1/messages/count_tokens"
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "build request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Forward headers (strip sensitive ones, same as handleMessages).
+	for k, vs := range r.Header {
+		switch k {
+		case "Host", "Authorization", "Proxy-Authorization", "Cookie":
+			continue
+		}
+		for _, v := range vs {
+			upstreamReq.Header.Add(k, v)
+		}
+	}
+	if h.deps.UpstreamAPIKey != "" {
+		upstreamReq.Header.Set("Authorization", "Bearer "+h.deps.UpstreamAPIKey)
+	}
+	upstreamReq.ContentLength = int64(len(body))
+
+	resp, err := h.client.Do(upstreamReq)
+	if err != nil {
+		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy upstream response headers and body verbatim.
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) {
