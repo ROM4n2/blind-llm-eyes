@@ -37,6 +37,15 @@ adaptive_concurrency:
 fail_open: true                                     # 视觉失败 → 替换为占位文字，不阻塞主链路
 log_level: "info"                                   # debug / info / warn / error
 
+# ── 视觉能力模型白名单（v1.0.1 新增） ──
+# 列出上游已原生支持图片输入的模型名。请求的 model 匹配此列表时（大小写不敏感，
+# 在去除 [1m] 等后缀之后匹配），代理跳过图片改写阶段，直接透传请求体——节省一次
+# vision API 调用和约 8s 延迟。留空或不配置 = 总是改写（默认行为）。
+# vision_capable_models:
+#   - "gpt-4o"
+#   - "gpt-4o-2024-08-06"
+#   - "claude-3-5-sonnet-20241022"
+
 # ────────────────────────────────────────────────────────────────────────────
 # 多 Vision Provider 池（P3 新增，可选）
 # 启用后覆盖上方 vision 字段；池按 priority 升序遍历 provider，失败自动故障转移。

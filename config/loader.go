@@ -20,6 +20,12 @@ type Config struct {
 	ConcurrencyLimit    int                    `yaml:"concurrency_limit"` // 单请求内并发 vision 调用上限
 	MaxBodyBytes        int64                  `yaml:"max_body_bytes"`    // 请求体大小上限（字节），默认 20MB
 	AdaptiveConcurrency AdaptiveConcurrencyCfg `yaml:"adaptive_concurrency"`
+	// VisionCapableModels lists upstream model names that natively support
+	// image input (e.g. gpt-4o, claude-3-5-sonnet). When the request model
+	// matches this list (case-insensitive, after sanitization), the proxy
+	// skips image rewriting and forwards the body verbatim. Empty = always
+	// rewrite (default).
+	VisionCapableModels []string `yaml:"vision_capable_models"`
 }
 
 type AdaptiveConcurrencyCfg struct {

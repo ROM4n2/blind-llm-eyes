@@ -144,6 +144,15 @@ func runServer(args []string) {
 		WG:                  &wg,
 		Metrics:             m,
 	}
+	// Build vision-capable model set for passthrough (skip rewrite when
+	// upstream model natively supports images). NewHandler normalizes to
+	// lowercase keys for case-insensitive matching.
+	if len(cfg.VisionCapableModels) > 0 {
+		deps.VisionCapableModels = make(map[string]bool, len(cfg.VisionCapableModels))
+		for _, model := range cfg.VisionCapableModels {
+			deps.VisionCapableModels[model] = true
+		}
+	}
 
 	// 主路由：代理 + metrics
 	mux := http.NewServeMux()
