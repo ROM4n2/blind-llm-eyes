@@ -44,6 +44,20 @@ archives:
       - goos: windows
         formats:
           - zip
+    # Include double-click launcher scripts at the archive root so users
+    # can start the proxy without opening a terminal. Each script runs
+    # `blind-llm-eyes start` and keeps the window open on exit.
+    files:
+      - src: scripts/start.bat
+        dst: .
+      - src: scripts/start.sh
+        dst: .
+        info:
+          mode: 0755
+      - src: scripts/start.command
+        dst: .
+        info:
+          mode: 0755
 
 checksum:
   name_template: "checksums.txt"
