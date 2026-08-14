@@ -155,7 +155,7 @@ func runSetupCore(stdin io.Reader, stdout, stderr io.Writer, deps *setupDeps) in
 	if deps.doctorFunc != nil {
 		doctorCode = deps.doctorFunc(cfg, stdout, stderr)
 	} else {
-		doctorCode = runDoctorCore(context.Background(), cfg, "deepseek-chat", stdout, stderr)
+		doctorCode = runDoctorCore(context.Background(), cfg, "deepseek-chat", false, stdout, stderr)
 	}
 
 	if doctorCode != 0 {

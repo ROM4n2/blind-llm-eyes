@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ROM4n2/blind-llm-eyes/config"
 )
@@ -35,7 +37,7 @@ func TestRunDoctor_AllPass(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := runDoctorCore(context.Background(), cfg, "deepseek-chat", &stdout, &stderr)
+	code := runDoctorCore(context.Background(), cfg, "deepseek-chat", false, &stdout, &stderr)
 	if code != 0 {
 		t.Errorf("expected exit 0, got %d; stderr=%s", code, stderr.String())
 	}
@@ -66,7 +68,7 @@ func TestRunDoctor_UpstreamFail(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := runDoctorCore(context.Background(), cfg, "m", &stdout, &stderr)
+	code := runDoctorCore(context.Background(), cfg, "m", false, &stdout, &stderr)
 	if code == 0 {
 		t.Errorf("expected non-zero exit on upstream failure")
 	}
@@ -93,7 +95,7 @@ func TestRunDoctor_VisionFail(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := runDoctorCore(context.Background(), cfg, "m", &stdout, &stderr)
+	code := runDoctorCore(context.Background(), cfg, "m", false, &stdout, &stderr)
 	if code == 0 {
 		t.Errorf("expected non-zero exit on vision failure")
 	}
@@ -127,7 +129,7 @@ func TestRunDoctor_VisionProviders(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := runDoctorCore(context.Background(), cfg, "m", &stdout, &stderr)
+	code := runDoctorCore(context.Background(), cfg, "m", false, &stdout, &stderr)
 	if code == 0 {
 		t.Errorf("expected non-zero exit when one provider fails")
 	}
@@ -147,7 +149,7 @@ func TestRunDoctor_UpstreamUnreachable(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := runDoctorCore(context.Background(), cfg, "m", &stdout, &stderr)
+	code := runDoctorCore(context.Background(), cfg, "m", false, &stdout, &stderr)
 	if code == 0 {
 		t.Errorf("expected non-zero exit on unreachable endpoints")
 	}
@@ -166,7 +168,7 @@ func TestRunDoctor_NoVisionConfigured(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := runDoctorCore(context.Background(), cfg, "m", &stdout, &stderr)
+	code := runDoctorCore(context.Background(), cfg, "m", false, &stdout, &stderr)
 	// Upstream passes, no vision to check → should still exit 0
 	if code != 0 {
 		t.Errorf("expected exit 0 when upstream passes and no vision configured, got %d; stderr=%s", code, stderr.String())
@@ -208,7 +210,7 @@ func TestRunDoctor_JSONRequestNoImage(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	runDoctorCore(context.Background(), cfg, "deepseek-chat", &stdout, &stderr)
+	runDoctorCore(context.Background(), cfg, "deepseek-chat", false, &stdout, &stderr)
 
 	msgs, _ := seenBody["messages"].([]any)
 	if len(msgs) == 0 {
@@ -221,5 +223,90 @@ func TestRunDoctor_JSONRequestNoImage(t *testing.T) {
 		if blk["type"] == "image" || blk["type"] == "image_url" {
 			t.Errorf("upstream ping body must not contain an image block, got %v", blk["type"])
 		}
+	}
+}
+
+func TestRunDoctor_Deep_Pass(t *testing.T) {
+	// Fake upstream — returns 200.
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"content":[{"type":"text","text":"ok"}]}`))
+	}))
+	defer upstreamSrv.Close()
+
+	// Fake vision (MiMo /v1/messages) — returns 200 with a text description.
+	// The deep check sends a real image and expects a non-empty description.
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"content":[{"type":"text","text":"a tiny transparent pixel"}]}`))
+	}))
+	defer visionSrv.Close()
+
+	// NOTE: these tests construct config.Config directly (bypassing config.Load,
+	// which applies default timeouts). Set an explicit Timeout so the vision
+	// client's context.WithTimeout doesn't get a zero-duration (immediately
+	// expired) deadline.
+	cfg := &config.Config{
+		Upstream: config.UpstreamCfg{BaseURL: upstreamSrv.URL, APIKey: "up-key"},
+		Vision: config.VisionCfg{
+			BaseURL:  visionSrv.URL,
+			APIKey:   "vis-key",
+			Model:    "mimo-v2.5",
+			Timeout:  30 * time.Second,
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runDoctorCore(context.Background(), cfg, "deepseek-chat", true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "deep") {
+		t.Errorf("expected 'deep' in output, got: %s", out)
+	}
+	if !strings.Contains(out, "PASS") {
+		t.Errorf("expected PASS in output, got: %s", out)
+	}
+}
+
+func TestRunDoctor_Deep_VisionFail(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstreamSrv.Close()
+
+	// Vision server returns 500 — the ping might pass (any HTTP response is
+	// a pass for ping), but the deep image call should fail.
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// First call (ping) returns 200; subsequent calls (deep) return 500.
+		body, _ := io.ReadAll(r.Body)
+		if len(body) > 100 {
+			// Likely the deep image request (larger body)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer visionSrv.Close()
+
+	cfg := &config.Config{
+		Upstream: config.UpstreamCfg{BaseURL: upstreamSrv.URL, APIKey: "k"},
+		Vision: config.VisionCfg{
+			BaseURL: visionSrv.URL,
+			APIKey:  "k",
+			Model:   "m",
+			Timeout: 30 * time.Second,
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runDoctorCore(context.Background(), cfg, "m", true, &stdout, &stderr)
+	if code == 0 {
+		t.Errorf("expected non-zero exit when deep check fails")
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "FAIL") {
+		t.Errorf("expected FAIL in output, got: %s", out)
 	}
 }
