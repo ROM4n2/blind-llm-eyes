@@ -259,6 +259,8 @@
 | ✅ T10 | ~~goreleaser + workflow + Makefile~~ | **已完成**（T10，`9f46a2b`） |
 | ✅ T11 | ~~E2E 集成测试（含网络超时场景）~~ | **已完成**（T11，`29c5104` + `3f059f8`） |
 | 🔴 发布 | 推送 master + tag + 上传 Release Assets | **阻塞于 GITHUB_TOKEN**。用户需在终端设置 `$env:GITHUB_TOKEN='ghp_...'` 后执行：`git push origin master; git push origin v1.0.0`，release workflow 自动出包；或本地 `goreleaser release --clean` |
+| 🔴 BUG | setup/cc-switch 导入可产出自循环上游 | 见第 9 节：cc-switch 里"已手动接到代理"的 provider 被当上游导入 → `upstream.base_url`=代理自身 → 无限自循环 |
+| 🔴 BUG | handler 无自转发防御 | 见第 9 节：任何 config 让 `upstream.base_url == 自身监听地址` 都无限循环，需 fail fast + doctor 检测 |
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
@@ -711,6 +713,8 @@ ad70a9f refactor(vision): extract provider builders from main.go
 | ✅ 完成 | ~~T1-T11 产品化 11 项 TDD 任务~~ | buildinfo / 构造抽取 / CLI 骨架 / admin+pidfile / Ping+doctor / `[1m]` 剥离 / connect / cc-switch / setup / goreleaser+workflow / E2E+超时场景。13 commit，`go test -race ./...` 13 包全绿 |
 | 🔴 发布 | 推送 master + tag + Release Assets | **阻塞于 GITHUB_TOKEN**。设置 `$env:GITHUB_TOKEN='ghp_...'` 后 `git push origin master; git push origin v1.0.0`，release workflow 自动出包；或本地 `goreleaser release --clean` |
 | ⚠️ Trae 沙箱限制 | pidfile tmp 文件被沙箱拒（仅 IDE 终端） | Trae 沙箱不允许在 `%AppData%` 下创建 `*.tmp`（CreateTemp 报错）。**在独立 PowerShell 终端中运行 `status`/`stop` 正常**；前台 start 不受影响 |
+| 🔴 BUG | setup/cc-switch 导入可产出自循环上游 | **2026-08-13 实测发现（v1.0.0）**。cc-switch 数据库里**合法存在**"已手动接到代理"的 provider（`base_url=http://127.0.0.1:8790`，名字还叫 DeepSeek）。`setup` 导入上游时选中它 → config.yaml `upstream.base_url` = 代理自身地址 → 代理把所有请求转发给自己 → **无限自循环**（日志无限刷 `parallel_images_start` / `forwarding request to upstream`，url=127.0.0.1:8790，remote_addr 也是 127.0.0.1:8790）。实测：发布版解压目录跑 setup 即复现。**修复方向**：`cli/ccswitch.go` + `cli/setup.go` 导入上游 provider 时，若其 `base_url` 等于代理自身 listen 地址 → 拒绝/警告（cc-switch 导入还应主动过滤掉这类 provider） |
+| 🔴 BUG | handler 无自转发防御 | **2026-08-13 实测发现（v1.0.0）**。即使绕过 cc-switch 导入，任何 config 手误让 `upstream.base_url == 自身监听地址` 都无限循环（proxy/handler.go 转发前无此检查）。**修复方向**：handler 构造/转发前检测 `UpstreamBaseURL` 的 host:port 等于自身 `listen` → fail fast 报清晰错误（"upstream 指向代理自身"），而非默默循环；`doctor` 也应检测并报告此情况（上游连通性测试连到自己可能通过或超时，不可靠） |
 | — | MiMo TTFB ~8s | 服务端固定开销（视觉编码 + 预填充），客户端无法优化 |
 | P4 | 主动健康检查 | 定期 ping provider 检测恢复，当前仅被动熔断（reset_timeout 后半开试探） |
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |

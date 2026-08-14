@@ -39,6 +39,24 @@ DeepSeek has no vision. Using it from Claude Code means pasting a screenshot get
 - **cc-switch one-click import** — reads providers directly from the cc-switch SQLite database (best-effort: falls back to temp-copy on DB lock, falls back to manual input on any error).
 - **Safe settings management** — `connect` rewrites Claude Code's `settings.json` with a full-file backup taken exactly once (repeat `connect` never overwrites the backup); `disconnect` restores byte-for-byte from the backup via atomic writes.
 
+## Performance results
+
+Measured on production traffic against the MiMo vision model (2026-08-12 smoke test, 20 samples). Every number is a real before/after measurement, not an estimate.
+
+| Optimization | Before | After | Gain |
+| --- | --- | --- | --- |
+| Disable MiMo thinking mode | 23,500 ms body read | 4,153 ms | **-82%** |
+| Parallel image processing (`errgroup`) | 39,689 ms (2-image E2E) | 19,754 ms | **-50%** |
+| Dedup in-flight vision calls (`singleflight`) | 5 identical images → 5 calls | → 1 call | **N→1** |
+| AIMD adaptive concurrency | static `limit=4` | dynamic `[1,12]`, self-tuned | up to +5 / down to 1 |
+
+Details:
+
+- **Disable thinking mode** — the largest single win. `body_read` dominated the vision call; root cause was MiMo's default thinking mode emitting hidden reasoning output (2,257 chars). Switching to the Anthropic Messages API with `thinking.type: disabled` cut body read from 23.5 s to 4.2 s (**-82%**), total vision call from 31.7 s to 12.4 s (**-61%**), and reasoning output to 0.
+- **Parallel image processing** — serial → `errgroup` with a bounded concurrency: 2-image end-to-end 39.7 s → 19.8 s (**-50%**).
+- **In-flight dedup** — `singleflight` + content-hash LRU: 5 identical images in one request collapse to 1 vision call; 10 concurrent requests carrying the same image also collapse to 1 (**N→1**).
+- **AIMD adaptive concurrency** — tuned from 20 production samples (MiMo avg 7.7 s, worst 20.6 s): defaults set to `concurrency_limit: 6`, `max_limit: 12`, `sample_window: 10`, `cooldown_ms: 2000`. Three-phase verification: fast upstream (P90≈3 s) → limit auto-rises to 9; normal (P90≈11 s) → hysteresis holds at 10; slow (P90≈16 s) → limit drops to 1.
+
 ## Quick start
 
 Three subcommands do the heavy lifting: `setup` (interactive config), `connect` (wire Claude Code to the proxy), and `start` (run the proxy). The whole flow is download → `setup` → `connect` → `start`.

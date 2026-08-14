@@ -39,6 +39,24 @@ DeepSeek 没有视觉能力。在 Claude Code 里用它，粘贴截图只会得�
 - **cc-switch 一键导入** — 直接从 cc-switch SQLite 数据库读取 provider（尽力而为：DB 被锁时回退临时拷贝，任何错误回退手动输入）。
 - **安全的 settings 管理** — `connect` 改写 Claude Code 的 `settings.json` 时先整文件备份且只备份一次（重复 `connect` 永不覆盖备份）；`disconnect` 经原子写从备份逐字节还原。
 
+## 性能结果
+
+对 MiMo 视觉模型的生产流量实测（2026-08-12 冒烟测试，20 个样本）。每个数字都是真实的前后对比测量，不是估算。
+
+| 优化 | 之前 | 之后 | 提升 |
+| --- | --- | --- | --- |
+| 关闭 MiMo thinking 模式 | body_read 23,500 ms | 4,153 ms | **-82%** |
+| 并行图片处理（`errgroup`） | 39,689 ms（2 图端到端） | 19,754 ms | **-50%** |
+| 在途视觉调用去重（`singleflight`） | 5 张相同图 → 5 次调用 | → 1 次调用 | **N→1** |
+| AIMD 自适应并发 | 静态 `limit=4` | 动态 `[1,12]`，自调优 | 最高 +5 / 最低降至 1 |
+
+细节：
+
+- **关闭 thinking 模式** —— 最大的一次提升。`body_read` 占视觉调用的大头；根因是 MiMo 默认 thinking 模式生成隐藏推理内容（2257 字符）。切到 Anthropic Messages API + `thinking.type: disabled` 后，body_read 从 23.5 s 降到 4.2 s（**-82%**），整个视觉调用从 31.7 s 降到 12.4 s（**-61%**），推理输出归零。
+- **并行图片处理** —— 串行 → `errgroup` + 有界并发：2 图端到端 39.7 s → 19.8 s（**-50%**）。
+- **在途去重** —— `singleflight` + 内容哈希 LRU：单请求内 5 张相同图合并为 1 次视觉调用；10 个并发请求带同一张图也合并为 1 次（**N→1**）。
+- **AIMD 自适应并发** —— 用 20 个生产样本调参（MiMo 均值 7.7 s、最差 20.6 s）：默认值定为 `concurrency_limit: 6`、`max_limit: 12`、`sample_window: 10`、`cooldown_ms: 2000`。三阶段验证：上游快（P90≈3 s）→ 并发自动升至 9；正常（P90≈11 s）→ 滞回区稳住 10；上游慢（P90≈16 s）→ 并发降至 1。
+
 ## 快速开始
 
 三个子命令完成重活：`setup`（交互配置）、`connect`（把 Claude Code 接到代理）、`start`（运行代理）。整个流程是 下载 → `setup` → `connect` → `start`。
