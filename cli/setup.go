@@ -100,6 +100,28 @@ func runSetupCore(stdin io.Reader, stdout, stderr io.Writer, deps *setupDeps) in
 	if upstreamAPIKey == "" {
 		upstreamAPIKey = prompt("Upstream API key: ")
 	}
+
+	// ── Step 2a: Free GLM-4V-Flash preset ──
+	// Offer the free default before asking for manual vision config. If the
+	// user accepts, we fill in the GLM-4V-Flash base URL + model and only
+	// ask for the (free) API key from https://open.bigmodel.cn.
+	if visionBaseURL == "" {
+		fmt.Fprintln(stdout, "")
+		fmt.Fprintln(stdout, "Vision provider options:")
+		fmt.Fprintln(stdout, "  1. GLM-4V-Flash (FREE — zero cost, get a key at https://open.bigmodel.cn)")
+		fmt.Fprintln(stdout, "  2. MiMo / other Anthropic-compatible (manual)")
+		fmt.Fprintln(stdout, "  3. OpenAI-compatible (manual)")
+		choice := prompt("Choose vision provider [1/2/3, default=1]: ")
+		if choice == "" || choice == "1" {
+			visionBaseURL = "https://open.bigmodel.cn/api/paas/v4"
+			visionModel = "glm-4v-flash"
+			fmt.Fprintln(stdout, "")
+			fmt.Fprintln(stdout, "Get a FREE API key from: https://open.bigmodel.cn")
+			fmt.Fprintln(stdout, "(Register → API Keys → create. The free tier covers GLM-4V-Flash at no cost.)")
+			visionAPIKey = prompt("GLM API key: ")
+		}
+	}
+
 	if visionBaseURL == "" {
 		visionBaseURL = prompt("Vision base URL [https://api.xiaomimimo.com/anthropic]: ")
 		if visionBaseURL == "" {

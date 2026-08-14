@@ -232,9 +232,20 @@ func Load(path string) (*Config, error) {
 			if p.Type == "" {
 				p.Type = "mimo"
 			}
-			if p.Type != "mimo" && p.Type != "openai_compatible" {
-				return nil, fmt.Errorf("vision_providers[%d] %q: type must be \"mimo\" or \"openai_compatible\", got %q",
+			if p.Type != "mimo" && p.Type != "openai_compatible" && p.Type != "glm_free" {
+				return nil, fmt.Errorf("vision_providers[%d] %q: type must be \"mimo\", \"openai_compatible\", or \"glm_free\", got %q",
 					i, p.Name, p.Type)
+			}
+			// glm_free auto-fills base_url and model with GLM-4V-Flash
+			// defaults; api_key is still required (free tier key from
+			// https://open.bigmodel.cn).
+			if p.Type == "glm_free" {
+				if p.BaseURL == "" {
+					p.BaseURL = "https://open.bigmodel.cn/api/paas/v4"
+				}
+				if p.Model == "" {
+					p.Model = "glm-4v-flash"
+				}
 			}
 			if p.BaseURL == "" {
 				return nil, fmt.Errorf("vision_providers[%d] %q: base_url is required", i, p.Name)

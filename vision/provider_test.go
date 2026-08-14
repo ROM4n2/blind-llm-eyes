@@ -84,6 +84,74 @@ func TestBuildProvider_UnknownType(t *testing.T) {
 	}
 }
 
+func TestBuildProvider_GLMFree(t *testing.T) {
+	// glm_free with only api_key: base_url and model should be auto-filled.
+	pc := config.ProviderCfg{
+		Name:     "glm-free",
+		Type:     "glm_free",
+		Priority: 1,
+		APIKey:   "free-glm-key",
+		Timeout:  30 * time.Second, LargeTimeout: 120 * time.Second,
+		LargeImageThreshold: 1_000_000, DescriptionCap: 1000,
+		SupportedFormats: []string{"image/png"},
+		CircuitBreaker:    config.CircuitBreakerCfg{FailureThreshold: 5, ResetTimeout: 30 * time.Second},
+	}
+	p, err := BuildProvider(pc, testBuildLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	client, ok := p.(*OpenAIClient)
+	if !ok {
+		t.Fatalf("expected *OpenAIClient, got %T", p)
+	}
+	if client.BaseURL != GLMFreeBaseURL {
+		t.Errorf("base_url: want %q, got %q", GLMFreeBaseURL, client.BaseURL)
+	}
+	if client.Model != GLMFreeModel {
+		t.Errorf("model: want %q, got %q", GLMFreeModel, client.Model)
+	}
+}
+
+func TestBuildProvider_GLMFree_OverrideDefaults(t *testing.T) {
+	// User can override the auto-filled base_url and model.
+	pc := config.ProviderCfg{
+		Name:     "glm-custom",
+		Type:     "glm_free",
+		Priority: 1,
+		BaseURL:  "https://custom.example.com/v4",
+		APIKey:   "k",
+		Model:    "glm-4v-plus",
+		Timeout:  30 * time.Second, LargeTimeout: 120 * time.Second,
+		LargeImageThreshold: 1_000_000, DescriptionCap: 1000,
+		SupportedFormats: []string{"image/png"},
+		CircuitBreaker:    config.CircuitBreakerCfg{FailureThreshold: 5, ResetTimeout: 30 * time.Second},
+	}
+	p, err := BuildProvider(pc, testBuildLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	client := p.(*OpenAIClient)
+	if client.BaseURL != "https://custom.example.com/v4" {
+		t.Errorf("base_url override: want custom, got %q", client.BaseURL)
+	}
+	if client.Model != "glm-4v-plus" {
+		t.Errorf("model override: want glm-4v-plus, got %q", client.Model)
+	}
+}
+
+func TestBuildProvider_GLMFree_EmptyAPIKey(t *testing.T) {
+	// api_key is still required for glm_free.
+	pc := config.ProviderCfg{
+		Name:    "glm-no-key",
+		Type:    "glm_free",
+		BaseURL: "https://open.bigmodel.cn/api/paas/v4",
+		Model:   "glm-4v-flash",
+	}
+	if _, err := BuildProvider(pc, testBuildLogger()); err == nil {
+		t.Fatal("expected error for empty api_key on glm_free")
+	}
+}
+
 func TestBuildSingleProvider(t *testing.T) {
 	vc := config.VisionCfg{
 		BaseURL: "https://api.example.com/anthropic", APIKey: "k", Model: "mimo-v2.5",

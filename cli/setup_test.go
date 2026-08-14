@@ -30,6 +30,7 @@ func TestRunSetupCore_ManualInput(t *testing.T) {
 		"n",                                      // import from cc-switch? no
 		"https://api.deepseek.com/anthropic",     // upstream base_url
 		"sk-deepseek-key",                        // upstream api_key
+		"2",                                      // vision provider: manual (MiMo)
 		"https://api.xiaomimimo.com/anthropic",   // vision base_url
 		"sk-mimo-key",                            // vision api_key
 		"mimo-v2.5",                              // vision model
@@ -96,6 +97,7 @@ func TestRunSetupCore_DoctorFail_SaveAnyway(t *testing.T) {
 		"n",
 		"https://api.deepseek.com/anthropic",
 		"sk-key",
+		"2", // vision provider: manual (MiMo)
 		"https://api.xiaomimimo.com/anthropic",
 		"sk-vis",
 		"mimo-v2.5",
@@ -134,6 +136,7 @@ func TestRunSetupCore_DoctorFail_DontSave(t *testing.T) {
 		"n",
 		"https://api.deepseek.com/anthropic",
 		"sk-key",
+		"2", // vision provider: manual (MiMo)
 		"https://api.xiaomimimo.com/anthropic",
 		"sk-vis",
 		"mimo-v2.5",
@@ -169,6 +172,7 @@ func TestRunSetupCore_ConnectAfterSetup(t *testing.T) {
 		"n",
 		"https://api.deepseek.com/anthropic",
 		"sk-key",
+		"2", // vision provider: manual (MiMo)
 		"https://api.xiaomimimo.com/anthropic",
 		"sk-vis",
 		"mimo-v2.5",
@@ -201,14 +205,15 @@ func TestRunSetupCore_DefaultValues(t *testing.T) {
 		},
 	}
 
-	// stdin: no cc-switch, all defaults (empty lines), no connect
+	// stdin: no cc-switch, choose manual MiMo (option 2), all defaults, no connect
 	stdin := strings.Join([]string{
 		"n",
-		"", // upstream base_url = default
+		"",     // upstream base_url = default
 		"sk-key",
-		"", // vision base_url = default
+		"2",    // vision provider: manual (MiMo)
+		"",     // vision base_url = default
 		"sk-vis",
-		"", // vision model = default
+		"",     // vision model = default
 		"n",
 	}, "\n") + "\n"
 
@@ -244,7 +249,7 @@ func TestRunSetupCore_StartupInstructions(t *testing.T) {
 	}
 
 	stdin := strings.Join([]string{
-		"n", "", "sk-key", "", "sk-vis", "", "n",
+		"n", "", "sk-key", "2", "", "sk-vis", "", "n",
 	}, "\n") + "\n"
 
 	var stdout, stderr bytes.Buffer
@@ -257,5 +262,59 @@ func TestRunSetupCore_StartupInstructions(t *testing.T) {
 	// Should mention the start command
 	if !strings.Contains(strings.ToLower(out), "start") {
 		t.Errorf("output should mention 'start' command:\n%s", out)
+	}
+}
+
+func TestRunSetupCore_GLMFreePreset(t *testing.T) {
+	var configData string
+	deps := &setupTestDeps{
+		writeConfig: func(name, data string) error {
+			configData = data
+			return nil
+		},
+		connectFunc: func(proxyURL string) error { return nil },
+		doctorFunc: func(cfg *config.Config, stdout, stderr io.Writer) int {
+			return 0
+		},
+	}
+
+	// stdin: no cc-switch, choose GLM-4V-Flash (option 1 = default), provide
+	// GLM API key, no connect.
+	stdin := strings.Join([]string{
+		"n",              // import from cc-switch? no
+		"",               // upstream base_url = default
+		"sk-deepseek",    // upstream api_key
+		"",               // vision provider: default = 1 (GLM-4V-Flash)
+		"sk-free-glm",    // GLM API key
+		"n",              // connect now? no
+	}, "\n") + "\n"
+
+	var stdout, stderr bytes.Buffer
+	code := runSetupCore(strings.NewReader(stdin), &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr=%s)", code, stderr.String())
+	}
+
+	var cfg config.Config
+	if err := yaml.Unmarshal([]byte(configData), &cfg); err != nil {
+		t.Fatalf("parse config: %v\nconfig:\n%s", err, configData)
+	}
+	if cfg.Vision.BaseURL != "https://open.bigmodel.cn/api/paas/v4" {
+		t.Errorf("vision.base_url: want GLM endpoint, got %q", cfg.Vision.BaseURL)
+	}
+	if cfg.Vision.Model != "glm-4v-flash" {
+		t.Errorf("vision.model: want glm-4v-flash, got %q", cfg.Vision.Model)
+	}
+	if cfg.Vision.APIKey != "sk-free-glm" {
+		t.Errorf("vision.api_key: want sk-free-glm, got %q", cfg.Vision.APIKey)
+	}
+
+	// Output should mention GLM and the free tier URL.
+	out := stdout.String()
+	if !strings.Contains(out, "GLM-4V-Flash") {
+		t.Errorf("stdout should mention GLM-4V-Flash:\n%s", out)
+	}
+	if !strings.Contains(out, "open.bigmodel.cn") {
+		t.Errorf("stdout should mention open.bigmodel.cn:\n%s", out)
 	}
 }

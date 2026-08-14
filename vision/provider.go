@@ -40,11 +40,35 @@ type Pinger interface {
 	Ping(ctx context.Context) error
 }
 
+// GLM-4V-Flash free-tier defaults (Zhipu AI BigModel platform).
+// The model is free to use but still requires an API key from
+// https://open.bigmodel.cn — the "free" refers to zero cost per call,
+// removing the payment barrier for onboarding.
+const (
+	GLMFreeBaseURL = "https://open.bigmodel.cn/api/paas/v4"
+	GLMFreeModel   = "glm-4v-flash"
+)
+
 // BuildProvider constructs a single VisionProvider from a pool-style ProviderCfg.
 // It validates the required fields (base_url, api_key, model) and dispatches on
-// Type ("mimo" = Anthropic Messages API, "openai_compatible" = /v1/chat/completions).
+// Type:
+//   - "mimo" = Anthropic Messages API
+//   - "openai_compatible" = OpenAI /v1/chat/completions
+//   - "glm_free" = GLM-4V-Flash free tier (auto-fills base_url + model)
+//
+// For "glm_free", base_url and model are optional (auto-filled with
+// GLMFreeBaseURL / GLMFreeModel); api_key is still required.
 // Safe to call multiple times in one process (no global metric registration).
 func BuildProvider(pc config.ProviderCfg, logger *slog.Logger) (VisionProvider, error) {
+	// glm_free auto-fills base_url and model; other types require all three.
+	if pc.Type == "glm_free" {
+		if pc.BaseURL == "" {
+			pc.BaseURL = GLMFreeBaseURL
+		}
+		if pc.Model == "" {
+			pc.Model = GLMFreeModel
+		}
+	}
 	if pc.BaseURL == "" {
 		return nil, fmt.Errorf("provider %q: base_url is required", pc.Name)
 	}
@@ -61,14 +85,14 @@ func BuildProvider(pc config.ProviderCfg, logger *slog.Logger) (VisionProvider, 
 			pc.APIKey, pc.Model, pc.Timeout, pc.LargeTimeout,
 			pc.LargeImageThreshold, pc.DescriptionCap, pc.SupportedFormats, logger,
 		), nil
-	case "openai_compatible":
+	case "openai_compatible", "glm_free":
 		return NewOpenAIClient(
 			strings.TrimRight(pc.BaseURL, "/"),
 			pc.APIKey, pc.Model, pc.Timeout, pc.LargeTimeout,
 			pc.LargeImageThreshold, pc.DescriptionCap, pc.SupportedFormats, logger,
 		), nil
 	default:
-		return nil, fmt.Errorf("provider %q: unknown type %q (want \"mimo\" or \"openai_compatible\")", pc.Name, pc.Type)
+		return nil, fmt.Errorf("provider %q: unknown type %q (want \"mimo\", \"openai_compatible\", or \"glm_free\")", pc.Name, pc.Type)
 	}
 }
 

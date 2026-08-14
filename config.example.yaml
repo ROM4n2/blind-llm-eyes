@@ -52,13 +52,32 @@ log_level: "info"                                   # debug / info / warn / erro
 # 每个 provider 配备独立的熔断器：连续失败达 failure_threshold 后开启，
 # 经过 reset_timeout 后进入半开态放行一个试探请求。
 #
+# 支持的 type:
+#   - "mimo"              = Anthropic Messages API 格式
+#   - "openai_compatible" = OpenAI Chat Completions 格式
+#   - "glm_free"          = GLM-4V-Flash 免费档（自动填充 base_url + model）
+#
 # 向后兼容：不配置 vision_providers 时，系统使用上方 vision 字段（单 provider 模式），
 # 行为与 P2 完全一致。
 #
 # vision_providers:
+#   - name: "glm-free"                           # GLM-4V-Flash 免费档（推荐首选）
+#     type: "glm_free"                           # 自动填充 base_url + model
+#     priority: 1
+#     api_key: "your-free-glm-key"               # 从 https://open.bigmodel.cn 免费获取
+#     # base_url 和 model 可省略，glm_free 会自动填充为：
+#     #   base_url: "https://open.bigmodel.cn/api/paas/v4"
+#     #   model: "glm-4v-flash"
+#     timeout: "60s"
+#     large_image_timeout: "120s"
+#     description_cap: 1000
+#     circuit_breaker:
+#       failure_threshold: 5
+#       reset_timeout: "30s"
+#
 #   - name: "mimo"                              # 标识符，用于日志和指标
 #     type: "mimo"                              # "mimo" = Anthropic Messages API 格式
-#     priority: 1                               # 数值越小越先尝试
+#     priority: 2                               # 数值越小越先尝试
 #     base_url: "https://api.xiaomimimo.com/anthropic"
 #     api_key: "sk-mimo-placeholder"
 #     model: "mimo-v2.5"
@@ -73,7 +92,7 @@ log_level: "info"                                   # debug / info / warn / erro
 #
 #   - name: "openai-fallback"
 #     type: "openai_compatible"                 # OpenAI Chat Completions 格式
-#     priority: 2
+#     priority: 3
 #     base_url: "https://api.openai.com/v1"
 #     api_key: "sk-openai-placeholder"
 #     model: "gpt-4o"
