@@ -118,24 +118,18 @@ func disconnectSettings(settingsPath, backupPath string) error {
 
 // atomicWrite writes data to path via a temp file + rename, creating parent
 // directories as needed.
+//
+// Uses a fixed-name temp file (path + ".tmp") instead of os.CreateTemp to
+// avoid Trae IDE sandbox restrictions that block CreateTemp in user
+// directories like ~/.claude/.
 func atomicWrite(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath) // no-op if rename succeeded
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
 		return fmt.Errorf("write temp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("rename: %w", err)

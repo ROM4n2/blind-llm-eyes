@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -62,6 +63,12 @@ func TestRun_NoArgs_ExitsNonZeroAndPrintsUsage(t *testing.T) {
 // are. Subcommands not yet implemented report "not implemented" (exit 2); as
 // later tasks implement them they replace the stubs and add focused tests.
 func TestRun_Routing(t *testing.T) {
+	// Use a non-existent backup path under a temp dir for the "disconnect
+	// no backup" case. This makes the test deterministic (independent of
+	// leftover ~/.claude/.bak-before-connect files) and avoids the Trae IDE
+	// sandbox, which blocks writes to ~/.claude/settings.json.tmp.
+	disconnectBackup := filepath.Join(t.TempDir(), "nonexistent-backup")
+
 	cases := []struct {
 		name        string
 		args        []string
@@ -74,7 +81,7 @@ func TestRun_Routing(t *testing.T) {
 		{"setup recognized", []string{"setup"}, 1, "", "unknown command"},
 		{"doctor missing config", []string{"doctor"}, 1, "config.yaml", "unknown command"},
 		{"connect missing config", []string{"connect"}, 1, "config.yaml", "unknown command"},
-		{"disconnect no backup", []string{"disconnect"}, 1, "backup", "unknown command"},
+		{"disconnect no backup", []string{"disconnect", "-backup", disconnectBackup}, 1, "backup", "unknown command"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -29,28 +29,28 @@ func DefaultPidfilePath() (string, error) {
 
 // WritePidfile atomically writes the pidfile (write to temp + rename), creating
 // parent directories as needed.
+//
+// Implementation note: we use os.WriteFile to a fixed temp path (path+".tmp")
+// instead of os.CreateTemp. The Trae IDE sandbox blocks os.CreateTemp in
+// %AppData% directories, causing status/stop subcommands to fail when run
+// from the IDE's integrated terminal. A fixed-name temp file + rename achieves
+// the same atomic-write semantics without triggering the sandbox restriction.
 func WritePidfile(path string, data PidfileData) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create pidfile dir: %w", err)
 	}
 	raw, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "pidfile-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp pidfile: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after successful rename
-	if _, err := tmp.Write(raw); err != nil {
-		tmp.Close()
+	// Write to a fixed-name temp file, then rename for atomicity.
+	// This avoids os.CreateTemp which is blocked by the Trae IDE sandbox.
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, raw, 0o600); err != nil {
 		return fmt.Errorf("write temp pidfile: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return os.Rename(tmpPath, path)
 }
 
 // ReadPidfile reads and parses the pidfile.
