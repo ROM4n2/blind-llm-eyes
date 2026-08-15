@@ -10,9 +10,7 @@ type Cache interface {
 }
 
 // Compile-time assertions that concrete types satisfy the Cache interface.
-// NOTE: TwoTier does not exist yet — its assertion is commented out and
-// uncommented in the Task that adds TwoTier.
 var (
 	_ Cache = (*LRU)(nil)
-	// _ Cache = (*TwoTier)(nil) // uncomment after TwoTier is added
+	_ Cache = (*TwoTier)(nil)
 )
