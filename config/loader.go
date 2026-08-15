@@ -62,7 +62,12 @@ type VisionCfg struct {
 }
 
 type CacheCfg struct {
-	MaxEntries int `yaml:"max_entries"`
+	MaxEntries       int           `yaml:"max_entries"`        // LRU hot-layer capacity, default 500
+	Type             string        `yaml:"type"`               // "lru" (default/empty) | "twotier"
+	DBPath           string        `yaml:"db_path"`            // SQLite path; empty + type=twotier -> default ./cache.db
+	SqliteMaxEntries int           `yaml:"sqlite_max_entries"` // SQLite capacity cap, default 10000 (<=0 -> 10000)
+	SqliteTTLStr     string        `yaml:"sqlite_ttl"`         // duration like "720h"; empty/0 = no TTL eviction
+	SqliteTTL        time.Duration `yaml:"-"`
 }
 
 // ProviderCfg 是 vision_providers 列表中单个 provider 的配置。
@@ -143,6 +148,22 @@ func Load(path string) (*Config, error) {
 	}
 	if c.Cache.MaxEntries <= 0 {
 		c.Cache.MaxEntries = 500
+	}
+	if c.Cache.Type == "" {
+		c.Cache.Type = "lru"
+	}
+	if c.Cache.Type != "lru" && c.Cache.Type != "twotier" {
+		return nil, fmt.Errorf("cache.type: must be \"lru\" or \"twotier\", got %q", c.Cache.Type)
+	}
+	if c.Cache.SqliteMaxEntries <= 0 {
+		c.Cache.SqliteMaxEntries = 10000
+	}
+	if c.Cache.SqliteTTLStr != "" {
+		d, err := time.ParseDuration(c.Cache.SqliteTTLStr)
+		if err != nil {
+			return nil, fmt.Errorf("cache.sqlite_ttl: %w", err)
+		}
+		c.Cache.SqliteTTL = d
 	}
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
