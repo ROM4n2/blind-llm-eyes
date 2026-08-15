@@ -232,8 +232,8 @@ func Load(path string) (*Config, error) {
 			if p.Type == "" {
 				p.Type = "mimo"
 			}
-			if p.Type != "mimo" && p.Type != "openai_compatible" && p.Type != "glm_free" {
-				return nil, fmt.Errorf("vision_providers[%d] %q: type must be \"mimo\", \"openai_compatible\", or \"glm_free\", got %q",
+			if p.Type != "mimo" && p.Type != "openai_compatible" && p.Type != "glm_free" && p.Type != "qwen" {
+				return nil, fmt.Errorf("vision_providers[%d] %q: type must be \"mimo\", \"openai_compatible\", \"glm_free\", or \"qwen\", got %q",
 					i, p.Name, p.Type)
 			}
 			// glm_free auto-fills base_url and model with GLM-4V-Flash
@@ -245,6 +245,17 @@ func Load(path string) (*Config, error) {
 				}
 				if p.Model == "" {
 					p.Model = "glm-4v-flash"
+				}
+			}
+			// qwen auto-fills base_url and model with DashScope Qwen-VL
+			// defaults; api_key is still required (key from
+			// https://bailian.console.aliyun.com).
+			if p.Type == "qwen" {
+				if p.BaseURL == "" {
+					p.BaseURL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+				}
+				if p.Model == "" {
+					p.Model = "qwen-vl-plus"
 				}
 			}
 			if p.BaseURL == "" {

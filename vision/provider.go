@@ -47,6 +47,13 @@ type Pinger interface {
 const (
 	GLMFreeBaseURL = "https://open.bigmodel.cn/api/paas/v4"
 	GLMFreeModel   = "glm-4v-flash"
+
+	// Qwen-VL DashScope (Aliyun) OpenAI-compatible defaults.
+	// base_url is the Bailian compatible-mode endpoint; model qwen-vl-plus
+	// is the general vision model. User must get an API key at
+	// https://bailian.console.aliyun.com.
+	QwenBaseURL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+	QwenModel   = "qwen-vl-plus"
 )
 
 // BuildProvider constructs a single VisionProvider from a pool-style ProviderCfg.
@@ -55,9 +62,10 @@ const (
 //   - "mimo" = Anthropic Messages API
 //   - "openai_compatible" = OpenAI /v1/chat/completions
 //   - "glm_free" = GLM-4V-Flash free tier (auto-fills base_url + model)
+//   - "qwen" = DashScope Qwen-VL (auto-fills base_url + model)
 //
-// For "glm_free", base_url and model are optional (auto-filled with
-// GLMFreeBaseURL / GLMFreeModel); api_key is still required.
+// For "glm_free" and "qwen", base_url and model are optional (auto-filled with
+// the corresponding defaults); api_key is still required.
 // Safe to call multiple times in one process (no global metric registration).
 func BuildProvider(pc config.ProviderCfg, logger *slog.Logger) (VisionProvider, error) {
 	// glm_free auto-fills base_url and model; other types require all three.
@@ -67,6 +75,14 @@ func BuildProvider(pc config.ProviderCfg, logger *slog.Logger) (VisionProvider, 
 		}
 		if pc.Model == "" {
 			pc.Model = GLMFreeModel
+		}
+	}
+	if pc.Type == "qwen" {
+		if pc.BaseURL == "" {
+			pc.BaseURL = QwenBaseURL
+		}
+		if pc.Model == "" {
+			pc.Model = QwenModel
 		}
 	}
 	if pc.BaseURL == "" {
@@ -85,14 +101,14 @@ func BuildProvider(pc config.ProviderCfg, logger *slog.Logger) (VisionProvider, 
 			pc.APIKey, pc.Model, pc.Timeout, pc.LargeTimeout,
 			pc.LargeImageThreshold, pc.DescriptionCap, pc.SupportedFormats, logger,
 		), nil
-	case "openai_compatible", "glm_free":
+	case "openai_compatible", "glm_free", "qwen":
 		return NewOpenAIClient(
 			strings.TrimRight(pc.BaseURL, "/"),
 			pc.APIKey, pc.Model, pc.Timeout, pc.LargeTimeout,
 			pc.LargeImageThreshold, pc.DescriptionCap, pc.SupportedFormats, logger,
 		), nil
 	default:
-		return nil, fmt.Errorf("provider %q: unknown type %q (want \"mimo\", \"openai_compatible\", or \"glm_free\")", pc.Name, pc.Type)
+		return nil, fmt.Errorf("provider %q: unknown type %q (want \"mimo\", \"openai_compatible\", \"glm_free\", or \"qwen\")", pc.Name, pc.Type)
 	}
 }
 

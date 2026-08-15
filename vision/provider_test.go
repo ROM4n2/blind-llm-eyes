@@ -152,6 +152,75 @@ func TestBuildProvider_GLMFree_EmptyAPIKey(t *testing.T) {
 	}
 }
 
+func TestBuildProvider_QwenAutoFill(t *testing.T) {
+	// qwen with only api_key: base_url and model should be auto-filled.
+	pc := config.ProviderCfg{
+		Name:     "qwen",
+		Type:     "qwen",
+		Priority: 1,
+		APIKey:   "ds-key",
+		Timeout:  30 * time.Second, LargeTimeout: 120 * time.Second,
+		LargeImageThreshold: 1_000_000, DescriptionCap: 1000,
+		SupportedFormats: []string{"image/png"},
+		CircuitBreaker:    config.CircuitBreakerCfg{FailureThreshold: 5, ResetTimeout: 30 * time.Second},
+	}
+	p, err := BuildProvider(pc, testBuildLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// qwen must dispatch to the OpenAI client, not the MiMo client.
+	client, ok := p.(*OpenAIClient)
+	if !ok {
+		t.Fatalf("expected *OpenAIClient, got %T", p)
+	}
+	if client.BaseURL != QwenBaseURL {
+		t.Errorf("base_url: want %q, got %q", QwenBaseURL, client.BaseURL)
+	}
+	if client.Model != QwenModel {
+		t.Errorf("model: want %q, got %q", QwenModel, client.Model)
+	}
+}
+
+func TestBuildProvider_Qwen_OverrideDefaults(t *testing.T) {
+	// User can override the auto-filled base_url and model.
+	pc := config.ProviderCfg{
+		Name:     "qwen-custom",
+		Type:     "qwen",
+		Priority: 1,
+		BaseURL:  "https://custom.example.com/v1",
+		APIKey:   "k",
+		Model:    "qwen-vl-max",
+		Timeout:  30 * time.Second, LargeTimeout: 120 * time.Second,
+		LargeImageThreshold: 1_000_000, DescriptionCap: 1000,
+		SupportedFormats: []string{"image/png"},
+		CircuitBreaker:    config.CircuitBreakerCfg{FailureThreshold: 5, ResetTimeout: 30 * time.Second},
+	}
+	p, err := BuildProvider(pc, testBuildLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	client := p.(*OpenAIClient)
+	if client.BaseURL != "https://custom.example.com/v1" {
+		t.Errorf("base_url override: want custom, got %q", client.BaseURL)
+	}
+	if client.Model != "qwen-vl-max" {
+		t.Errorf("model override: want qwen-vl-max, got %q", client.Model)
+	}
+}
+
+func TestBuildProvider_Qwen_EmptyAPIKey(t *testing.T) {
+	// api_key is still required for qwen.
+	pc := config.ProviderCfg{
+		Name:    "qwen-no-key",
+		Type:    "qwen",
+		BaseURL: QwenBaseURL,
+		Model:   QwenModel,
+	}
+	if _, err := BuildProvider(pc, testBuildLogger()); err == nil {
+		t.Fatal("expected error for empty api_key on qwen")
+	}
+}
+
 func TestBuildSingleProvider(t *testing.T) {
 	vc := config.VisionCfg{
 		BaseURL: "https://api.example.com/anthropic", APIKey: "k", Model: "mimo-v2.5",
