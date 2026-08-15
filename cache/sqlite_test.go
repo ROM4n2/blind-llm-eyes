@@ -1,10 +1,12 @@
 package cache
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func discardLogger() *slog.Logger {
@@ -113,5 +115,36 @@ func TestSQLite_TouchAccessOnGet(t *testing.T) {
 	_ = s.db.QueryRow("SELECT last_accessed FROM cache WHERE hash = ?", "h1").Scan(&la)
 	if la == 0 {
 		t.Fatal("Get did not update last_accessed")
+	}
+}
+
+func TestSQLite_EvictByCount(t *testing.T) {
+	s, err := OpenSQLite(filepath.Join(t.TempDir(), "cache.db"), 3, 0, discardLogger())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer s.Close()
+	for i := 0; i < 5; i++ {
+		s.Put(fmt.Sprintf("h%d", i), "v")
+		time.Sleep(2 * time.Millisecond) // stagger last_accessed
+	}
+	var n int
+	_ = s.db.QueryRow("SELECT COUNT(*) FROM cache").Scan(&n)
+	if n > 3 {
+		t.Fatalf("count %d > maxEntries 3", n)
+	}
+}
+
+func TestSQLite_EvictByTTL(t *testing.T) {
+	s, err := OpenSQLite(filepath.Join(t.TempDir(), "cache.db"), 0, 1*time.Millisecond, discardLogger())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer s.Close()
+	s.Put("h1", "v")
+	time.Sleep(20 * time.Millisecond)
+	s.Put("h2", "v") // triggers TTL eviction of h1
+	if _, ok := s.Get("h1"); ok {
+		t.Fatal("h1 should have been TTL-evicted")
 	}
 }

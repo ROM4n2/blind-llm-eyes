@@ -37,6 +37,10 @@ const (
 			description   = excluded.description,
 			size_bytes    = excluded.size_bytes,
 			last_accessed = excluded.last_accessed`
+	sqlCount    = `SELECT COUNT(*) FROM cache`
+	sqlEvictLRU = `DELETE FROM cache WHERE hash IN (
+		SELECT hash FROM cache ORDER BY last_accessed ASC LIMIT ?)`
+	sqlEvictTTL = `DELETE FROM cache WHERE created_at < ?`
 )
 
 // OpenSQLite opens (creating if absent) the SQLite cache DB, applies WAL
@@ -124,6 +128,30 @@ func (s *SQLite) Put(key, value string) {
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
-// evictIfNeeded is a no-op stub here; real count+TTL eviction is added in the
-// next task. Kept so Put compiles without conditional logic.
-func (s *SQLite) evictIfNeeded() {}
+// evictIfNeeded enforces the SQLite-layer caps. Count-based eviction trims
+// to 90% of maxEntries when over (batch delete to amortize). TTL eviction
+// drops entries older than ttl. Both are best-effort; failures log a WARN.
+func (s *SQLite) evictIfNeeded() {
+	if s.maxEntries > 0 {
+		var n int
+		if err := s.db.QueryRow(sqlCount).Scan(&n); err != nil {
+			s.log.Warn("sqlite count", "err", err)
+			return
+		}
+		if n > s.maxEntries {
+			del := n - s.maxEntries*9/10
+			if del < 1 {
+				del = 1
+			}
+			if _, err := s.db.Exec(sqlEvictLRU, del); err != nil {
+				s.log.Warn("sqlite evict lru", "err", err)
+			}
+		}
+	}
+	if s.ttl > 0 {
+		cutoff := nowMillis() - s.ttl.Milliseconds()
+		if _, err := s.db.Exec(sqlEvictTTL, cutoff); err != nil {
+			s.log.Warn("sqlite evict ttl", "err", err)
+		}
+	}
+}
