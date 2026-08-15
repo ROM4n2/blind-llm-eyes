@@ -128,11 +128,33 @@ func runServer(args []string) {
 		)
 	}
 
+	// Build cache backend: type=twotier uses LRU+SQLite; on SQLite open
+	// failure, fall back to LRU-only (persistence is an enhancement, never
+	// blocks startup). type=lru (default) stays in-memory only.
+	var cacheBackend cache.Cache
+	switch cfg.Cache.Type {
+	case "twotier":
+		sqlc, err := cache.OpenSQLite(cfg.Cache.DBPath, cfg.Cache.SqliteMaxEntries, cfg.Cache.SqliteTTL, logger)
+		if err != nil {
+			logger.Warn("sqlite open failed, falling back to LRU-only", "err", err)
+			cacheBackend = cache.NewLRU(cfg.Cache.MaxEntries)
+		} else {
+			cacheBackend = cache.NewTwoTier(cfg.Cache.MaxEntries, sqlc, logger)
+			logger.Info("persistent cache enabled",
+				"db_path", cfg.Cache.DBPath,
+				"sqlite_max_entries", cfg.Cache.SqliteMaxEntries,
+				"sqlite_ttl", cfg.Cache.SqliteTTL,
+			)
+		}
+	default:
+		cacheBackend = cache.NewLRU(cfg.Cache.MaxEntries)
+	}
+
 	deps := proxy.HandlerDeps{
 		UpstreamBaseURL:     strings.TrimRight(cfg.Upstream.BaseURL, "/"),
 		UpstreamAPIKey:      cfg.Upstream.APIKey,
 		VisionProvider:      visionProvider,
-		Cache:               cache.NewLRU(cfg.Cache.MaxEntries),
+		Cache:               cacheBackend,
 		FailOpen:            cfg.FailOpen,
 		LargeImageThreshold: cfg.Vision.LargeImageThreshold,
 		MaxBodyBytes:        cfg.MaxBodyBytes,
