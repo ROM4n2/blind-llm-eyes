@@ -29,6 +29,14 @@ const (
 		last_accessed  INTEGER NOT NULL
 	)`
 	sqlCreateIndex = `CREATE INDEX IF NOT EXISTS idx_cache_last_accessed ON cache(last_accessed)`
+	sqlGet         = `SELECT description FROM cache WHERE hash = ?`
+	sqlTouchAccess = `UPDATE cache SET last_accessed = ? WHERE hash = ?`
+	sqlUpsert      = `INSERT INTO cache(hash, description, size_bytes, created_at, last_accessed)
+		VALUES(?, ?, ?, ?, ?)
+		ON CONFLICT(hash) DO UPDATE SET
+			description   = excluded.description,
+			size_bytes    = excluded.size_bytes,
+			last_accessed = excluded.last_accessed`
 )
 
 // OpenSQLite opens (creating if absent) the SQLite cache DB, applies WAL
@@ -88,3 +96,34 @@ func (s *SQLite) initSchema() error {
 }
 
 func (s *SQLite) Close() error { return s.db.Close() }
+
+func (s *SQLite) Get(key string) (string, bool) {
+	var desc string
+	err := s.db.QueryRow(sqlGet, key).Scan(&desc)
+	if err == sql.ErrNoRows {
+		return "", false
+	}
+	if err != nil {
+		s.log.Warn("sqlite get", "err", err, "key", key)
+		return "", false
+	}
+	// Touch access time (best-effort; failure does not invalidate the hit).
+	if _, err := s.db.Exec(sqlTouchAccess, nowMillis(), key); err != nil {
+		s.log.Warn("sqlite touch access", "err", err, "key", key)
+	}
+	return desc, true
+}
+
+func (s *SQLite) Put(key, value string) {
+	now := nowMillis()
+	if _, err := s.db.Exec(sqlUpsert, key, value, len(value), now, now); err != nil {
+		s.log.Warn("sqlite put", "err", err, "key", key)
+	}
+	s.evictIfNeeded()
+}
+
+func nowMillis() int64 { return time.Now().UnixMilli() }
+
+// evictIfNeeded is a no-op stub here; real count+TTL eviction is added in the
+// next task. Kept so Put compiles without conditional logic.
+func (s *SQLite) evictIfNeeded() {}

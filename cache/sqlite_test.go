@@ -63,3 +63,55 @@ func TestOpenSQLite_IdempotentReopen(t *testing.T) {
 		t.Fatalf("schema not preserved on reopen: n=%d", n)
 	}
 }
+
+func newTestSQLite(t *testing.T) *SQLite {
+	t.Helper()
+	s, err := OpenSQLite(filepath.Join(t.TempDir(), "cache.db"), 10000, 0, discardLogger())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	return s
+}
+
+func TestSQLite_PutGetRoundTrip(t *testing.T) {
+	s := newTestSQLite(t)
+	defer s.Close()
+	s.Put("h1", "a cat sitting on a mat")
+	got, ok := s.Get("h1")
+	if !ok || got != "a cat sitting on a mat" {
+		t.Fatalf("got (%q,%v), want (\"a cat...\", true)", got, ok)
+	}
+}
+
+func TestSQLite_GetMiss(t *testing.T) {
+	s := newTestSQLite(t)
+	defer s.Close()
+	if _, ok := s.Get("nope"); ok {
+		t.Fatal("expected miss")
+	}
+}
+
+func TestSQLite_UpsertOverwrites(t *testing.T) {
+	s := newTestSQLite(t)
+	defer s.Close()
+	s.Put("h1", "v1")
+	s.Put("h1", "v2")
+	got, _ := s.Get("h1")
+	if got != "v2" {
+		t.Fatalf("want v2, got %q", got)
+	}
+}
+
+func TestSQLite_TouchAccessOnGet(t *testing.T) {
+	s := newTestSQLite(t)
+	defer s.Close()
+	s.Put("h1", "v")
+	// Force last_accessed to 0 (ancient).
+	_, _ = s.db.Exec("UPDATE cache SET last_accessed = 0 WHERE hash = ?", "h1")
+	s.Get("h1")
+	var la int64
+	_ = s.db.QueryRow("SELECT last_accessed FROM cache WHERE hash = ?", "h1").Scan(&la)
+	if la == 0 {
+		t.Fatal("Get did not update last_accessed")
+	}
+}
