@@ -45,6 +45,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runStatus(rest, stdin, stdout, stderr)
 	case "stop":
 		return runStop(rest, stdin, stdout, stderr)
+	case "cache":
+		return runCache(rest, stdin, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "blind-llm-eyes: unknown command %q\n\n", cmd)
 		printUsage(stderr)
@@ -76,5 +78,6 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  disconnect   Restore Claude Code settings")
 	fmt.Fprintln(w, "  status       Show running proxy status")
 	fmt.Fprintln(w, "  stop         Stop the running proxy")
+	fmt.Fprintln(w, "  cache        Manage persistent cache (stats/list/clear/path)")
 	fmt.Fprintln(w, "  version      Print version information")
 }
