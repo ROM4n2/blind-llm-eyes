@@ -41,12 +41,16 @@ const (
 	sqlEvictLRU = `DELETE FROM cache WHERE hash IN (
 		SELECT hash FROM cache ORDER BY last_accessed ASC LIMIT ?)`
 	sqlEvictTTL = `DELETE FROM cache WHERE created_at < ?`
+
+	sqlIntegrityCheck = `PRAGMA integrity_check`
 )
 
 // OpenSQLite opens (creating if absent) the SQLite cache DB, applies WAL
-// PRAGMAs, runs integrity_check (corruption recovery is added in a later
-// task — for now a failed integrity check returns an error), and creates
-// the schema. path "" defaults to "./cache.db".
+// PRAGMAs, and runs integrity_check. If applyPragmas or integrity_check
+// detects corruption (or errors), the DB + wal + shm files are deleted and
+// the handle is reopened — a cold start that loses descriptions but never
+// blocks the service. Finally the schema is (re)created. path "" defaults
+// to "./cache.db".
 func OpenSQLite(path string, maxEntries int, ttl time.Duration, logger *slog.Logger) (*SQLite, error) {
 	if path == "" {
 		path = "./cache.db"
@@ -65,11 +69,22 @@ func OpenSQLite(path string, maxEntries int, ttl time.Duration, logger *slog.Log
 
 	s := &SQLite{db: db, maxEntries: maxEntries, ttl: ttl, log: logger}
 	if err := s.applyPragmas(); err != nil {
-		db.Close()
+		// modernc errors on PRAGMA journal_mode=WAL with "file is not a
+		// database" when the file is corrupt/garbage — this happens before
+		// integrity_check can run. Treat any applyPragmas failure as
+		// corruption and rebuild so the service never fails to start.
+		s.log.Warn("sqlite applyPragmas failed, attempting corruption recovery", "err", err)
+		if err := s.rebuildDB(path); err != nil {
+			s.db.Close()
+			return nil, err
+		}
+	}
+	if err := s.applyCorruptionRecovery(path); err != nil {
+		s.db.Close()
 		return nil, err
 	}
 	if err := s.initSchema(); err != nil {
-		db.Close()
+		s.db.Close()
 		return nil, err
 	}
 	return s, nil
@@ -85,6 +100,43 @@ func (s *SQLite) applyPragmas() error {
 		if _, err := s.db.Exec(p); err != nil {
 			return fmt.Errorf("pragma %q: %w", p, err)
 		}
+	}
+	return nil
+}
+
+// applyCorruptionRecovery runs PRAGMA integrity_check. If the result is not
+// "ok" (or the check itself errors), the DB files are deleted and the handle
+// is reopened — a cold start that loses descriptions but never blocks the
+// service. After rebuild, initSchema recreates the table.
+func (s *SQLite) applyCorruptionRecovery(path string) error {
+	var result string
+	if err := s.db.QueryRow(sqlIntegrityCheck).Scan(&result); err != nil {
+		s.log.Warn("sqlite integrity_check failed, rebuilding", "err", err)
+		return s.rebuildDB(path)
+	}
+	if result != "ok" {
+		s.log.Warn("sqlite integrity_check not ok, rebuilding", "result", result)
+		return s.rebuildDB(path)
+	}
+	return nil
+}
+
+// rebuildDB closes the current handle, removes the db + wal + shm files, and
+// reopens a fresh handle with the WAL pragmas applied. The schema is recreated
+// by the caller's initSchema step that follows OpenSQLite's recovery call.
+func (s *SQLite) rebuildDB(path string) error {
+	s.db.Close()
+	for _, f := range []string{path, path + "-wal", path + "-shm"} {
+		_ = os.Remove(f)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return fmt.Errorf("reopen sqlite after rebuild: %w", err)
+	}
+	db.SetMaxOpenConns(8)
+	s.db = db
+	if err := s.applyPragmas(); err != nil {
+		return err
 	}
 	return nil
 }

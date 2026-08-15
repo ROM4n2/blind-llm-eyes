@@ -66,6 +66,25 @@ func TestOpenSQLite_IdempotentReopen(t *testing.T) {
 	}
 }
 
+func TestOpenSQLite_CorruptionRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.db")
+	// Write garbage bytes to simulate a corrupted DB file.
+	if err := os.WriteFile(path, []byte("not a sqlite database garbage garbage garbage"), 0o600); err != nil {
+		t.Fatalf("write garbage: %v", err)
+	}
+	// OpenSQLite should detect corruption and rebuild (not return an error).
+	s, err := OpenSQLite(path, 10000, 0, discardLogger())
+	if err != nil {
+		t.Fatalf("OpenSQLite on corrupt db: %v", err)
+	}
+	defer s.Close()
+	// After recovery the DB should be usable.
+	s.Put("h1", "v")
+	if got, _ := s.Get("h1"); got != "v" {
+		t.Fatalf("after recovery Get=%q want v", got)
+	}
+}
+
 func newTestSQLite(t *testing.T) *SQLite {
 	t.Helper()
 	s, err := OpenSQLite(filepath.Join(t.TempDir(), "cache.db"), 10000, 0, discardLogger())
