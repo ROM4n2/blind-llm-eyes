@@ -34,7 +34,7 @@ type HandlerDeps struct {
 	UpstreamBaseURL     string
 	UpstreamAPIKey      string
 	VisionProvider      vision.VisionProvider
-	Cache               *cache.LRU
+	Cache               cache.Cache
 	FailOpen            bool
 	LargeImageThreshold int64
 	MaxBodyBytes        int64                // 请求体上限字节，<=0 时 NewHandler 兜底 20MB
