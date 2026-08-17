@@ -1,17 +1,17 @@
 # Changelog
 
-## [Unreleased] — Tier 2 (v1.1.0-dev, M0 + M1.A + M1.B + perf 优化)
+## [v1.1.0] — 2026-08-17
 
-**迭代范围**：2026-08-15 ~ 2026-08-16，共 15 个提交（`0758431..de514b1`），对应
+**迭代范围**：2026-08-15 ~ 2026-08-17，共 21 个提交（`0758431..3c17240`），对应
 [spec](docs/superpowers/specs/2026-08-14-tier2-sqlite-cache-qwen-design.md)
 和
 [plan](docs/superpowers/plans/2026-08-14-tier2-sqlite-cache-qwen.md)
-的 Task 1-12（M0 接口锁定 + M1.A SQLite 缓存 + M1.B Qwen setup），
+的 Task 1-22（M0 接口锁定 + M1.A-D SQLite 缓存/Qwen setup/cache CLI/e2e+文档 + M2 RC1 + M3 GA），
 外加两个 perf 优化补丁（[内存计数器](docs/superpowers/plans/2026-08-16-sqlite-inmemory-counter.md)）。
 
-**迭代目标**：为 v1.1.0 引入两个 opt-in 特性的骨架与核心实现——两层
-LRU+SQLite 持久化缓存（描述文本跨进程重启存活）和 DashScope Qwen-VL
-视觉 provider 预设（国内用户友好）。默认行为保留 v1.0.1
+**迭代目标**：为 v1.1.0 引入两个 opt-in 特性——两层 LRU+SQLite 持久化缓存
+（描述文本跨进程重启存活）和 DashScope Qwen-VL 视觉 provider 预设（国内用户友好），
+以及 4 个 `cache` CLI 子命令用于缓存管理。默认行为保留 v1.0.1
 （`type=lru`），持久化与 Qwen 预设均需显式启用。
 
 ### New Features
@@ -82,6 +82,37 @@ LRU+SQLite 持久化缓存（描述文本跨进程重启存活）和 DashScope Q
 - **手动模式保留**：选项 3/4 仍走 `vision:` 单块（MiMo Client），
   presetType 为空时才提示 base_url/api_key/model 手动输入
 
+#### cache CLI 子命令实现（M1.C, Task 13-17）
+
+- **4 个子命令** (`cli/cache.go`)：`path` / `stats` / `list` / `clear`，
+  替换 M0 阶段的 stub
+- **path**：打印缓存类型、db 路径、文件是否存在（twotier 才检查）
+- **stats**：查询条目数、总字节数、最早/最晚访问时间、db 文件大小、
+  实际 journal_mode（非硬编码）
+- **list**：按 `last_accessed DESC` 列出条目，hash 截断 12 字符、
+  desc 截断 60 字符 + `…`，`-limit N`（默认 20）
+- **clear**：`DELETE FROM cache`，交互 `y/N` 确认或 `-yes` 跳过
+- **改进**：每个子命令支持 `-config` flag（与 doctor/connect 一致）；
+  `openCacheDB` 设置 `busy_timeout=5000`，代理运行中也能操作
+- **测试**：17 个新用例覆盖 LRU-only 拒绝、twotier 有/无 db、空 db、
+  desc 截断、clear 确认/取消/`-yes`、未知子命令、`-config` flag
+
+#### 跨重启缓存存活 E2E + 文档（M1.D, Task 18-20）
+
+- **E2E 测试** (`test/e2e_test.go`)：`TestE2E_CacheSurvivesRestart`
+  验证 SQLite 冷层跨重启存活——冷启动 TwoTier 发请求（vision 调用 1x，
+  header "rewritten"）→ 关闭 SQLite（WAL checkpoint）→ 重开同 db 路径
+  → 同图请求命中冷层缓存（vision 不再调用，header "cached"）
+- **config.example.yaml 文档化**：cache 段补全 `type` / `db_path` /
+  `sqlite_max_entries` / `sqlite_ttl` 注释；vision_providers 段新增
+  Qwen-VL 示例
+- **README 更新**（en + zh）：功能列表（缓存持久化 + Qwen 预设 +
+  多 provider 池）、配置参考表（5 个 cache 新字段）、架构图（TwoTier +
+  四预设）、新增"缓存管理"小节、CLI 子命令 8→9、限制段更新
+- **RELEASE_NOTES-v1.1.0**（en + zh）：完整发版说明，覆盖两层缓存
+  架构、Qwen 预设、cache CLI、perf 补丁、向后兼容、21 commit 列表、
+  升级指南
+
 ### Refactor
 
 #### 缓存接口抽象（M0, Task 1）
@@ -137,10 +168,10 @@ LRU+SQLite 持久化缓存（描述文本跨进程重启存活）和 DashScope Q
 | `cache/twotier.go` | `cache/twotier_test.go` | Get 回填 / Put 双写 / 50-goroutine 防惊群 |
 | `config/loader.go` | `config/loader_test.go` | 默认值 / twotier 解析 / bad-type 拒绝 |
 | `vision/provider.go` | `vision/provider_test.go` | Qwen auto-fill / 用户 override 优先 / 空 api_key 报错 |
-| `cli/cache.go` + `cli/cli.go` | `cli/cli_test.go` | `TestRun_Routing` 覆盖 cache no-args / unknown / stats stub |
+| `cli/cache.go` + `cli/cli.go` | `cli/cli_test.go` + `cli/cache_test.go` | `TestRun_Routing` 覆盖 cache no-args / unknown；**17 个 cache 测试**：path LRU/twotier、stats LRU/twotier/empty、list 基础/截断/LRU、clear `-yes`/取消/确认/LRU、dispatch、`-config` flag |
 | `cli/setup.go` | `cli/setup_test.go` | 手动 MiMo / doctor 失败保存/取消 / connect / 默认值 / **GLM 预设 vision_providers** / **Qwen 预设** / **GLM 统一输出** |
 | `proxy/handler.go` | 现有 proxy 测试 | 接口改动不破坏现有行为 |
-| `main.go` | — | 装配逻辑无单元测试（Go 惯例由 e2e 覆盖，规划在 Task 18-20） |
+| `main.go` + `cache/twotier.go` | `test/e2e_test.go` | **`TestE2E_CacheSurvivesRestart`**：TwoTier 跨重启缓存存活（WAL checkpoint → 重开 → 冷层命中） |
 
 - `go vet ./...` 通过
 - `go build ./...` 通过
@@ -148,16 +179,12 @@ LRU+SQLite 持久化缓存（描述文本跨进程重启存活）和 DashScope Q
 
 ### Known Limitations / Pending
 
-本次迭代覆盖 v1.1.0 的 M0 + M1.A + M1.B + perf 优化，以下属后续里程碑
-（Task 13-22），**未包含在本次推送中**：
+本次迭代覆盖 v1.1.0 全部里程碑（M0 + M1.A-D + M2 + M3），无遗留待办。
 
 - ~~**M1.B**（Task 12）：Qwen 预设的 setup 向导集成~~ ✓ 已完成（`de514b1`）
-- **M1.C**（Task 13-17）：`cache stats/list/clear/path` 子命令实现
-  （当前 `cli/cache.go` 仅 stub，返回 "not implemented yet"）
-- **M1.D**（Task 18-20）：跨重启缓存存活 e2e 测试 + 用户文档
-  （`test/e2e_test.go` 当前 3 处仍用 `cache.NewLRU(10)`，未覆盖
-  TwoTier 路径；`main.go` 装配逻辑无单元测试，待 e2e 覆盖）
-- **M2/M3**（Task 21-22）：RC1 + GA 发布
+- ~~**M1.C**（Task 13-17）：`cache stats/list/clear/path` 子命令实现~~ ✓ 已完成（`7da5013`）
+- ~~**M1.D**（Task 18-20）：跨重启缓存存活 e2e 测试 + 用户文档~~ ✓ 已完成（`b00e907` + `188145e` + `3c17240`）
+- ~~**M2/M3**（Task 21-22）：RC1 + GA 发布~~ ✓ 已完成（tag `v1.1.0-rc1` + `v1.1.0`，GitHub Release 6 平台产物已发布）
 
 ### 环境配置变更（本会话）
 
@@ -183,11 +210,21 @@ LRU+SQLite 持久化缓存（描述文本跨进程重启存活）和 DashScope Q
 | `cd32794` | feat(cache) | add two-tier lru+sqlite composite cache |
 | `1991fa1` | feat(config) | extend cachecfg with type dbpath and ttl |
 | `1d69b5e` | feat(main) | wire two-tier cache with lru-only fallback |
+| `20732ab` | docs | add changelog for tier2 m0+m1.a iteration |
+| `d707a2e` | perf(cache) | avoid per-put count(*) via in-memory counter |
+| `656bab4` | fix(cache) | add cas guard to prevent concurrent evict storm |
+| `de514b1` | feat(cli) | add qwen preset and unify preset output to vision_providers |
+| `41e9443` | docs | update handoff and changelog for tier2 v1.1.0-dev handover |
+| `7da5013` | feat(cli) | implement cache path/stats/list/clear subcommands |
+| `b00e907` | test(e2e) | add cache survives restart scenario |
+| `188145e` | docs | document cache and qwen options in config example |
+| `3c17240` | docs | add v1.1.0 release notes and readme updates |
 
 ---
 
-**版本状态**：v1.1.0-dev（unreleased）。当前 GA 版本仍为
-v1.0.1。
+**版本状态**：v1.1.0 GA 已发布（2026-08-17）。GitHub Release 6 平台
+archives + checksums 已就绪：
+https://github.com/ROM4n2/blind-llm-eyes/releases/tag/v1.1.0
 
 ## [1.0.1] — 2026-08-15
 
