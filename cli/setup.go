@@ -101,40 +101,55 @@ func runSetupCore(stdin io.Reader, stdout, stderr io.Writer, deps *setupDeps) in
 		upstreamAPIKey = prompt("Upstream API key: ")
 	}
 
-	// ── Step 2a: Free GLM-4V-Flash preset ──
-	// Offer the free default before asking for manual vision config. If the
-	// user accepts, we fill in the GLM-4V-Flash base URL + model and only
-	// ask for the (free) API key from https://open.bigmodel.cn.
+	// ── Step 2a: Vision provider preset (GLM/Qwen) or manual ──
+	// presetType 非空表示用户选了预设（GLM/Qwen），将写出 vision_providers+type，
+	// 走 BuildProvider -> OpenAIClient。为空表示手动，走 vision: 单块 -> MiMo Client。
+	var presetType string
 	if visionBaseURL == "" {
 		fmt.Fprintln(stdout, "")
 		fmt.Fprintln(stdout, "Vision provider options:")
-		fmt.Fprintln(stdout, "  1. GLM-4V-Flash (FREE — zero cost, get a key at https://open.bigmodel.cn)")
-		fmt.Fprintln(stdout, "  2. MiMo / other Anthropic-compatible (manual)")
-		fmt.Fprintln(stdout, "  3. OpenAI-compatible (manual)")
-		choice := prompt("Choose vision provider [1/2/3, default=1]: ")
-		if choice == "" || choice == "1" {
-			visionBaseURL = "https://open.bigmodel.cn/api/paas/v4"
-			visionModel = "glm-4v-flash"
+		fmt.Fprintln(stdout, "  1. GLM-4V-Flash (FREE — zero cost, https://open.bigmodel.cn)")
+		fmt.Fprintln(stdout, "  2. Qwen-VL (DashScope — China first, https://bailian.console.aliyun.com)")
+		fmt.Fprintln(stdout, "  3. MiMo / other Anthropic-compatible (manual)")
+		fmt.Fprintln(stdout, "  4. OpenAI-compatible (manual)")
+		choice := prompt("Choose vision provider [1/2/3/4, default=1]: ")
+		switch {
+		case choice == "" || choice == "1":
+			presetType = "glm_free"
 			fmt.Fprintln(stdout, "")
 			fmt.Fprintln(stdout, "Get a FREE API key from: https://open.bigmodel.cn")
 			fmt.Fprintln(stdout, "(Register → API Keys → create. The free tier covers GLM-4V-Flash at no cost.)")
 			visionAPIKey = prompt("GLM API key: ")
+		case choice == "2":
+			presetType = "qwen"
+			fmt.Fprintln(stdout, "")
+			fmt.Fprintln(stdout, "Get an API key at: https://bailian.console.aliyun.com")
+			fmt.Fprintln(stdout, "(Bailian Console → API-KEY → create. qwen-vl-plus is the general vision model.)")
+			visionAPIKey = prompt("DashScope API key: ")
+		case choice == "3":
+			// 手动 MiMo，落 vision: 块（presetType 保持空）
+		case choice == "4":
+			// 手动 OpenAI 兼容，落 vision: 块但需用户手改 type；setup 简化处理
 		}
 	}
 
-	if visionBaseURL == "" {
-		visionBaseURL = prompt("Vision base URL [https://api.xiaomimimo.com/anthropic]: ")
+	// 手动模式（presetType 为空）才提示 base_url/api_key/model 输入。
+	// 预设模式的 base_url/model 由 loader 默认值填，api_key 已在上方 prompt。
+	if presetType == "" {
 		if visionBaseURL == "" {
-			visionBaseURL = "https://api.xiaomimimo.com/anthropic"
+			visionBaseURL = prompt("Vision base URL [https://api.xiaomimimo.com/anthropic]: ")
+			if visionBaseURL == "" {
+				visionBaseURL = "https://api.xiaomimimo.com/anthropic"
+			}
 		}
-	}
-	if visionAPIKey == "" {
-		visionAPIKey = prompt("Vision API key: ")
-	}
-	if visionModel == "" {
-		visionModel = prompt("Vision model [mimo-v2.5]: ")
+		if visionAPIKey == "" {
+			visionAPIKey = prompt("Vision API key: ")
+		}
 		if visionModel == "" {
-			visionModel = "mimo-v2.5"
+			visionModel = prompt("Vision model [mimo-v2.5]: ")
+			if visionModel == "" {
+				visionModel = "mimo-v2.5"
+			}
 		}
 	}
 
@@ -149,6 +164,17 @@ func runSetupCore(stdin io.Reader, stdout, stderr io.Writer, deps *setupDeps) in
 			APIKey:  visionAPIKey,
 			Model:   visionModel,
 		},
+	}
+	// 预设模式：doctor 和最终配置都用 vision_providers + type（走 BuildProvider -> OpenAIClient，
+	// 修正 GLM 走 MiMo Client 打 /v1/messages 的 404）。base_url/model 由 loader 默认值填。
+	if presetType != "" {
+		cfg.VisionProviders = []config.ProviderCfg{{
+			Name:   presetType,
+			Type:   presetType,
+			APIKey: visionAPIKey,
+		}}
+		// 清空 vision: 避免两套并存
+		cfg.Vision = config.VisionCfg{}
 	}
 
 	doctorCode := 1
@@ -221,12 +247,33 @@ func generateConfigYAML(cfg *config.Config) string {
 			"base_url": cfg.Upstream.BaseURL,
 			"api_key":  cfg.Upstream.APIKey,
 		},
-		"vision": map[string]any{
+		"log_level": "info",
+	}
+	if len(cfg.VisionProviders) > 0 {
+		// 预设模式：写 vision_providers + type（base_url/model 留给 loader 默认值填）
+		ps := make([]map[string]any, 0, len(cfg.VisionProviders))
+		for _, p := range cfg.VisionProviders {
+			m := map[string]any{
+				"name":    p.Name,
+				"type":    p.Type,
+				"api_key": p.APIKey,
+			}
+			if p.BaseURL != "" {
+				m["base_url"] = p.BaseURL
+			}
+			if p.Model != "" {
+				m["model"] = p.Model
+			}
+			ps = append(ps, m)
+		}
+		out["vision_providers"] = ps
+	} else {
+		// 手动模式：写 vision: 单块
+		out["vision"] = map[string]any{
 			"base_url": cfg.Vision.BaseURL,
 			"api_key":  cfg.Vision.APIKey,
 			"model":    cfg.Vision.Model,
-		},
-		"log_level": "info",
+		}
 	}
 	b, _ := yaml.Marshal(out)
 	return string(b)

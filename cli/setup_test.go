@@ -30,7 +30,7 @@ func TestRunSetupCore_ManualInput(t *testing.T) {
 		"n",                                      // import from cc-switch? no
 		"https://api.deepseek.com/anthropic",     // upstream base_url
 		"sk-deepseek-key",                        // upstream api_key
-		"2",                                      // vision provider: manual (MiMo)
+		"3",                                      // vision provider: manual (MiMo)
 		"https://api.xiaomimimo.com/anthropic",   // vision base_url
 		"sk-mimo-key",                            // vision api_key
 		"mimo-v2.5",                              // vision model
@@ -97,7 +97,7 @@ func TestRunSetupCore_DoctorFail_SaveAnyway(t *testing.T) {
 		"n",
 		"https://api.deepseek.com/anthropic",
 		"sk-key",
-		"2", // vision provider: manual (MiMo)
+		"3", // vision provider: manual (MiMo)
 		"https://api.xiaomimimo.com/anthropic",
 		"sk-vis",
 		"mimo-v2.5",
@@ -136,7 +136,7 @@ func TestRunSetupCore_DoctorFail_DontSave(t *testing.T) {
 		"n",
 		"https://api.deepseek.com/anthropic",
 		"sk-key",
-		"2", // vision provider: manual (MiMo)
+		"3", // vision provider: manual (MiMo)
 		"https://api.xiaomimimo.com/anthropic",
 		"sk-vis",
 		"mimo-v2.5",
@@ -172,7 +172,7 @@ func TestRunSetupCore_ConnectAfterSetup(t *testing.T) {
 		"n",
 		"https://api.deepseek.com/anthropic",
 		"sk-key",
-		"2", // vision provider: manual (MiMo)
+		"3", // vision provider: manual (MiMo)
 		"https://api.xiaomimimo.com/anthropic",
 		"sk-vis",
 		"mimo-v2.5",
@@ -205,12 +205,12 @@ func TestRunSetupCore_DefaultValues(t *testing.T) {
 		},
 	}
 
-	// stdin: no cc-switch, choose manual MiMo (option 2), all defaults, no connect
+	// stdin: no cc-switch, choose manual MiMo (option 3), all defaults, no connect
 	stdin := strings.Join([]string{
 		"n",
 		"",     // upstream base_url = default
 		"sk-key",
-		"2",    // vision provider: manual (MiMo)
+		"3",    // vision provider: manual (MiMo)
 		"",     // vision base_url = default
 		"sk-vis",
 		"",     // vision model = default
@@ -249,7 +249,7 @@ func TestRunSetupCore_StartupInstructions(t *testing.T) {
 	}
 
 	stdin := strings.Join([]string{
-		"n", "", "sk-key", "2", "", "sk-vis", "", "n",
+		"n", "", "sk-key", "3", "", "sk-vis", "", "n",
 	}, "\n") + "\n"
 
 	var stdout, stderr bytes.Buffer
@@ -299,14 +299,20 @@ func TestRunSetupCore_GLMFreePreset(t *testing.T) {
 	if err := yaml.Unmarshal([]byte(configData), &cfg); err != nil {
 		t.Fatalf("parse config: %v\nconfig:\n%s", err, configData)
 	}
-	if cfg.Vision.BaseURL != "https://open.bigmodel.cn/api/paas/v4" {
-		t.Errorf("vision.base_url: want GLM endpoint, got %q", cfg.Vision.BaseURL)
+	// 预设模式：应有 1 个 vision provider，type=glm_free
+	if len(cfg.VisionProviders) != 1 {
+		t.Fatalf("expected 1 vision provider, got %d", len(cfg.VisionProviders))
 	}
-	if cfg.Vision.Model != "glm-4v-flash" {
-		t.Errorf("vision.model: want glm-4v-flash, got %q", cfg.Vision.Model)
+	p := cfg.VisionProviders[0]
+	if p.Type != "glm_free" {
+		t.Errorf("provider type: want glm_free, got %q", p.Type)
 	}
-	if cfg.Vision.APIKey != "sk-free-glm" {
-		t.Errorf("vision.api_key: want sk-free-glm, got %q", cfg.Vision.APIKey)
+	if p.APIKey != "sk-free-glm" {
+		t.Errorf("provider api_key: want sk-free-glm, got %q", p.APIKey)
+	}
+	// 预设模式应清空 vision: 块
+	if cfg.Vision.BaseURL != "" {
+		t.Errorf("vision: block should be empty in preset mode, got base_url=%q", cfg.Vision.BaseURL)
 	}
 
 	// Output should mention GLM and the free tier URL.
@@ -316,5 +322,54 @@ func TestRunSetupCore_GLMFreePreset(t *testing.T) {
 	}
 	if !strings.Contains(out, "open.bigmodel.cn") {
 		t.Errorf("stdout should mention open.bigmodel.cn:\n%s", out)
+	}
+}
+
+func TestSetup_QwenPresetWritesVisionProviders(t *testing.T) {
+	var cfgOut string
+	deps := &setupTestDeps{
+		writeConfig: func(name, data string) error { cfgOut = data; return nil },
+		connectFunc: func(proxyURL string) error { return nil },
+		doctorFunc:  func(cfg *config.Config, stdout, stderr io.Writer) int { return 0 },
+		configPath:  "config.yaml",
+	}
+	// 选 Qwen（第 2 选项）+ key + 不 connect
+	stdin := strings.NewReader("n\nhttps://up.example\nup-key\n2\nds-key\nn\n")
+	var stdout, stderr bytes.Buffer
+	code := runSetupCore(stdin, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("setup exited %d (stderr=%s)", code, stderr.String())
+	}
+	if !strings.Contains(cfgOut, "vision_providers") {
+		t.Errorf("config missing vision_providers:\n%s", cfgOut)
+	}
+	if !strings.Contains(cfgOut, "type: qwen") {
+		t.Errorf("config missing type: qwen:\n%s", cfgOut)
+	}
+	if strings.Contains(cfgOut, "vision:") {
+		t.Errorf("preset should not write vision: block:\n%s", cfgOut)
+	}
+}
+
+func TestSetup_GLMUnifiedToVisionProviders(t *testing.T) {
+	var cfgOut string
+	deps := &setupTestDeps{
+		writeConfig: func(name, data string) error { cfgOut = data; return nil },
+		connectFunc: func(proxyURL string) error { return nil },
+		doctorFunc:  func(cfg *config.Config, stdout, stderr io.Writer) int { return 0 },
+		configPath:  "config.yaml",
+	}
+	// 选 GLM（默认，直接回车）+ key + 不 connect
+	stdin := strings.NewReader("n\nhttps://up.example\nup-key\n\nglm-key\nn\n")
+	var stdout, stderr bytes.Buffer
+	code := runSetupCore(stdin, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("setup exited %d (stderr=%s)", code, stderr.String())
+	}
+	if !strings.Contains(cfgOut, "type: glm_free") {
+		t.Errorf("GLM preset should write type: glm_free:\n%s", cfgOut)
+	}
+	if strings.Contains(cfgOut, "vision:") {
+		t.Errorf("preset should not write vision: block:\n%s", cfgOut)
 	}
 }
