@@ -167,3 +167,78 @@ func TestSQLite_EvictByTTL(t *testing.T) {
 		t.Fatal("h1 should have been TTL-evicted")
 	}
 }
+
+func TestSQLite_PutUpdatesInMemoryCount(t *testing.T) {
+	s := newTestSQLite(t)
+	defer s.Close()
+	if got := s.count.Load(); got != 0 {
+		t.Fatalf("initial count = %d, want 0", got)
+	}
+	s.Put("h1", "desc1")
+	s.Put("h2", "desc2")
+	s.Put("h3", "desc3")
+	if got := s.count.Load(); got != 3 {
+		t.Fatalf("after 3 inserts count = %d, want 3", got)
+	}
+	// Update existing key: counter must not change.
+	s.Put("h1", "desc1-updated")
+	if got := s.count.Load(); got != 3 {
+		t.Fatalf("after update count = %d, want 3", got)
+	}
+	// Counter must agree with the DB row count.
+	var dbN int
+	if err := s.db.QueryRow(sqlCount).Scan(&dbN); err != nil {
+		t.Fatal(err)
+	}
+	if int64(dbN) != s.count.Load() {
+		t.Fatalf("counter %d != db rows %d", s.count.Load(), dbN)
+	}
+}
+
+func TestSQLite_EvictDecrementsCount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.db")
+	s, err := OpenSQLite(path, 5, 0, discardLogger())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer s.Close()
+	for i := 0; i < 10; i++ {
+		s.Put(fmt.Sprintf("h%d", i), "desc")
+	}
+	if got := s.count.Load(); got > 5 {
+		t.Fatalf("after evict count = %d, want <= 5", got)
+	}
+	var dbN int
+	if err := s.db.QueryRow(sqlCount).Scan(&dbN); err != nil {
+		t.Fatal(err)
+	}
+	if int64(dbN) != s.count.Load() {
+		t.Fatalf("counter %d != db rows %d after evict", s.count.Load(), dbN)
+	}
+}
+
+func TestSQLite_RebuildResetsCount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.db")
+	s, err := OpenSQLite(path, 100, 0, discardLogger())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer s.Close()
+	s.Put("h1", "desc1")
+	s.Put("h2", "desc2")
+	if got := s.count.Load(); got != 2 {
+		t.Fatalf("pre-rebuild count = %d, want 2", got)
+	}
+	if err := s.rebuildDB(path); err != nil {
+		t.Fatalf("rebuildDB: %v", err)
+	}
+	if err := s.initSchema(); err != nil {
+		t.Fatalf("initSchema: %v", err)
+	}
+	if err := s.initCount(); err != nil {
+		t.Fatalf("initCount: %v", err)
+	}
+	if got := s.count.Load(); got != 0 {
+		t.Fatalf("post-rebuild count = %d, want 0", got)
+	}
+}

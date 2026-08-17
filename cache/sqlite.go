@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, registered via database/sql
@@ -15,9 +16,10 @@ import (
 // Thread-safe: database/sql connection pool + WAL (reads don't block writes).
 type SQLite struct {
 	db         *sql.DB
-	maxEntries int          // capacity cap; <=0 means effectively unlimited
+	maxEntries int           // capacity cap; <=0 means effectively unlimited
 	ttl        time.Duration // TTL; 0 = no TTL eviction
 	log        *slog.Logger
+	count      atomic.Int64 // in-memory row counter; avoids per-Put COUNT(*)
 }
 
 const (
@@ -31,12 +33,14 @@ const (
 	sqlCreateIndex = `CREATE INDEX IF NOT EXISTS idx_cache_last_accessed ON cache(last_accessed)`
 	sqlGet         = `SELECT description FROM cache WHERE hash = ?`
 	sqlTouchAccess = `UPDATE cache SET last_accessed = ? WHERE hash = ?`
-	sqlUpsert      = `INSERT INTO cache(hash, description, size_bytes, created_at, last_accessed)
-		VALUES(?, ?, ?, ?, ?)
-		ON CONFLICT(hash) DO UPDATE SET
-			description   = excluded.description,
-			size_bytes    = excluded.size_bytes,
-			last_accessed = excluded.last_accessed`
+	// sqlInsertIgnore + sqlUpdate replace the original ON CONFLICT UPSERT so
+	// the in-memory counter can distinguish INSERT (RowsAffected=1) from
+	// UPDATE (RowsAffected=0 on the INSERT OR IGNORE step).
+	sqlInsertIgnore = `INSERT OR IGNORE INTO cache(hash, description, size_bytes, created_at, last_accessed)
+		VALUES(?, ?, ?, ?, ?)`
+	sqlUpdate = `UPDATE cache
+		SET description = ?, size_bytes = ?, created_at = ?, last_accessed = ?
+		WHERE hash = ?`
 	sqlCount    = `SELECT COUNT(*) FROM cache`
 	sqlEvictLRU = `DELETE FROM cache WHERE hash IN (
 		SELECT hash FROM cache ORDER BY last_accessed ASC LIMIT ?)`
@@ -84,6 +88,10 @@ func OpenSQLite(path string, maxEntries int, ttl time.Duration, logger *slog.Log
 		return nil, err
 	}
 	if err := s.initSchema(); err != nil {
+		s.db.Close()
+		return nil, err
+	}
+	if err := s.initCount(); err != nil {
 		s.db.Close()
 		return nil, err
 	}
@@ -151,6 +159,18 @@ func (s *SQLite) initSchema() error {
 	return nil
 }
 
+// initCount populates the in-memory row counter with a one-shot COUNT(*).
+// Called once at startup (after initSchema); subsequent Put/evict operations
+// maintain the counter via atomic adds, avoiding per-Put full table scans.
+func (s *SQLite) initCount() error {
+	var n int
+	if err := s.db.QueryRow(sqlCount).Scan(&n); err != nil {
+		return fmt.Errorf("init count: %w", err)
+	}
+	s.count.Store(int64(n))
+	return nil
+}
+
 func (s *SQLite) Close() error { return s.db.Close() }
 
 func (s *SQLite) Get(key string) (string, bool) {
@@ -172,38 +192,55 @@ func (s *SQLite) Get(key string) (string, bool) {
 
 func (s *SQLite) Put(key, value string) {
 	now := nowMillis()
-	if _, err := s.db.Exec(sqlUpsert, key, value, len(value), now, now); err != nil {
+	// INSERT OR IGNORE: RowsAffected=1 on new row, 0 on existing. This lets
+	// the in-memory counter distinguish inserts from updates without a
+	// separate COUNT(*) query on every Put.
+	res, err := s.db.Exec(sqlInsertIgnore, key, value, len(value), now, now)
+	if err != nil {
 		s.log.Warn("sqlite put", "err", err, "key", key)
+		return
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		// Key exists; update fields without touching the counter.
+		if _, err := s.db.Exec(sqlUpdate, value, len(value), now, now, key); err != nil {
+			s.log.Warn("sqlite update", "err", err, "key", key)
+			return
+		}
+	} else {
+		s.count.Add(1) // new row inserted
 	}
 	s.evictIfNeeded()
 }
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
-// evictIfNeeded enforces the SQLite-layer caps. Count-based eviction trims
-// to 90% of maxEntries when over (batch delete to amortize). TTL eviction
-// drops entries older than ttl. Both are best-effort; failures log a WARN.
+// evictIfNeeded enforces the SQLite-layer caps using the in-memory counter
+// (O(1)) instead of a per-Put COUNT(*) (O(N) full table scan). Count-based
+// eviction trims to 90% of maxEntries when over (batch delete to amortize).
+// TTL eviction drops entries older than ttl. Both are best-effort; failures
+// log a WARN. On successful DELETE the counter is decremented by the actual
+// number of rows removed (rowsAffected) to prevent drift.
 func (s *SQLite) evictIfNeeded() {
-	if s.maxEntries > 0 {
-		var n int
-		if err := s.db.QueryRow(sqlCount).Scan(&n); err != nil {
-			s.log.Warn("sqlite count", "err", err)
-			return
+	n := s.count.Load()
+	if s.maxEntries > 0 && n > int64(s.maxEntries) {
+		del := n - int64(s.maxEntries)*9/10
+		if del < 1 {
+			del = 1
 		}
-		if n > s.maxEntries {
-			del := n - s.maxEntries*9/10
-			if del < 1 {
-				del = 1
-			}
-			if _, err := s.db.Exec(sqlEvictLRU, del); err != nil {
-				s.log.Warn("sqlite evict lru", "err", err)
-			}
+		res, err := s.db.Exec(sqlEvictLRU, del)
+		if err != nil {
+			s.log.Warn("sqlite evict lru", "err", err)
+		} else if deleted, _ := res.RowsAffected(); deleted > 0 {
+			s.count.Add(-deleted)
 		}
 	}
 	if s.ttl > 0 {
 		cutoff := nowMillis() - s.ttl.Milliseconds()
-		if _, err := s.db.Exec(sqlEvictTTL, cutoff); err != nil {
+		res, err := s.db.Exec(sqlEvictTTL, cutoff)
+		if err != nil {
 			s.log.Warn("sqlite evict ttl", "err", err)
+		} else if deleted, _ := res.RowsAffected(); deleted > 0 {
+			s.count.Add(-deleted)
 		}
 	}
 }
