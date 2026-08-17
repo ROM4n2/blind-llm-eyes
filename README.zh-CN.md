@@ -24,7 +24,7 @@ DeepSeek 没有视觉能力。在 Claude Code 里用它，粘贴截图只会得�
 - **图片 → 描述替换** — 图片块原位替换为 `<BLIND_LLM_EYES_IMAGE>` 包裹的文本，并追加一条 system 指令，让模型把描述当作自己的视觉观察。
 - **嵌套 `tool_result` 图片** — 递归扫描 `tool_result` 内嵌图片（真实 Claude Code 截图多藏在此），与顶层图片同等处理，深度限制 16 防栈溢出。
 - **会话上下文感知描述** *(可选)* — 把最近 N 轮对话（`context_rounds`，默认 3 轮 / `context_max_chars` 2000 字）注入视觉模型，让描述贴合上下文（如"这个报错怎么解决"能聚焦到报错信息）。
-- **内容哈希 LRU 缓存** — 多轮对话中同一张图重复发送时，零视觉调用（命中典型的多轮重发场景）。
+- **内容哈希缓存 + 可选持久化** — 多轮对话中同一张图重复发送时，零视觉调用。默认内存 LRU；可选两层缓存（LRU + SQLite）让描述跨重启存活（`cache.type: twotier`）。
 - **`singleflight` 在途去重** — 并发请求携带同一张图时，合并为一次视觉调用。
 - **并行图片处理** — 单请求内多图通过 `errgroup` 并发描述，受 `concurrency_limit` 限制。
 - **自适应并发** *(可选)* — AIMD 风格控制器，根据真实视觉调用延迟反馈（P90 + 错误率）动态调整并发上限，保护上游免被打爆。
@@ -32,10 +32,11 @@ DeepSeek 没有视觉能力。在 Claude Code 里用它，粘贴截图只会得�
 - **WebP → PNG 转换** — 发送前自动把 WebP 图片转为 PNG。
 - **自适应超时** — 大图使用更长的超时（`large_image_timeout`）。
 - **可观测性** — 结构化 JSON 日志（异步写入）、基于 `httptrace` 的分阶段耗时、`/metrics` Prometheus 指标、贯穿全链路的 request ID、优雅关闭。
-- **可插拔视觉后端** — 任何实现 `vision.VisionProvider` 的后端都能接入；内置多 provider 池 + 三态熔断器故障转移。
+- **可插拔视觉后端** — 任何实现 `vision.VisionProvider` 的后端都能接入。内置预设：MiMo（Anthropic 格式）、OpenAI 兼容、GLM-4V-Flash（免费档）、Qwen-VL（DashScope）。
+- **多 provider 池 + 熔断器** — `vision_providers` 按 priority 升序定义 provider 列表，失败自动故障转移，每个 provider 配备独立三态熔断器。
 - **单一静态二进制** — 无运行时依赖，约 10 MB，无需 Go 编译器。
 - **模型名净化** — 转发上游前自动剥离厂商上下文长度后缀（`deepseek-chat[1m]` → `deepseek-chat`）；请求路径与 cc-switch 导入双重保险。
-- **CLI 生命周期** — 8 个子命令覆盖全生命周期：`setup`（交互配置 + doctor）、`doctor`（连通性自检）、`connect`/`disconnect`（Claude Code settings.json 接线）、`start`、`status`、`stop`、`version`。
+- **CLI 生命周期** — 9 个子命令覆盖全生命周期：`setup`（交互配置 + doctor）、`doctor`（连通性自检）、`connect`/`disconnect`（Claude Code settings.json 接线）、`start`、`status`、`stop`、`version`、`cache`（持久缓存查看/清理）。
 - **cc-switch 一键导入** — 直接从 cc-switch SQLite 数据库读取 provider（尽力而为：DB 被锁时回退临时拷贝，任何错误回退手动输入）。
 - **安全的 settings 管理** — `connect` 改写 Claude Code 的 `settings.json` 时先整文件备份且只备份一次（重复 `connect` 永不覆盖备份）；`disconnect` 经原子写从备份逐字节还原。
 
@@ -193,6 +194,19 @@ blind-llm-eyes status
 | 图片被截断 / 视觉 hash 不匹配 | 用了 CC Switch **代理模式**（而非 base_url 覆盖）。它会在转发前静默截断 >200 字节的请求体。 | 直接设 `ANTHROPIC_BASE_URL=http://127.0.0.1:8790`。别在 cc-switch 开代理模式。`blind-llm-eyes connect` 写的就是这个设置。 |
 | `go install github.com/ROM4n2/blind-llm-eyes@latest` 报 "invalid version: unknown revision" | `@latest` 需要远端仓库至少有一个已发布的 semver tag。`v1.0.0` tag 本地存在但还没推。 | 从 releases 页下载预编译压缩包，或从 checkout 构建：`go build -ldflags "-X github.com/ROM4n2/blind-llm-eyes/buildinfo.Version=1.0.0" .` |
 
+### 缓存管理
+
+启用 `cache.type: twotier` 后，SQLite 冷层跨重启存活。四个 `cache` 子命令用于查看和管理：
+
+```powershell
+blind-llm-eyes cache path                  # 显示缓存类型、db 路径、文件是否存在
+blind-llm-eyes cache stats                 # 条目数、总字节数、最早/最晚访问、db 文件大小
+blind-llm-eyes cache list -limit 50        # 列出条目（哈希前缀 + 描述预览）
+blind-llm-eyes cache clear -yes            # 删除所有条目（-yes 跳过确认）
+```
+
+每个子命令支持 `-config <路径>`（默认 `config.yaml`）。`stats` / `list` / `clear` 在 `cache.type` 为 `lru` 时退出码 1（无持久存储）。CLI 打开 SQLite 时设置 `busy_timeout=5000`，代理运行中也能查看/清理缓存。
+
 ### 安全考虑
 
 - **Admin token** — 每次 `start` 从 `crypto/rand` 新生成，写入 `<UserConfigDir>/blind-llm-eyes/pidfile.json`，`stop` 时删除。绝不持久化到别处（无环境变量、无配置键）。
@@ -218,7 +232,11 @@ blind-llm-eyes status
 | `vision.supported_formats` | png/jpeg/webp/gif | 允许的媒体类型 |
 | `vision.context_rounds` | `3` | 上下文感知描述：最近 N 轮对话；`0`/`-1` 禁用 |
 | `vision.context_max_chars` | `2000` | 上下文最大字符数（约 500 tokens） |
-| `cache.max_entries` | `500` | 内存 LRU 容量 |
+| `cache.type` | `lru` | `lru`（纯内存）或 `twotier`（LRU + SQLite，描述跨重启存活） |
+| `cache.max_entries` | `500` | LRU 热层容量（`type=lru` 时为总容量） |
+| `cache.db_path` | `./cache.db` | SQLite 冷层路径（仅 `type=twotier` 生效） |
+| `cache.sqlite_max_entries` | `10000` | SQLite 冷层容量上限 |
+| `cache.sqlite_ttl` | `0`（不限） | 冷层条目 TTL，如 `720h` 表示 30 天 |
 | `concurrency_limit` | `6` | 单请求内最大并行视觉调用数；也是 adaptive 的初始值 |
 | `adaptive_concurrency.*` | 关闭 | AIMD 控制器（见下） |
 | `fail_open` | `true` | 视觉失败 → 占位文字而非 502 |
@@ -239,12 +257,12 @@ blind-llm-eyes status
 ```text
 config      YAML + env 加载、默认值
 messages    Anthropic Messages 解析、校验、图片→文本改写、上下文提取
-cache       内容哈希（sha256）key + 线程安全 LRU
-vision      VisionProvider 接口 + MiMo Anthropic 客户端 / OpenAI 兼容客户端 + 多 provider 池 + 熔断器
+cache       内容哈希（sha256）key + 线程安全 LRU + 可选 SQLite 冷层（TwoTier）
+vision      VisionProvider 接口 + MiMo / OpenAI 兼容 / GLM 免费档 / Qwen-VL 预设 + 多 provider 池 + 熔断器
 proxy       请求管线：解析 → 找图 → 缓存 → 描述 → 替换 → 转发
 logging     结构化 JSON 日志、异步写入、request ID
 metrics     Prometheus registry
-cli         子命令：setup / doctor / connect / disconnect / status / stop / version
+cli         子命令：setup / doctor / connect / disconnect / status / stop / version / cache
 admin       /admin/shutdown 优雅关闭端点（token 鉴权）
 modelutil   模型名净化（[1m] 剥离）
 buildinfo   构建版本（ldflags 注入）
@@ -268,8 +286,8 @@ buildinfo   构建版本（ldflags 注入）
 ## 已知限制
 
 - **仅 Anthropic Messages 格式**（不支持 OpenAI Chat Completions 输入）。
-- **纯内存缓存** — 重启后描述丢失（个人自用可接受）。
 - **`/metrics`、`/healthz` 无客户端鉴权** — 建议仅本地暴露。
+- **默认纯内存缓存** — 重启后描述丢失。可选 `cache.type: twotier` 启用 SQLite 持久化。
 
 ## 开发
 

@@ -24,7 +24,7 @@ DeepSeek has no vision. Using it from Claude Code means pasting a screenshot get
 - **Image → description replacement** — image blocks are replaced in place with `<BLIND_LLM_EYES_IMAGE>`-wrapped text, and a system instruction tells the model to treat the description as its own observation.
 - **Nested `tool_result` images** — recursively finds images nested inside `tool_result` blocks (where real Claude Code screenshots usually live) and describes them like top-level ones (recursion depth capped at 16 to prevent stack overflow).
 - **Conversation-context-aware descriptions** *(optional)* — feeds the last N turns of conversation (`context_rounds`, default 3 rounds / `context_max_chars` 2000 chars) to the vision model so descriptions match intent (e.g. "how do I fix this error?" focuses on the error text).
-- **Content-hash LRU cache** — the same image re-sent across turns triggers zero vision calls (the typical multi-turn resend case).
+- **Content-hash cache with optional persistence** — the same image re-sent across turns triggers zero vision calls. Default is in-memory LRU; opt-in two-tier (LRU + SQLite) keeps descriptions across restarts (`cache.type: twotier`).
 - **`singleflight` in-flight dedup** — concurrent requests carrying the same image share a single vision call.
 - **Parallel image processing** — images in one request are described concurrently via `errgroup`, bounded by `concurrency_limit`.
 - **Adaptive concurrency** *(optional)* — AIMD-style controller that raises/lowers the concurrency limit from real vision latency feedback (P90 + error rate), protecting against slow upstreams.
@@ -32,10 +32,11 @@ DeepSeek has no vision. Using it from Claude Code means pasting a screenshot get
 - **WebP → PNG conversion** — automatically converts WebP images before sending them to the vision model.
 - **Adaptive timeouts** — large images get a longer timeout (`large_image_timeout`).
 - **Observability** — structured JSON logs (async writer), per-stage timing via `httptrace`, Prometheus metrics at `/metrics`, request IDs threaded through the whole pipeline, graceful shutdown.
-- **Pluggable vision backends** — anything implementing `vision.VisionProvider` works.
+- **Pluggable vision backends** — anything implementing `vision.VisionProvider` works. Built-in presets: MiMo (Anthropic format), OpenAI-compatible, GLM-4V-Flash (free tier), Qwen-VL (DashScope).
+- **Multi-provider pool with circuit breakers** — `vision_providers` defines a priority-ordered list; failed providers trip a circuit breaker and traffic fails over automatically.
 - **Single static binary** — no runtime dependencies, ~10 MB.
 - **Model name sanitization** — automatically strips vendor context-length suffixes before forwarding to upstream (`deepseek-chat[1m]` → `deepseek-chat`); applied both on the request path and during cc-switch import (double-safe).
-- **CLI lifecycle** — 8 subcommands cover the full lifecycle: `setup` (interactive config + doctor), `doctor` (connectivity self-check), `connect`/`disconnect` (Claude Code settings.json wiring), `start`, `status`, `stop`, `version`.
+- **CLI lifecycle** — 9 subcommands cover the full lifecycle: `setup` (interactive config + doctor), `doctor` (connectivity self-check), `connect`/`disconnect` (Claude Code settings.json wiring), `start`, `status`, `stop`, `version`, `cache` (inspect/clear the persistent cache).
 - **cc-switch one-click import** — reads providers directly from the cc-switch SQLite database (best-effort: falls back to temp-copy on DB lock, falls back to manual input on any error).
 - **Safe settings management** — `connect` rewrites Claude Code's `settings.json` with a full-file backup taken exactly once (repeat `connect` never overwrites the backup); `disconnect` restores byte-for-byte from the backup via atomic writes.
 
@@ -193,6 +194,19 @@ Common gotchas:
 | Images get truncated / vision hash mismatch errors | Using CC Switch **proxy mode** (not base_url override). It silently truncates request bodies > ~200 bytes before forwarding. | Set `ANTHROPIC_BASE_URL=http://127.0.0.1:8790` directly. Don't enable proxy mode in cc-switch. `blind-llm-eyes connect` writes exactly this setting. |
 | `go install github.com/ROM4n2/blind-llm-eyes@latest` errors with "invalid version: unknown revision" | `@latest` requires at least one published semver tag on the remote repo. Tag `v1.0.0` exists locally but hasn't been pushed yet. | Download a prebuilt archive from the releases page, or build from a checkout: `go build -ldflags "-X github.com/ROM4n2/blind-llm-eyes/buildinfo.Version=1.0.0" .` |
 
+### Cache management
+
+When `cache.type: twotier` is enabled, the SQLite cold layer persists across restarts. Four `cache` subcommands inspect and manage it:
+
+```powershell
+blind-llm-eyes cache path                  # show cache type, db path, file existence
+blind-llm-eyes cache stats                 # entries, total bytes, oldest/newest access, db size
+blind-llm-eyes cache list -limit 50        # list entries (hash prefix + description preview)
+blind-llm-eyes cache clear -yes            # delete all entries (-yes skips confirmation)
+```
+
+Each subcommand accepts `-config <path>` (default `config.yaml`). `stats` / `list` / `clear` exit 1 if `cache.type` is `lru` (no persistent store). The CLI opens the SQLite db with `busy_timeout=5000` so it can inspect/clear the cache even while the proxy is running.
+
 ### Security considerations
 
 - **Admin token** — generated fresh from `crypto/rand` on every `start`, written to the pidfile at `<UserConfigDir>/blind-llm-eyes/pidfile.json`, and deleted by `stop`. It's never persisted elsewhere (no env var, no config key).
@@ -218,7 +232,11 @@ Common gotchas:
 | `vision.supported_formats` | png/jpeg/webp/gif | Allowed media types |
 | `vision.context_rounds` | `3` | Context-aware descriptions: last N turns; `0`/`-1` disables |
 | `vision.context_max_chars` | `2000` | Max context chars (~500 tokens) |
-| `cache.max_entries` | `500` | In-memory LRU capacity |
+| `cache.type` | `lru` | `lru` (in-memory) or `twotier` (LRU + SQLite, descriptions survive restart) |
+| `cache.max_entries` | `500` | LRU hot-layer capacity (total capacity when `type=lru`) |
+| `cache.db_path` | `./cache.db` | SQLite cold-layer path (only when `type=twotier`) |
+| `cache.sqlite_max_entries` | `10000` | SQLite cold-layer capacity cap |
+| `cache.sqlite_ttl` | `0` (unlimited) | Cold-layer entry TTL, e.g. `720h` for 30 days |
 | `concurrency_limit` | `4` | Max parallel vision calls per request; also the adaptive initial value |
 | `adaptive_concurrency.*` | disabled | AIMD controller (see below) |
 | `fail_open` | `false` | Vision failure → placeholder instead of 502 |
@@ -239,12 +257,12 @@ Disabled by default; when disabled, behavior is identical to a static `concurren
 ```text
 config      YAML + env loading, defaults
 messages    Anthropic Messages parsing, validation, image→text rewriting, context extraction
-cache       content-hash (sha256) key + thread-safe LRU
-vision      VisionProvider interface + MiMo Anthropic-format / OpenAI-compatible clients + provider pool + circuit breaker
+cache       content-hash (sha256) key + thread-safe LRU + optional SQLite cold layer (TwoTier)
+vision      VisionProvider interface + MiMo / OpenAI-compatible / GLM-free / Qwen-VL presets + provider pool + circuit breaker
 proxy       request pipeline: parse → find images → cache → describe → replace → forward
 logging     structured JSON logs, async writer, request IDs
 metrics     Prometheus registry
-cli         subcommands: setup / doctor / connect / disconnect / status / stop / version
+cli         subcommands: setup / doctor / connect / disconnect / status / stop / version / cache
 admin       /admin/shutdown graceful-shutdown endpoint (token-authed)
 modelutil   model-name sanitization ([1m] stripping)
 buildinfo   build version (ldflags injection)
@@ -269,8 +287,8 @@ The core concurrency follows Go's practical model rather than the slogan: channe
 ## Limitations
 
 - **Anthropic Messages format only** (no OpenAI Chat Completions input).
-- **In-memory cache** — descriptions are lost on restart (acceptable for a personal proxy).
 - No client auth on `/metrics` or `/healthz` — expose only locally.
+- In-memory cache by default — descriptions are lost on restart. Opt in to `cache.type: twotier` for SQLite-backed persistence.
 
 ## Development
 
