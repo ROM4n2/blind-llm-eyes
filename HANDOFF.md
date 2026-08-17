@@ -1,7 +1,10 @@
 # 交接文档 — blind-llm-eyes 视觉代理
 
-> **最近更新**：2026-08-13（产品化 v1.0.0 发布：11 项 TDD 任务全部完成 + Release Notes + 合并 master + tag v1.0.0）
-> **状态**：MVP → P1 → P2 → P3 → P5 → **产品化 v1.0.0 全部完成**。产品化内容：buildinfo + CLI 子命令 + admin/pidfile + vision/upstream Ping + `[1m]` 模型剥离 + connect/disconnect settings.json 接线 + cc-switch SQLite 导入 + 交互式 setup 向导 + goreleaser/Makefile/发布 workflow + E2E 集成测试（含 FailOpen/FailClosed 网络超时场景）5 用例。`go test -race ./...` 全 13 包全绿；`goreleaser build --snapshot` 6 平台二进制全成功；master 已合并，tag `v1.0.0` 本地就位。详见 [RELEASE_NOTES-v1.0.0.md](./RELEASE_NOTES-v1.0.0.md)
+> **最近更新**：2026-08-17（Tier 2 v1.1.0-dev 迭代 M0+M1.A+M1.B+perf 优化完成，已推送远程；M1.C/D/M2/M3 待办）
+> **当前版本**：v1.1.0-dev（unreleased）。GA 版本仍为 [v1.0.1](./RELEASE_NOTES-v1.0.1.md)
+> **状态**：
+> - **v1.0.0 GA**（2026-08-13）：MVP → P1 → P2 → P3 → P5 → 产品化 11 项 TDD 任务全部完成。`go test -race ./...` 全 13 包全绿；`goreleaser build --snapshot` 6 平台二进制全成功；master 已合并，tag `v1.0.0` 本地就位。详见 [RELEASE_NOTES-v1.0.0.md](./RELEASE_NOTES-v1.0.0.md)
+> - **Tier 2 v1.1.0-dev**（2026-08-15 ~ 2026-08-16）：M0 接口锁定 + M1.A SQLite 缓存 + M1.B Qwen setup + 两个 perf 优化补丁共 15 个 commit 已推送 `origin/master`。完整变更摘要见 [CHANGELOG.md](./CHANGELOG.md)，任务清单见 [plan](./docs/superpowers/plans/2026-08-14-tier2-sqlite-cache-qwen.md)。**M1.C/D/M2/M3（Task 13-22）待办**，详见下方第 0.5 节
 
 ---
 
@@ -266,6 +269,121 @@
 | P4 | 加权负载均衡 | 当前仅 priority failover，可扩展为 weighted round-robin |
 | P4 | README 中文翻译 | `README.zh-CN.md` 未创建（Glob 验证缺失） |
 | P4 | daemon / systemd 模式 | 当前仅前台 serve，后台 daemon 化留给 P4 |
+
+---
+
+## 0.5 Tier 2 (v1.1.0-dev) 迭代总结
+
+> **迭代范围**：2026-08-14（设计）~ 2026-08-16（perf 优化补丁），共 15 个 commit
+> （`0758431..de514b1`），对应
+> [spec](./docs/superpowers/specs/2026-08-14-tier2-sqlite-cache-qwen-design.md) 与
+> [plan](./docs/superpowers/plans/2026-08-14-tier2-sqlite-cache-qwen.md) 的 Task 1-12
+> （M0 接口锁定 + M1.A SQLite 缓存 + M1.B Qwen setup）+ 两个
+> [perf 优化补丁](./docs/superpowers/plans/2026-08-16-sqlite-inmemory-counter.md)
+> （内存计数器 + CAS 防并发 evict 风暴）。
+>
+> **完整变更摘要**见 [CHANGELOG.md](./CHANGELOG.md)。以下仅列接手者必须了解的要点。
+
+### 已完成里程碑
+
+| 里程碑 | Task | Commit | 要点 |
+|---|---|---|---|
+| **M0** 接口锁定 | 1-3 | `e239a96` `245487e` `eb1197d` | `cache.Cache` 接口解耦 handler；`qwen` provider 类型 stub；`cache` CLI 子命令 stub |
+| **M1.A** SQLite 缓存 | 4-11 | `5d193c7` `8dc4afd` `4a9e9ff` `b993018` `cd32794` `1991fa1` `1d69b5e` | SQLite 冷层（WAL + UPSERT + LRU/TTL 双淘汰 + 损坏自愈）；TwoTier 复合层；CacheCfg 扩展；main.go 装配 + LRU-only 降级 |
+| **M1.B** Qwen setup | 12 | `de514b1` | setup 向导 Qwen 选项（1=GLM / 2=Qwen / 3=MiMo 手动 / 4=OpenAI 手动）；GLM/Qwen 预设统一输出 `vision_providers + type`；修正 GLM 走 MiMo Client 打 `/v1/messages` 404 的 bug |
+| **perf 优化** | — | `d707a2e` `656bab4` | `atomic.Int64` 内存计数器消除每次 Put 的全表 COUNT（10k 库 ~1ms→0）；`evicting atomic.Bool` CAS 防护并发 evict 风暴（50-goroutine + barrier + `-race -count=10` 0 失败） |
+
+### 关键设计决策
+
+| 决策 | 选择 | 理由 |
+|---|---|---|
+| 缓存接口 | `cache.Cache` 接口（`Get` / `Put`） | 解耦 handler 与具体实现，支持 LRU/TwoTier 无缝切换，编译期断言保证实现一致性 |
+| 持久化驱动 | `modernc.org/sqlite`（纯 Go） | 保持 `CGO_ENABLED=0`，goreleaser 三平台交叉编译不破坏 |
+| SQLite 并发 | WAL 模式 + `synchronous=NORMAL` | 读写并发安全；单写者串行化保证关键不变式 |
+| 损坏恢复 | `PRAGMA integrity_check` + `applyPragmas` 双触发 → 删除 db/-wal/-shm 重建空库 | 冷启动丢失描述但不阻塞服务（best-effort） |
+| 装配降级 | `type=twotier` SQLite 打开失败 → 降级 LRU-only + WARN 日志 | 保证服务可用性，冷层失败不阻塞主流程 |
+| 缓存计数 | `atomic.Int64` 内存计数器 + `INSERT OR IGNORE` 区分新增/更新 | 消除 O(N) 全表 COUNT；SQLite 单写者 + WAL 原子性保证 count 最终一致 |
+| evict 防风暴 | `atomic.Bool` CAS 闸门 | 突发并发场景只允许一个 goroutine 执行 DELETE，用短暂超量换避免风暴 |
+
+### 配置扩展（`config/loader.go`）
+
+`CacheCfg` 新增字段，默认值保留 v1.0.1 行为（`Type=lru`）：
+
+```yaml
+cache:
+  type: lru              # "lru"（默认，向后兼容）| "twotier"（opt-in 持久化）
+  max_entries: 500       # LRU 热层容量
+  db_path: ""            # SQLite 路径，空 = os.UserConfigDir()/blind-llm-eyes/cache.db
+  sqlite_max_entries: 10000  # SQLite 容量阈值，<=0 回退 10000
+  sqlite_ttl: ""         # SQLite TTL（如 "168h"），格式错误会被拒绝
+```
+
+### Qwen-VL 预设配置（vision/provider.go）
+
+`qwen` provider 类型对接 DashScope（阿里云百炼）OpenAI 兼容接口，自动填充：
+
+```yaml
+vision_providers:
+  - name: qwen
+    type: qwen            # 自动填 base_url + model
+    api_key: sk-...      # 用户只需配置 api_key
+```
+
+自动填充值：`base_url=https://dashscope.aliyuncs.com/compatible-mode/v1`，`model=qwen-vl-plus`。复用 `*OpenAIClient`（与 `glm_free` 同路径）。
+
+### 测试覆盖
+
+| 变更文件 | 测试文件 | 覆盖范围 |
+|---|---|---|
+| `cache/sqlite.go` | `cache/sqlite_test.go` | Open / idempotent reopen / corruption recovery / Get-Put / eviction by count / eviction by TTL / 内存计数器 Put/evict/rebuild / **CAS 防风暴 50-goroutine** |
+| `cache/twotier.go` | `cache/twotier_test.go` | Get 回填 / Put 双写 / 50-goroutine 防惊群 |
+| `config/loader.go` | `config/loader_test.go` | 默认值 / twotier 解析 / bad-type 拒绝 |
+| `vision/provider.go` | `vision/provider_test.go` | Qwen auto-fill / 用户 override 优先 / 空 api_key 报错 |
+| `cli/cache.go` + `cli/cli.go` | `cli/cli_test.go` | `TestRun_Routing` 覆盖 cache no-args / unknown / stats stub |
+| `cli/setup.go` | `cli/setup_test.go` | 手动 MiMo / doctor 失败保存/取消 / connect / 默认值 / GLM 预设 vision_providers / Qwen 预设 / GLM 统一输出 |
+
+- `go vet ./...` 通过
+- `go build ./...` 通过
+- `go test -race -count=1 ./...` 全部 PASS（13 个包，race-clean）
+
+### 环境配置变更（本会话）
+
+- **origin URL 改为 SSH**：`git@github.com:ROM4n2/blind-llm-eyes.git`
+  （原 HTTPS 在本网络环境 21s 超时，SSH 端口 22 畅通）
+- **永久环境变量**（User 级）：`GIT_SSH=C:\WINDOWS\System32\OpenSSH\ssh.exe` + `HOME=C:\Users\Haoyu`
+  （让 git 用 Windows OpenSSH 而非 msys2 ssh，找到 ssh-agent 的 ED25519 key）
+
+### Commit List
+
+| Commit | Type | Summary |
+|---|---|---|
+| `0758431` | docs | add tier2 sqlite cache and qwen-vl preset design |
+| `941e426` | docs | add tier2 implementation plan |
+| `e239a96` | refactor(cache) | introduce Cache interface to decouple handler |
+| `245487e` | feat(vision) | add qwen provider type for DashScope Qwen-VL |
+| `eb1197d` | feat(cli) | add cache subcommand stub and usage |
+| `5d193c7` | feat(cache) | add sqlite open with schema and wal pragmas |
+| `8dc4afd` | feat(cache) | add sqlite get/put with upsert and last_accessed |
+| `4a9e9ff` | feat(cache) | add sqlite lru and ttl eviction |
+| `b993018` | feat(cache) | add sqlite integrity check and corruption recovery |
+| `cd32794` | feat(cache) | add two-tier lru+sqlite composite cache |
+| `1991fa1` | feat(config) | extend cachecfg with type dbpath and ttl |
+| `1d69b5e` | feat(main) | wire two-tier cache with lru-only fallback |
+| `de514b1` | feat(cli) | add qwen preset and unify preset output to vision_providers |
+| `d707a2e` | perf(cache) | avoid per-put count(*) via in-memory counter |
+| `656bab4` | fix(cache) | add cas guard to prevent concurrent evict storm |
+| `20732ab` | docs | add changelog for tier2 m0+m1.a iteration |
+
+### 下一步建议（按优先级）
+
+| 优先级 | 任务 | 说明 |
+|---|---|---|
+| 🔴 M1.C | `cache stats/list/clear/path` 子命令实现 | Task 13-17。当前 `cli/cache.go` 仍是 stub（返回 "not implemented yet"），需要实现与 SQLite/LRU 缓存交互的统计、列出、清除、显示路径功能。Task 17 完成后删 `runCache` 的 stub 分支 |
+| 🔴 M1.D | 跨重启缓存存活 e2e 测试 + 用户文档 | Task 18-20。`test/e2e_test.go` 当前 3 处仍用 `cache.NewLRU(10)`，未覆盖 TwoTier 路径；`main.go` 装配逻辑无单元测试，待 e2e 覆盖；`config.example.yaml` 需文档化 cache 块；README / RELEASE_NOTES 需提及新功能 |
+| 🔴 M2 | RC1 | Task 21。tag RC1 + 本地构建验证（`goreleaser build --snapshot` 6 平台） |
+| 🔴 M3 | GA | Task 22。tag v1.1.0 + 发布（推送 `v1.1.0` tag 触发 release workflow） |
+| ⚠️ v1.0.0 BUG | setup/cc-switch 导入可产出自循环上游 | 见下方第 9 节：cc-switch 里"已手动接到代理"的 provider 被当上游导入 → `upstream.base_url`=代理自身 → 无限自循环。**未修复**，M1.C/D 阶段建议顺手解决 |
+| ⚠️ v1.0.0 BUG | handler 无自转发防御 | 见下方第 9 节：任何 config 让 `upstream.base_url == 自身监听地址` 都无限循环，需 fail fast + doctor 检测。**未修复**，M1.C/D 阶段建议顺手解决 |
 
 ---
 
@@ -721,6 +839,24 @@ ad70a9f refactor(vision): extract provider builders from main.go
 | P4 | README 中文翻译 | `README.zh-CN.md` 未创建 |
 | P4 | daemon / systemd 模式 | 当前仅前台 serve，后台 daemon 化留给 P4 |
 
+### v1.1.0-dev（Tier 2）后续方向
+
+> **完整任务详情**见 [plan](./docs/superpowers/plans/2026-08-14-tier2-sqlite-cache-qwen.md) Task 13-22。
+> **变更摘要**见 [CHANGELOG.md](./CHANGELOG.md)。
+
+| 优先级 | Task | 说明 | 状态 |
+|---|---|---|---|
+| ✅ 完成 | ~~M0 接口锁定（Task 1-3）~~ | `cache.Cache` 接口 + `qwen` provider stub + `cache` CLI stub | `e239a96` `245487e` `eb1197d` |
+| ✅ 完成 | ~~M1.A SQLite 缓存（Task 4-11）~~ | SQLite 冷层 + TwoTier + CacheCfg 扩展 + main.go 装配降级 | `5d193c7`…`1d69b5e` |
+| ✅ 完成 | ~~M1.B Qwen setup（Task 12）~~ | setup 向导 Qwen 选项 + 预设统一输出 `vision_providers` + GLM 404 修正 | `de514b1` |
+| ✅ 完成 | ~~perf：内存计数器~~ | `atomic.Int64` 消除每次 Put 的全表 COUNT | `d707a2e` |
+| ✅ 完成 | ~~perf：CAS 防风暴~~ | `atomic.Bool` 防护并发 evict 风暴，50-goroutine `-race -count=10` 0 失败 | `656bab4` |
+| 🔴 **M1.C** | **Task 13-17：cache CLI 子命令实现** | 当前 `cli/cache.go` 仅 stub，返回 "not implemented yet"。需实现 `path`（最简）/ `stats` / `list` / `clear`，再删 `runCache` 的 stub 分支 | 待办 |
+| 🔴 **M1.D** | **Task 18-20：E2E + 用户文档** | `test/e2e_test.go` 3 处仍用 `cache.NewLRU(10)`，未覆盖 TwoTier 路径；`main.go` 装配逻辑无单测（Go 惯例由 e2e 覆盖）；`config.example.yaml` 需文档化 cache 块；README / RELEASE_NOTES 提及新功能 | 待办 |
+| 🔴 **M2** | **Task 21：RC1** | tag `v1.1.0-rc1` + `goreleaser build --snapshot` 6 平台构建验证 | 待办 |
+| 🔴 **M3** | **Task 22：GA** | tag `v1.1.0` + 推送触发 release workflow | 待办 |
+| ⚠️ 顺手 | v1.0.0 自循环 BUG | 见上方表格"setup/cc-switch 导入可产出自循环上游" + "handler 无自转发防御"。M1.C/D 阶段建议顺手解决 | 待办 |
+
 ---
 
 ## 12. P5 上下文感知图片描述（已实现）
@@ -897,9 +1033,14 @@ vision:
 
 | 文件 | 内容 |
 |------|------|
+| [CHANGELOG.md](./CHANGELOG.md) | **变更日志**：v1.0.1 + v1.1.0-dev（Tier 2 M0+M1.A+M1.B+perf 优化）完整变更摘要、Commit 列表、测试覆盖表、已知限制 |
 | [RELEASE_NOTES-v1.0.0.md](./RELEASE_NOTES-v1.0.0.md) | **v1.0.0 发布说明**：7 大新功能 / 改进 / 5 E2E 用例表格 / 发布基础设施 / 升级指引 / 12 提交完整列表 / 已知限制 / 验证总结 |
+| [RELEASE_NOTES-v1.0.1.md](./RELEASE_NOTES-v1.0.1.md) | **v1.0.1 GA 发布说明**（当前 GA 版本） |
 | [CONCURRENCY_DESIGN.md](./CONCURRENCY_DESIGN.md) | errgroup 并发优化 + concurrency_limit 设计文档 |
 | [docs/superpowers/specs/2026-08-12-multi-vision-provider-pool-design.md](./docs/superpowers/specs/2026-08-12-multi-vision-provider-pool-design.md) | P3 多 Provider 池设计规格文档 |
+| [docs/superpowers/specs/2026-08-14-tier2-sqlite-cache-qwen-design.md](./docs/superpowers/specs/2026-08-14-tier2-sqlite-cache-qwen-design.md) | **Tier 2 设计规格**：两层 LRU+SQLite 缓存 + Qwen-VL 预设架构，383 行 |
+| [docs/superpowers/plans/2026-08-14-tier2-sqlite-cache-qwen.md](./docs/superpowers/plans/2026-08-14-tier2-sqlite-cache-qwen.md) | **Tier 2 实施计划**：22 个 TDD 任务（M0+M1.A/B/C/D+M2/M3），1947 行；当前已完成 Task 1-12 + perf 补丁，Task 13-22 待办 |
+| [docs/superpowers/plans/2026-08-16-sqlite-inmemory-counter.md](./docs/superpowers/plans/2026-08-16-sqlite-inmemory-counter.md) | **perf 优化任务**：内存计数器消除每次 Put 的 COUNT(*) + CAS 防并发 evict 风暴补丁 |
 | [vision-fallback-architecture.md](./vision-fallback-architecture.md) | 原始架构设计 v1 |
 | [vision-fallback-notes.md](./vision-fallback-notes.md) | 决策时间线 + 调研记录 |
 | [SMOKE_TEST_REPORT.md](./SMOKE_TEST_REPORT.md) | 生产冒烟测试报告（20 样本延迟数据 + AIMD 决策） |
