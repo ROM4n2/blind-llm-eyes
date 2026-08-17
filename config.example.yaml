@@ -12,7 +12,14 @@ vision:
   context_rounds: 3                                # 最近 N 轮对话传给 vision provider。0/不写 → 默认 3；写 -1 → 显式禁用
   context_max_chars: 2000                          # 上下文最大字符数（约 500 tokens），超出时整轮次截断早期对话，保留最新
 cache:
-  max_entries: 500                                  # 纯内存 LRU 容量
+  # ── 缓存类型（v1.1.0 新增） ──
+  # type: lru            # 默认；纯内存 LRU，重启后描述丢失，零外部依赖
+  # type: twotier         # 两层缓存：内存 LRU 热层 + SQLite 冷层，描述跨重启存活
+  # 不配置 type 或留空 → 默认 lru（向后兼容 v1.0.x）
+  max_entries: 500                                  # LRU 热层容量（type=lru 时为总容量）
+  # db_path: ./cache.db             # SQLite 冷层路径（仅 type=twotier 生效）；空→./cache.db
+  # sqlite_max_entries: 10000       # SQLite 冷层容量上限；<=0→10000
+  # sqlite_ttl: "720h"              # SQLite 冷层条目 TTL；空=不限（建议 30 天 = 720h）
 concurrency_limit: 6                                # 单请求内并发 vision 调用上限（errgroup.SetLimit），覆盖典型 2-6 图场景；也作为 adaptive 的初始值
 # 自适应并发控制（默认关闭）。开启后会根据 MiMo 实际响应时间在 [min_limit, max_limit]
 # 区间内动态调整 concurrency_limit。关闭时完全使用上面的静态 concurrency_limit 值。
@@ -103,5 +110,22 @@ log_level: "info"                                   # debug / info / warn / erro
 #     supported_formats: ["image/png", "image/jpeg", "image/webp"]
 #     circuit_breaker:
 #       failure_threshold: 3
+#       reset_timeout: "30s"
+#
+#   - name: "qwen"                              # DashScope Qwen-VL（v1.1.0 新增预设）
+#     type: "qwen"                              # OpenAI 兼容，自动填 base_url/model
+#     priority: 4                               # 建议作为兜底 provider
+#     api_key: "sk-qwen-placeholder"            # 从 https://dashscope.aliyun.com 获取
+#     # base_url 和 model 可省略，qwen 会自动填充为：
+#     #   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+#     #   model: "qwen-vl-plus"
+#     # model: "qwen-vl-max"                    # 可覆盖为更强模型
+#     timeout: "60s"
+#     large_image_timeout: "120s"
+#     large_image_threshold: 1000000
+#     description_cap: 1000
+#     supported_formats: ["image/png", "image/jpeg", "image/webp", "image/gif"]
+#     circuit_breaker:
+#       failure_threshold: 5
 #       reset_timeout: "30s"
 # ────────────────────────────────────────────────────────────────────────────
