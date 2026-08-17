@@ -570,3 +570,132 @@ func TestE2E_VisionTimeout_FailClosed(t *testing.T) {
 		t.Errorf("response body missing failure detail: %q", body)
 	}
 }
+
+// TestE2E_CacheSurvivesRestart verifies the core Tier 2 promise: an image
+// description written to the SQLite cold layer by one handler instance is
+// still readable by a fresh handler instance pointing at the same db file.
+//
+// This simulates a proxy restart (process crash + relaunch, or stop + start):
+// the in-memory LRU hot layer is lost, but the SQLite cold layer persists on
+// disk. A second request carrying the same image must hit the cold-layer
+// cache — the vision provider is NOT called again, and the X-Blind-Llm-Eyes
+// header reports "cached".
+func TestE2E_CacheSurvivesRestart(t *testing.T) {
+	logger := quietLogger()
+	pngB64, _ := redPNGBase64(t)
+	dbPath := filepath.Join(t.TempDir(), "cache.db")
+
+	// --- Fake MiMo vision endpoint (counts calls) ---
+	var visionCalls int32
+	visionSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&visionCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"content": []map[string]any{
+				{"type": "text", "text": "RESTART_TEST: a solid red square"},
+			},
+			"stop_reason": "end_turn",
+		})
+	}))
+	defer visionSrv.Close()
+
+	// --- Fake upstream (minimal SSE passthrough) ---
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"type\":\"message_start\"}\n\n"))
+		w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstreamSrv.Close()
+
+	// --- Real vision.Client pointed at the fake MiMo server ---
+	visionClient := vision.NewClient(
+		visionSrv.URL, "test-vision-key", "mimo-v2.5",
+		10*time.Second, 30*time.Second, 1<<20, 300,
+		[]string{"image/png", "image/jpeg", "image/webp", "image/gif"},
+		logger,
+	)
+
+	reqBody := `{"model":"deepseek-chat","max_tokens":100,"stream":true,` +
+		`"messages":[{"role":"user","content":[` +
+		`{"type":"text","text":"What is in this image?"},` +
+		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + pngB64 + `"}}` +
+		`]}]}`
+
+	// ── 1st "cold start": TwoTier with a fresh SQLite db ──
+	cold1, err := cache.OpenSQLite(dbPath, 10000, 0, logger)
+	if err != nil {
+		t.Fatalf("open sqlite (1st): %v", err)
+	}
+	tt1 := cache.NewTwoTier(10, cold1, logger)
+	h1 := proxy.NewHandler(proxy.HandlerDeps{
+		UpstreamBaseURL:     upstreamSrv.URL,
+		UpstreamAPIKey:      "test-upstream-key",
+		VisionProvider:      visionClient,
+		Cache:               tt1,
+		FailOpen:            true,
+		LargeImageThreshold: 1 << 20,
+		Log:                 logger,
+	})
+
+	rr1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
+	req1.Header.Set("Content-Type", "application/json")
+	h1.ServeHTTP(rr1, req1)
+
+	if rr1.Code != http.StatusOK {
+		t.Fatalf("1st request: status %d (body=%s)", rr1.Code, rr1.Body.String())
+	}
+	if got := atomic.LoadInt32(&visionCalls); got != 1 {
+		t.Fatalf("1st request: vision calls got %d, want 1", got)
+	}
+	// Cache miss → header reports "rewritten" but NOT "cached".
+	hdr1 := rr1.Header().Get("X-Blind-Llm-Eyes")
+	if !strings.Contains(hdr1, "1 rewritten") {
+		t.Errorf("1st request header: got %q, want \"1 rewritten\"", hdr1)
+	}
+	if strings.Contains(hdr1, "1 cached") {
+		t.Errorf("1st request header should NOT report cached: got %q", hdr1)
+	}
+
+	// ── "Restart": close the old SQLite handle, reopen the same db file ──
+	// This mirrors a proxy restart: the in-memory LRU is lost, but the SQLite
+	// cold layer (with WAL checkpointed on Close) persists on disk.
+	if err := cold1.Close(); err != nil {
+		t.Fatalf("close sqlite (1st): %v", err)
+	}
+	cold2, err := cache.OpenSQLite(dbPath, 10000, 0, logger)
+	if err != nil {
+		t.Fatalf("open sqlite (2nd): %v", err)
+	}
+	defer cold2.Close()
+	tt2 := cache.NewTwoTier(10, cold2, logger)
+	h2 := proxy.NewHandler(proxy.HandlerDeps{
+		UpstreamBaseURL:     upstreamSrv.URL,
+		UpstreamAPIKey:      "test-upstream-key",
+		VisionProvider:      visionClient,
+		Cache:               tt2,
+		FailOpen:            true,
+		LargeImageThreshold: 1 << 20,
+		Log:                 logger,
+	})
+
+	// ── 2nd request: same image, fresh handler — must hit cold-layer cache ──
+	rr2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(reqBody))
+	req2.Header.Set("Content-Type", "application/json")
+	h2.ServeHTTP(rr2, req2)
+
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("2nd request: status %d (body=%s)", rr2.Code, rr2.Body.String())
+	}
+	// Vision provider must NOT be called again — the description survived the
+	// restart in the SQLite cold layer.
+	if got := atomic.LoadInt32(&visionCalls); got != 1 {
+		t.Errorf("2nd request: vision calls got %d, want 1 (cache should survive restart)", got)
+	}
+	// Cache hit → header reports "cached".
+	hdr2 := rr2.Header().Get("X-Blind-Llm-Eyes")
+	if !strings.Contains(hdr2, "1 cached") {
+		t.Errorf("2nd request header: got %q, want \"1 cached\" (cache hit after restart)", hdr2)
+	}
+}
