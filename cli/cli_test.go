@@ -84,7 +84,6 @@ func TestRun_Routing(t *testing.T) {
 		{"disconnect no backup", []string{"disconnect", "-backup", disconnectBackup}, 1, "backup", "unknown command"},
 		{"cache no args", []string{"cache"}, 2, "Subcommands", ""},
 		{"cache unknown", []string{"cache", "frob"}, 2, "unknown subcommand", ""},
-		{"cache stats stub", []string{"cache", "stats"}, 2, "not implemented yet", ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
