@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -240,5 +241,74 @@ func TestSQLite_RebuildResetsCount(t *testing.T) {
 	}
 	if got := s.count.Load(); got != 0 {
 		t.Fatalf("post-rebuild count = %d, want 0", got)
+	}
+}
+
+// TestSQLite_EvictNoThunderingHerd verifies the CAS guard prevents the
+// "evict storm" where bursty concurrent Puts each trigger DELETE and clear
+// the cache far below the configured cap.
+//
+// Without the guard: 50 goroutines crossing maxEntries=5 simultaneously
+// would each run DELETE LIMIT 41, eventually emptying the cache.
+//
+// With the guard: at most one evict runs at a time; concurrent losers return
+// early. count may transiently exceed maxEntries during the burst window but
+// converges on the next Put.
+func TestSQLite_EvictNoThunderingHerd(t *testing.T) {
+	maxEntries := 5
+	path := filepath.Join(t.TempDir(), "cache.db")
+	s, err := OpenSQLite(path, maxEntries, 0, discardLogger())
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer s.Close()
+
+	// 50 goroutines released by a barrier to maximize concurrent Put
+	// arrival — this is the burst that triggers the storm without the CAS.
+	const N = 50
+	var wg sync.WaitGroup
+	barrier := make(chan struct{})
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-barrier
+			s.Put(fmt.Sprintf("k%d", i), "v")
+		}(i)
+	}
+	close(barrier)
+	wg.Wait()
+
+	// Assertion 1: cache was not emptied by a concurrent evict storm.
+	if s.count.Load() == 0 {
+		t.Fatal("cache was emptied by concurrent evict storm (CAS guard missing or ineffective)")
+	}
+
+	// Assertion 2: counter agrees with the actual DB row count (no drift).
+	var dbN int
+	if err := s.db.QueryRow(sqlCount).Scan(&dbN); err != nil {
+		t.Fatal(err)
+	}
+	if int64(dbN) != s.count.Load() {
+		t.Fatalf("counter %d != db rows %d after concurrent puts", s.count.Load(), dbN)
+	}
+
+	// Assertion 3: CAS lets evict converge once the burst subsides. We
+	// manually trigger a few evictIfNeeded calls (the next Put would also
+	// do this, but we want a deterministic check) and expect count to fall
+	// back to <= maxEntries.
+	for i := 0; i < 5; i++ {
+		s.evictIfNeeded()
+	}
+	if s.count.Load() > int64(maxEntries) {
+		t.Fatalf("after manual evicts, counter %d > maxEntries %d (CAS did not converge)", s.count.Load(), maxEntries)
+	}
+
+	// Assertion 4: counter still agrees with the DB after convergence.
+	if err := s.db.QueryRow(sqlCount).Scan(&dbN); err != nil {
+		t.Fatal(err)
+	}
+	if int64(dbN) != s.count.Load() {
+		t.Fatalf("counter %d != db rows %d after convergence", s.count.Load(), dbN)
 	}
 }

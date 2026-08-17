@@ -20,6 +20,7 @@ type SQLite struct {
 	ttl        time.Duration // TTL; 0 = no TTL eviction
 	log        *slog.Logger
 	count      atomic.Int64 // in-memory row counter; avoids per-Put COUNT(*)
+	evicting   atomic.Bool  // CAS guard: at most one evict in flight at a time
 }
 
 const (
@@ -220,7 +221,20 @@ func nowMillis() int64 { return time.Now().UnixMilli() }
 // TTL eviction drops entries older than ttl. Both are best-effort; failures
 // log a WARN. On successful DELETE the counter is decremented by the actual
 // number of rows removed (rowsAffected) to prevent drift.
+//
+// CAS guard: a CompareAndSwap on s.evicting ensures at most one evict runs
+// at a time. Without this, bursty concurrent Puts (e.g., after vision
+// provider recovery) each cross maxEntries simultaneously and each run
+// DELETE LIMIT del, clearing the cache far below the cap. Losers return
+// early; their count.Add(1) is already accounted for, and the next Put
+// will retry the CAS and converge. Trade-off: count may transiently exceed
+// maxEntries during the burst window.
 func (s *SQLite) evictIfNeeded() {
+	if !s.evicting.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.evicting.Store(false)
+
 	n := s.count.Load()
 	if s.maxEntries > 0 && n > int64(s.maxEntries) {
 		del := n - int64(s.maxEntries)*9/10
