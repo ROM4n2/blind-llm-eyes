@@ -1,5 +1,100 @@
 # Changelog
 
+## [v1.3.0] — 2026-08-XX
+
+**迭代范围**：2026-08-18 设计，约 6 周，≈12 commits。Plan A Balanced Ops: 3×P0 + 5×P1，
+遵循可观测性与运维增强主题。零破坏性变更；所有 v1.2.0 配置文件无需修改即兼容。
+
+**迭代目标**：为 v1.2.0 引入的安全+分片锁基础补上运维侧短板 —— 配置热加载（SIGHUP + admin HTTP + CLI
+三通道）、12 个新 Prometheus 指标覆盖缓存分层命中/漂移、provider 结果/熔断器状态变迁、singleflight
+去重效率、请求/响应负载分布、SSE 事件吞吐；debug/pprof 标准 Go 剖析端点配 3 层安全；E2E 测试补 TwoTier
+后端与跨重启缓存存活；doctor 新增持久层可写、上游可达、视觉模型存在三项检查；示例配置同步
+vision_capable_models / metrics_auth_token / debug_pprof_enabled 字段块和 *int 注释。
+
+### Observability
+
+#### Metrics P0 层 — 缓存分层命中 + 漂移 + provider/CB 事件 (P0)
+
+- `metrics/metrics.go`：新增 `blind_llm_eyes_cache_hits_total`（tier=hot/cold × outcome=hit/miss）、
+  `blind_llm_eyes_cache_row_count`（tier=memory/actual）、
+  `blind_llm_eyes_cache_drift_pct`（±100% 饱和，60s tick 更新）。
+  `cache/lru.go` + `cache/twotier.go` 各读取站点埋点；nil-safe 无指标注入时零额外开销。
+- `metrics/metrics.go`：新增 `blind_llm_eyes_provider_calls_total`
+  （provider × outcome ∈ success/fail/skip/fallback），埋在 `vision/pool.go CallProvider`
+  每个出口分支；新增 `blind_llm_eyes_circuit_breaker_transitions_total`
+  （provider × from × to ∈ closed/open/halfopen），埋在 `vision/circuit_breaker.go Transition`
+  每次状态机 dispatch。旧同名一标签 CounterVec 与 GaugeVec **保留一版**（迁移窗口）。
+
+#### Metrics P1 层 — singleflight / 图片输入 / 负载分布 / SSE 吞吐 (P1)
+
+- `proxy/handler.go`：singleflight.Do 返回 shared bool → exec/wait 分类 + merged 计数。
+- `proxy/handler.go`：image base64 解码后 `len(rawBytes)` → 累加到 `images_bytes_in_total` 按 format 标签。
+- `proxy/handler.go` 请求体 size histograms（8 buckets, 1KB–20MB）响应体 size histograms；
+  SSE passthrough 写路径扫描每个 `event:` 前缀分类到 message/error/other。
+
+### Reliability
+
+#### 配置热加载 ReloadableConfig (P0)
+
+- `config/loader.go`：新增 `ReloadableConfig`（atomic.Pointer + 进程级互斥 reload）。
+  `Load()` 单次原子读取，调用方存为 snapshot 本地变量，单次请求绝不多次 Load 以避免版本交叉。
+  `Reload()` 复用 `Load(path)+validate()`；若 NON-RELOADABLE 字段（listen / upstream.base_url /
+  upstream.api_key / metrics_auth_token / cache.db_path）有变更 → 拒绝并返回描述性错误，保留旧配置。
+- `main.go`：SIGHUP goroutine + `/admin/reload` POST handler（200 全部应用 / 206 pool
+  drain-30s 超时强制交换 / 422 验证失败，保留旧配置）。
+  `applyReloadSideEffects` 触发三个副作用：slog.LevelVar 级别切换、vision.Pool drain-swap、
+  LRU Resize 热层容量调整。
+- `cli/reload.go`：新增 `blind-llm-eyes reload` 子命令。读取 pidfile，带 admin token POST
+  `/admin/reload`，pretty 打印 JSON 响应。Windows 下 SIGHUP 无法触发，此为主要通道。Unix 上双通道皆可用。
+
+#### E2E 跨重启缓存存活验证 (P1)
+
+- `test/e2e_test.go`：抽取 `setupHandlerBackend(t, cacheImpl)` helper。
+  新增 `BasicRewrite_TwoTier`、`SSEPassthrough_TwoTier`、`ModelUtilPassthrough_TwoTier`、
+  `CacheSurvivesRestart_TwoTier`。最关键的跨重启测试构造两个独立 handler 生命周期共享同一
+  t.TempDir()/shared-cache.db，断言 vision mock 调用计数增量为 0（冷层命中，无需再次调用 vision）。
+  Release Gate 要求 `-count=10 -race` 十次全绿（无 flaky）。
+
+#### Doctor 三项新检查 (P1)
+
+- `cli/doctor.go`：在自指 URL 检查后追加三项。
+  `db_writable`：OpenSQLite + PRAGMA quick_check + 随机 probe 行写入/删除。type=lru 时 SKIP。
+  `upstream_reachable`：5s timeout HEAD 到 `<base_url>/v1/models`；任何 HTTP 响应 PASS；
+  TCP/DNS/TLS 连接失败 FAIL。`vision_model_exists`：5s ProviderPing（401 立即 FAIL）；
+  成功后可选 `/v1/models`，404 或 model 不在列表 = WARN，退出码仍为 0。
+
+#### debug/pprof 标准 Go 剖析端点 (P0)
+
+- 新增包 `internal/pprofsec`：Wrap(http.Handler, Config) 实现 3 层中间件：
+  (1) `Enabled=false` → 返回 404（隐藏端点存在）；
+  (2) AuthToken 非空时 `subtle.ConstantTimeCompare` 对 query ?token= 或 X-Metrics-Token；
+  (3) AuthToken 为空 → 限制 `net.ParseIP(RemoteAddr host).IsLoopback()`，非回环 403。
+  main.go 路由注册 `/debug/pprof/*` 五个端点（Index cmdline profile symbol trace）。
+  mutex/block profile 默认关闭（0 采样成本），需调优时通过 env 设置比例。
+  7 个单元测试覆盖 3 层每一个失败分支 + IPv6 `[::1]` 通过。
+
+### Compatibility
+
+- 新增 `ReloadableConfig` 类型、配置字段 `debug_pprof_enabled`、`Cache.Close() error` 接口方法
+  —— 均为纯**增量**，不改变任何已有导出符号签名（返回值、参数、方法名）。
+- 旧 Prometheus 指标名（CacheHitRatio、ProviderCallsTotal 1-label、CircuitBreakerState gauge）
+  保留一个大版本迁移窗口，不删除、不重命名、不调整 label 集合。
+- v1.2.0 样式配置加载无警告、无行为变化（`debug_pprof_enabled` nil → true 默认，
+  `vision_capable_models` 空 → 始终重写，旧行为 100% 等价保留）。
+
+### Engineering
+
+- `config.example.yaml`：同步 vision_capable_models 示例块、metrics_auth_token 块（含 openssl /
+  PowerShell token 生成命令）、debug_pprof_enabled 注释块、vision.context_rounds *int 语义修正。
+- CI 矩阵 ubuntu job 额外执行 `go test -race -count=10 -run TestE2E_CacheSurvivesRestart_TwoTier ./test`
+  作为 flaky gate，失败即 CI 红。
+- cache 接口新增 Close()：LRU 空实现；SQLite 真实关闭连接；TwoTier 级联关闭冷层。
+  handler shutdown 路径调用（非重启场景不会泄漏连接）。
+
+---
+
+**版本状态**：待发布（等待 Release Gate §0.1.3 逐项打勾后 tag `v1.3.0`）。
+
 ## [v1.2.0] — 2026-08-18
 
 **迭代范围**：2026-08-18，共 6 个提交（`9db77b3..4346cf4`），基于只读审计报告
