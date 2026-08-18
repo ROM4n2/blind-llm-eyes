@@ -2,6 +2,10 @@
 
 **English** | [中文](README.zh-CN.md)
 
+[![ci](https://github.com/ROM4n2/blind-llm-eyes/actions/workflows/ci.yml/badge.svg)](https://github.com/ROM4n2/blind-llm-eyes/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/ROM4n2/blind-llm-eyes?sort=semver)](https://github.com/ROM4n2/blind-llm-eyes/releases)
+[![license](https://img.shields.io/github/license/ROM4n2/blind-llm-eyes)](LICENSE)
+
 Give text-only LLMs eyes. A reverse proxy that sits in front of an Anthropic-compatible, text-only model and transparently turns image blocks into text descriptions using a separate vision model — so you can paste screenshots into Claude Code without switching providers.
 
 **Primary scenario:** Claude Code ↔ **blind-llm-eyes** ↔ text-only upstream (e.g. DeepSeek), with a vision model (e.g. MiMo) describing the images.
@@ -210,10 +214,12 @@ Each subcommand accepts `-config <path>` (default `config.yaml`). `stats` / `lis
 ### Security considerations
 
 - **Admin token** — generated fresh from `crypto/rand` on every `start`, written to the pidfile at `<UserConfigDir>/blind-llm-eyes/pidfile.json`, and deleted by `stop`. It's never persisted elsewhere (no env var, no config key).
-- **Bind address** — default listen is `127.0.0.1:8790` (loopback only). Exposing `0.0.0.0` or a LAN IP forwards `/v1/messages` with your upstream API key to anyone who can reach the port — never do that on an untrusted network. `/metrics` and `/healthz` also have no client auth.
-- **Keys from config vs env** — API keys set in `config.yaml` override the client's `Authorization` header. The handler strips `Authorization` / `Proxy-Authorization` / `Cookie` headers from the client before forwarding upstream whenever `UpstreamAPIKey` is configured, to avoid leaking client-side credentials.
+- **Bind address** — default listen is `127.0.0.1:8790` (loopback only). Exposing `0.0.0.0` or a LAN IP forwards `/v1/messages` with your upstream API key to anyone who can reach the port — never do that on an untrusted network.
+- **`/metrics` authentication (optional)** — by default `/metrics` is unauthenticated (for Prometheus scrapers on localhost). Set `metrics_auth_token` in `config.yaml` or the `BLIND_METRICS_AUTH_TOKEN` env var to require a token via `?token=xxx` query param or `X-Metrics-Token` HTTP header. The comparison uses constant-time (`crypto/subtle.ConstantTimeCompare`) so timing attacks cannot extract the token byte-by-byte.
+- **Keys from config vs env** — API keys set in `config.yaml` override the client's `Authorization` header. The handler strips `Authorization` / `Proxy-Authorization` / `Cookie` headers from the client **whenever `UpstreamAPIKey` is configured** (proxy injects its own key). When `UpstreamAPIKey` is empty, the proxy acts as a transparent forwarder and passes the client's `Authorization` to the upstream so it can authenticate directly. Client credentials are never logged; context text in logs is truncated to 80 bytes as `context_preview`.
 - **Pidfile permissions** — on Windows the pidfile directory defaults to `%AppData%\blind-llm-eyes\` (user-only ACLs inherited from `AppData`). Don't share `%AppData%` across accounts or put it on a world-readable share.
 - **`connect` backup** — `~/.claude/.bak-before-connect` is a verbatim copy of your original `settings.json`. It contains whatever secrets `settings.json` held (e.g. `ANTHROPIC_API_KEY`). Treat it the same as the real file.
+- **Pre-commit hooks** — the repo ships with `pre-commit` (bash) and `pre-commit.ps1` (PowerShell) hooks that block hard-coded API keys (`sk-*`, `AKIA*`, `ghp_*`) from reaching git history. Run `git config core.hooksPath .githooks` once after cloning to activate.
 
 ## Configuration reference
 
@@ -221,7 +227,7 @@ Each subcommand accepts `-config <path>` (default `config.yaml`). `stats` / `lis
 | --- | --- | --- |
 | `listen` | `127.0.0.1:8790` | Bind address |
 | `upstream.base_url` | — (required) | Text-only upstream root (Anthropic-compatible) |
-| `upstream.api_key` | — | If set, overrides the client's `Authorization` when forwarding |
+| `upstream.api_key` | — | If set, overrides the client's `Authorization` when forwarding; client auth headers are stripped only when this is configured |
 | `vision.base_url` | — (required) | Vision model root; the client appends `/v1/messages` |
 | `vision.api_key` | — | Vision provider key |
 | `vision.model` | — | Vision model name |
@@ -230,8 +236,9 @@ Each subcommand accepts `-config <path>` (default `config.yaml`). `stats` / `lis
 | `vision.large_image_threshold` | `1048576` | Bytes; images at/above this get the large timeout |
 | `vision.description_cap` | `1000` | `max_tokens` for descriptions |
 | `vision.supported_formats` | png/jpeg/webp/gif | Allowed media types |
-| `vision.context_rounds` | `3` | Context-aware descriptions: last N turns; `0`/`-1` disables |
+| `vision.context_rounds` | (omitted = `3`) | Context-aware descriptions: last N turns. Omit the key entirely for the default 3. Set explicitly to `0` to disable context awareness. Negative values are clamped to 0. |
 | `vision.context_max_chars` | `2000` | Max context chars (~500 tokens) |
+| `vision_capable_models` | `[]` (always rewrite) | Model names that natively support image input (e.g. `gpt-4o`, `claude-3-5-sonnet`). When the request model matches (case-insensitive, after sanitization), the proxy skips image rewriting and forwards the body verbatim. |
 | `cache.type` | `lru` | `lru` (in-memory) or `twotier` (LRU + SQLite, descriptions survive restart) |
 | `cache.max_entries` | `500` | LRU hot-layer capacity (total capacity when `type=lru`) |
 | `cache.db_path` | `./cache.db` | SQLite cold-layer path (only when `type=twotier`) |
@@ -241,6 +248,8 @@ Each subcommand accepts `-config <path>` (default `config.yaml`). `stats` / `lis
 | `adaptive_concurrency.*` | disabled | AIMD controller (see below) |
 | `fail_open` | `false` | Vision failure → placeholder instead of 502 |
 | `log_level` | `info` | `debug`/`info`/`warn`/`error` |
+| `metrics_auth_token` | — (no auth) | Optional bearer token for `/metrics`. Set via env var `BLIND_METRICS_AUTH_TOKEN` to avoid storing secrets in YAML. |
+| `max_body_bytes` | `20971520` (20 MB) | Max request body size; larger requests are rejected with 413 |
 
 ### Adaptive concurrency
 
@@ -287,22 +296,26 @@ The core concurrency follows Go's practical model rather than the slogan: channe
 ## Limitations
 
 - **Anthropic Messages format only** (no OpenAI Chat Completions input).
-- No client auth on `/metrics` or `/healthz` — expose only locally.
+- `/healthz` has no auth — expose only locally. `/metrics` has **optional** token auth (`metrics_auth_token` / `BLIND_METRICS_AUTH_TOKEN`); enable it when exposing beyond localhost.
 - In-memory cache by default — descriptions are lost on restart. Opt in to `cache.type: twotier` for SQLite-backed persistence.
+- SQLite count drift: the in-memory row counter (`memory_count`) may diverge from the actual DB row count (`actual_count`) if writes fail or an external writer modifies the database. Run `blind-llm-eyes cache stats` periodically to monitor drift; a >5% warning is printed and the observation can trigger a rebuild.
+- Self-referential upstream URLs are blocked at 5 layers (import filter / setup reject / doctor FAIL / NewHandler panic / runtime 508). DNS FQDN forms like `127.0.0.1.:8790` are detected (trailing dots stripped). If the proxy's own listen address changes at runtime *after* startup, the last-resort runtime 508 guard still applies.
 
 ## Development
 
 ```bash
-make test          # go test -race -count=1 ./...  (the CI gate)
+make test          # go test -race -count=1 ./...  — matches the ci.yml CI gate
 make vet           # go vet ./...
 make build         # local binary with version ldflags
 make snapshot      # goreleaser build --snapshot — compile all platform targets
 make goreleaser-check  # validate .goreleaser.yaml
 ```
 
-Releasing is tag-driven: push a `v*` tag and the `release` workflow runs `goreleaser release`, publishing archives + checksums to the GitHub release. Maintainers can also run `make release` locally with `GITHUB_TOKEN` set.
+The `ci` GitHub Actions workflow (`.github/workflows/ci.yml`) runs `go vet` + `go test -race` on a matrix of ubuntu-latest / macos-latest / windows-latest for every push and pull request, plus `go build` on ubuntu-latest. The `make test` command above reproduces the exact race-check gate locally.
 
-The test suite covers parsing/rewrite round-trips (including preserving unknown fields), LRU behavior, vision client against a mock server, the full handler pipeline with mock vision + upstream, concurrency bounds, `singleflight` dedup across requests, and adaptive-limit behavior.
+Releasing is tag-driven: push a `v*` tag and the `release` workflow runs `goreleaser release`, publishing 6 archives (Windows/Linux/macOS, amd64 + arm64) + `checksums.txt` to the GitHub release. Maintainers can also run `make release` locally with `GITHUB_TOKEN` set.
+
+The test suite covers parsing/rewrite round-trips (including preserving unknown fields), LRU behavior, vision client against a mock server, the full handler pipeline with mock vision + upstream, concurrency bounds, `singleflight` dedup across requests, adaptive-limit behavior, TwoTier sharded-lock parallelism, SQLite count-drift observability, and self-referential URL detection.
 
 ### Git Hooks
 
