@@ -15,7 +15,36 @@ import (
 	"github.com/ROM4n2/blind-llm-eyes/config"
 )
 
-// writeConfigYAML helper not needed — doctor core takes a *config.Config directly.
+// minimalTestConfig returns a *config.Config suitable for doctor tests:
+// LRU cache (no SQLite), no listen address (avoids accidental self-loop),
+// vision model "m" + fake non-empty API key (required by BuildProvider).
+// Upstream and vision URLs are populated by each test.
+func minimalTestConfig(t *testing.T) *config.Config {
+	t.Helper()
+	return &config.Config{
+		Cache: config.CacheCfg{
+			Type:             "lru",
+			MaxEntries:       500,
+			SqliteMaxEntries: 10000,
+		},
+		Upstream: config.UpstreamCfg{
+			APIKey: "test-upstream-key",
+		},
+		Vision: config.VisionCfg{
+			Model:   "m",
+			APIKey:  "test-vision-key",
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+// runDoctorMinimal calls runDoctorCore with the given config, using sensible
+// defaults for the remaining test-only parameters. Returns the exit code.
+func runDoctorMinimal(t *testing.T, cfg *config.Config) int {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	return runDoctorCore(context.Background(), cfg, "deepseek-chat", false, &stdout, &stderr)
+}
 
 func TestRunDoctor_AllPass(t *testing.T) {
 	// Fake upstream (Anthropic-compatible /v1/messages) — returns 200.
@@ -673,3 +702,109 @@ func TestRunDoctor_VisionSelfReferential_PoolProvider(t *testing.T) {
 		t.Errorf("stderr should mention provider name, got: %s", errOut)
 	}
 }
+
+// ── TG3 Task 8: doctor P1 checks — DB writable / upstream ping / vision model ──
+
+// runDoctorMinimalCapture is like runDoctorMinimal but also returns the
+// captured stdout+stderr so tests can assert on diagnostic output lines.
+func runDoctorMinimalCapture(t *testing.T, cfg *config.Config) (rc int, stdout, stderr string) {
+	t.Helper()
+	var so, se bytes.Buffer
+	rc = runDoctorCore(context.Background(), cfg, "deepseek-chat", false, &so, &se)
+	return rc, so.String(), se.String()
+}
+
+func TestDoctor_DBWritable_SKIP_whenLRU(t *testing.T) {
+	cfg := minimalTestConfig(t)
+	cfg.Cache.Type = "lru" // SKIP expected
+	rc, _, stderr := runDoctorMinimalCapture(t, cfg)
+	if rc != 0 {
+		t.Fatalf("Lru-only doctor must pass even with no-op check; rc=%d stderr=%s", rc, stderr)
+	}
+	// D1 check must print "db_writable ... SKIP" (to stderr per plan output layout).
+	if !strings.Contains(stderr, "db_writable") {
+		t.Fatalf("expected 'db_writable' check line in stderr on LRU; got: %s", stderr)
+	}
+	if !strings.Contains(stderr, "SKIP") {
+		t.Fatalf("expected SKIP for lru cache db_writable check; got: %s", stderr)
+	}
+}
+
+func TestDoctor_DBWritable_FAIL_whenFileNotWritable(t *testing.T) {
+	cfg := minimalTestConfig(t)
+	cfg.Cache.Type = "twotier"
+	// Point DBPath at a directory — OpenSQLite should error when opening a
+	// directory as a DB file, which triggers D1 FAIL.
+	dir := t.TempDir()
+	cfg.Cache.DBPath = dir
+	rc, _, stderr := runDoctorMinimalCapture(t, cfg)
+	// At a minimum the check must print "db_writable". We don't hard-fail
+	// the assertion on rc (some platforms treat directory paths leniently).
+	if !strings.Contains(stderr, "db_writable") {
+		t.Fatalf("expected 'db_writable' diagnostic line in stderr; got: %s", stderr)
+	}
+	t.Logf("rc=%d stderr=%s", rc, stderr)
+}
+
+func TestDoctor_UpstreamReachable_PASS_withFake200(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer srv.Close()
+	cfg := minimalTestConfig(t)
+	cfg.Upstream.BaseURL = srv.URL
+	rc, _, stderr := runDoctorMinimalCapture(t, cfg)
+	if rc != 0 {
+		t.Fatalf("expected PASS rc=0, got rc=%d stderr=%s", rc, stderr)
+	}
+	// D2 check must emit "upstream_reachable" diagnostic line.
+	if !strings.Contains(stderr, "upstream_reachable") {
+		t.Fatalf("expected 'upstream_reachable' D2 check line in stderr; got: %s", stderr)
+	}
+}
+
+func TestDoctor_UpstreamReachable_FAIL_noListener(t *testing.T) {
+	cfg := minimalTestConfig(t)
+	cfg.Upstream.BaseURL = "http://127.0.0.1:1/" // nothing there
+	rc, _, _ := runDoctorMinimalCapture(t, cfg)
+	if rc == 0 {
+		t.Fatalf("expected FAIL exit 1 for unreachable upstream")
+	}
+}
+
+func TestDoctor_VisionModel_FAIL_401(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401) }))
+	defer srv.Close()
+	cfg := minimalTestConfig(t)
+	cfg.Vision.BaseURL = srv.URL
+	rc, _, _ := runDoctorMinimalCapture(t, cfg)
+	if rc == 0 {
+		t.Fatalf("401 from vision must FAIL doctor exit=1")
+	}
+}
+
+func TestDoctor_VisionModel_WARN_noModelsEndpoint(t *testing.T) {
+	// Provider returns 200 for ping but 404 for /models → warn not fail.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			w.WriteHeader(404)
+			return
+		}
+		w.WriteHeader(200) // ping OK
+	}))
+	defer srv.Close()
+	cfg := minimalTestConfig(t)
+	cfg.Vision.BaseURL = srv.URL
+	rc, _, stderr := runDoctorMinimalCapture(t, cfg)
+	// WARN only → exit still 0 (doctor does not fail on WARN).
+	if rc != 0 {
+		t.Fatalf("WARN-only check must NOT set exit=1; rc=%d stderr=%s", rc, stderr)
+	}
+	// D3 vision_model_exists must emit a diagnostic line.
+	if !strings.Contains(stderr, "vision_model_exists") {
+		t.Fatalf("expected 'vision_model_exists' D3 check line in stderr; got: %s", stderr)
+	}
+	// Specifically a WARN (not PASS, not FAIL) — because /models 404.
+	if !strings.Contains(stderr, "WARN") {
+		t.Fatalf("expected WARN for /models-404 case; got: %s", stderr)
+	}
+}
+

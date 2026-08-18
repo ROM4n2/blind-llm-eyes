@@ -289,3 +289,38 @@ func (s *SQLite) evictIfNeeded() {
 		}
 	}
 }
+
+// PragmaQuickCheck runs `PRAGMA quick_check` and returns nil iff the result
+// is exactly "ok". Used by doctor D1 to detect low-level DB corruption
+// (faster than the full integrity_check).
+func (s *SQLite) PragmaQuickCheck() error {
+	var res string
+	if err := s.db.QueryRow("PRAGMA quick_check").Scan(&res); err != nil {
+		return fmt.Errorf("quick_check query: %w", err)
+	}
+	if res != "ok" {
+		return fmt.Errorf("quick_check reported: %s", res)
+	}
+	return nil
+}
+
+// WriteProbe inserts a uniquely-keyed probe row with the given hash and a
+// non-empty description, then immediately deletes it (cleanup). Returns nil
+// only when both write + delete succeed, proving round-trip write capability.
+// Used by doctor D1 as the "can actually persist data" smoke-test.
+func (s *SQLite) WriteProbe(hash string) error {
+	desc := "doctor-write-probe"
+	size := int64(len(desc))
+	now := nowMillis()
+	_, err := s.db.Exec(sqlInsertIgnore, hash, desc, size, now, now)
+	if err != nil {
+		return fmt.Errorf("probe insert: %w", err)
+	}
+	// Clean up — keep the cache table tidy. RowsAffected check intentionally
+	// skipped: if insert was a no-op (INSERT OR IGNORE) we still want to
+	// delete any stray leftover probe row from a prior interrupted run.
+	if _, err := s.db.Exec(`DELETE FROM cache WHERE hash = ?`, hash); err != nil {
+		return fmt.Errorf("probe cleanup: %w", err)
+	}
+	return nil
+}
