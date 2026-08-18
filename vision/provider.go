@@ -40,6 +40,20 @@ type Pinger interface {
 	Ping(ctx context.Context) error
 }
 
+// BaseURLAware is an optional interface for providers that expose their
+// configured BaseURL. The proxy's runtime self-loop guard type-asserts to
+// this interface before each vision call; if the BaseURL points back to the
+// proxy's own listen address, the call is rejected with 508 Loop Detected
+// instead of causing an infinite forwarding loop.
+//
+// Both Client (MiMo/Anthropic) and OpenAIClient implement this interface.
+// Mock providers in tests can choose to implement it or not — providers that
+// don't implement it skip the runtime check (falling back to config-time
+// detection in doctor/setup).
+type BaseURLAware interface {
+	GetBaseURL() string
+}
+
 // GLM-4V-Flash free-tier defaults (Zhipu AI BigModel platform).
 // The model is free to use but still requires an API key from
 // https://open.bigmodel.cn — the "free" refers to zero cost per call,

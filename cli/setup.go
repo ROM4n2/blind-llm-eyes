@@ -13,6 +13,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// defaultListen is the proxy's default listen address, used as the single
+// source of truth for self-referential URL detection in the setup wizard.
+const defaultListen = "127.0.0.1:8790"
+
 // setupDeps holds injectable dependencies for the setup wizard, enabling
 // testing without real file I/O, network calls, or cc-switch databases.
 type setupDeps struct {
@@ -61,11 +65,27 @@ func runSetupCore(stdin io.Reader, stdout, stderr io.Writer, deps *setupDeps) in
 	var upstreamBaseURL, upstreamAPIKey, visionBaseURL, visionAPIKey, visionModel string
 
 	if askYesNo("Import from cc-switch?", false) && deps.ccSwitchPath != "" {
-		providers, err := ImportFromCcSwitch(deps.ccSwitchPath)
-		if err == nil && len(providers) > 0 {
-			fmt.Fprintf(stdout, "Found %d Claude Code providers in cc-switch:\n", len(providers))
+		allProviders, err := ImportFromCcSwitch(deps.ccSwitchPath, "")
+		if err == nil && len(allProviders) > 0 {
+			var providers []CcSwitchProvider
+			var filteredCount int
+			for _, p := range allProviders {
+				if IsSelfReferentialURL(p.BaseURL, defaultListen) {
+					filteredCount++
+					continue
+				}
+				providers = append(providers, p)
+			}
+			fmt.Fprintf(stdout, "Found %d Claude Code providers in cc-switch", len(providers))
+			if filteredCount > 0 {
+				fmt.Fprintf(stdout, " (%d self-referential filtered out)", filteredCount)
+			}
+			fmt.Fprintln(stdout, ":")
 			for i, p := range providers {
 				fmt.Fprintf(stdout, "  %d. %s (base_url=%s, model=%s)\n", i+1, p.Name, p.BaseURL, p.Model)
+			}
+			if len(providers) == 0 {
+				fmt.Fprintln(stdout, "  (no valid providers remaining)")
 			}
 			fmt.Fprintln(stdout, "")
 			upIdx := prompt("Select upstream provider number (or Enter to type manually): ")
@@ -95,6 +115,17 @@ func runSetupCore(stdin io.Reader, stdout, stderr io.Writer, deps *setupDeps) in
 		upstreamBaseURL = prompt("Upstream base URL [https://api.deepseek.com/anthropic]: ")
 		if upstreamBaseURL == "" {
 			upstreamBaseURL = "https://api.deepseek.com/anthropic"
+		}
+		if IsSelfReferentialURL(upstreamBaseURL, defaultListen) {
+			fmt.Fprintln(stdout, "")
+			fmt.Fprintf(stderr, "WARNING: upstream base_url %q points to the proxy itself (127.0.0.1:8790).\n", upstreamBaseURL)
+			fmt.Fprintf(stderr, "  This will cause an infinite self-forwarding loop.\n")
+			fmt.Fprintf(stderr, "  Please use a real upstream API endpoint instead.\n")
+			upstreamBaseURL = prompt("Enter a valid upstream base URL: ")
+			if upstreamBaseURL == "" || IsSelfReferentialURL(upstreamBaseURL, defaultListen) {
+				fmt.Fprintln(stderr, "Invalid upstream URL. Setup cancelled.")
+				return 1
+			}
 		}
 	}
 	if upstreamAPIKey == "" {
@@ -141,6 +172,19 @@ func runSetupCore(stdin io.Reader, stdout, stderr io.Writer, deps *setupDeps) in
 			if visionBaseURL == "" {
 				visionBaseURL = "https://api.xiaomimimo.com/anthropic"
 			}
+			// Self-loop detection: vision base_url points to the proxy itself.
+			// MiMo Client calls /v1/messages (same as proxy path) → infinite loop.
+			if IsSelfReferentialURL(visionBaseURL, defaultListen) {
+				fmt.Fprintln(stdout, "")
+				fmt.Fprintf(stderr, "WARNING: vision base_url %q points to the proxy itself (127.0.0.1:8790).\n", visionBaseURL)
+				fmt.Fprintf(stderr, "  This will cause an infinite self-forwarding loop (vision calls /v1/messages on the proxy).\n")
+				fmt.Fprintf(stderr, "  Please use a real vision API endpoint instead.\n")
+				visionBaseURL = prompt("Enter a valid vision base URL: ")
+				if visionBaseURL == "" || IsSelfReferentialURL(visionBaseURL, defaultListen) {
+					fmt.Fprintln(stderr, "Invalid vision URL. Setup cancelled.")
+					return 1
+				}
+			}
 		}
 		if visionAPIKey == "" {
 			visionAPIKey = prompt("Vision API key: ")
@@ -157,7 +201,7 @@ func runSetupCore(stdin io.Reader, stdout, stderr io.Writer, deps *setupDeps) in
 	fmt.Fprintln(stdout, "")
 	fmt.Fprintln(stdout, "Running connectivity self-check (doctor)...")
 	cfg := &config.Config{
-		Listen:   "127.0.0.1:8790",
+		Listen:   defaultListen,
 		Upstream: config.UpstreamCfg{BaseURL: upstreamBaseURL, APIKey: upstreamAPIKey},
 		Vision: config.VisionCfg{
 			BaseURL: visionBaseURL,

@@ -54,9 +54,18 @@ func runDoctorCore(ctx context.Context, cfg *config.Config, upstreamModel string
 
 	// ── Upstream ping ──
 	fmt.Fprintf(stdout, "checking upstream (%s) ... ", cfg.Upstream.BaseURL)
-	if cfg.Upstream.BaseURL == "" {
+	switch {
+	case cfg.Upstream.BaseURL == "":
 		fmt.Fprintln(stdout, "SKIP (no upstream.base_url configured)")
-	} else {
+	case IsSelfReferentialURL(cfg.Upstream.BaseURL, cfg.Listen):
+		// Self-loop detection: upstream.base_url points to the proxy itself,
+		// which would cause infinite self-forwarding loops. Report FAIL once
+		// here instead of pinging our own endpoint.
+		fmt.Fprintln(stdout, "FAIL")
+		fmt.Fprintf(stderr, "  upstream.base_url points to proxy's own listen address (%s) — this causes infinite self-forwarding loops\n", cfg.Listen)
+		fmt.Fprintf(stderr, "  Fix: set upstream.base_url to a real upstream API endpoint\n")
+		failed = true
+	default:
 		if err := PingUpstream(ctx, cfg.Upstream.BaseURL, cfg.Upstream.APIKey, upstreamModel); err != nil {
 			fmt.Fprintln(stdout, "FAIL")
 			fmt.Fprintf(stderr, "  %v\n", err)
@@ -70,6 +79,15 @@ func runDoctorCore(ctx context.Context, cfg *config.Config, upstreamModel string
 	if len(cfg.VisionProviders) > 0 {
 		for _, pc := range cfg.VisionProviders {
 			fmt.Fprintf(stdout, "checking vision provider %q (%s) ... ", pc.Name, pc.BaseURL)
+			// Self-loop detection: vision provider base_url points to the proxy itself.
+			// MiMo Client calls /v1/messages (same as proxy path) → infinite loop.
+			if IsSelfReferentialURL(pc.BaseURL, cfg.Listen) {
+				fmt.Fprintln(stdout, "FAIL")
+				fmt.Fprintf(stderr, "  vision provider %q base_url points to proxy's own listen address (%s) — this causes infinite self-forwarding loops\n", pc.Name, cfg.Listen)
+				fmt.Fprintf(stderr, "  Fix: set vision_providers[].base_url to a real vision API endpoint\n")
+				failed = true
+				continue
+			}
 			p, err := vision.BuildProvider(pc, logger)
 			if err != nil {
 				fmt.Fprintln(stdout, "FAIL")
@@ -97,26 +115,35 @@ func runDoctorCore(ctx context.Context, cfg *config.Config, upstreamModel string
 		}
 	} else if cfg.Vision.BaseURL != "" {
 		fmt.Fprintf(stdout, "checking vision (%s) ... ", cfg.Vision.BaseURL)
-		p, err := vision.BuildSingleProvider(cfg.Vision, logger)
-		if err != nil {
+		// Self-loop detection: vision base_url points to the proxy itself.
+		// MiMo Client calls /v1/messages (same as proxy path) → infinite loop.
+		if IsSelfReferentialURL(cfg.Vision.BaseURL, cfg.Listen) {
 			fmt.Fprintln(stdout, "FAIL")
-			fmt.Fprintf(stderr, "  build: %v\n", err)
+			fmt.Fprintf(stderr, "  vision.base_url points to proxy's own listen address (%s) — this causes infinite self-forwarding loops\n", cfg.Listen)
+			fmt.Fprintf(stderr, "  Fix: set vision.base_url to a real vision API endpoint\n")
 			failed = true
 		} else {
-			if err := pingVisionProvider(ctx, p); err != nil {
+			p, err := vision.BuildSingleProvider(cfg.Vision, logger)
+			if err != nil {
 				fmt.Fprintln(stdout, "FAIL")
-				fmt.Fprintf(stderr, "  %v\n", err)
+				fmt.Fprintf(stderr, "  build: %v\n", err)
 				failed = true
-			} else if deep {
-				if err := deepCheckVision(ctx, p); err != nil {
-					fmt.Fprintln(stdout, "FAIL (deep)")
-					fmt.Fprintf(stderr, "  deep: %v\n", err)
-					failed = true
-				} else {
-					fmt.Fprintln(stdout, "PASS (deep)")
-				}
 			} else {
-				fmt.Fprintln(stdout, "PASS")
+				if err := pingVisionProvider(ctx, p); err != nil {
+					fmt.Fprintln(stdout, "FAIL")
+					fmt.Fprintf(stderr, "  %v\n", err)
+					failed = true
+				} else if deep {
+					if err := deepCheckVision(ctx, p); err != nil {
+						fmt.Fprintln(stdout, "FAIL (deep)")
+						fmt.Fprintf(stderr, "  deep: %v\n", err)
+						failed = true
+					} else {
+						fmt.Fprintln(stdout, "PASS (deep)")
+					}
+				} else {
+					fmt.Fprintln(stdout, "PASS")
+				}
 			}
 		}
 	}

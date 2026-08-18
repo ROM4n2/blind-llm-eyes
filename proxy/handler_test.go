@@ -32,6 +32,16 @@ func (m *mockVisionProvider) DescribeImage(ctx context.Context, base64Data, medi
 	return m.desc, nil
 }
 
+// mockVisionProviderWithBaseURL is a mockVisionProvider that also implements
+// the BaseURLAware interface, allowing tests to verify the runtime self-loop
+// guard for vision providers.
+type mockVisionProviderWithBaseURL struct {
+	mockVisionProvider
+	baseURL string
+}
+
+func (m *mockVisionProviderWithBaseURL) GetBaseURL() string { return m.baseURL }
+
 // 假上游：收到请求后把 body 原样回显
 func fakeUpstream(_ *testing.T, gotBody *[]byte) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1206,4 +1216,935 @@ func TestHandler_CacheHit_Scenarios(t *testing.T) {
 			t.Errorf("cached description not found in upstream body: %s", textVal)
 		}
 	})
+}
+
+// ── Self-loop protection tests ──
+
+func TestNewHandler_PanicsOnSelfReferentialUpstream(t *testing.T) {
+	mockVis := &mockVisionProvider{desc: "test"}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic for self-referential upstream URL, but handler was created successfully")
+		}
+	}()
+	_ = NewHandler(HandlerDeps{
+		UpstreamBaseURL: "http://127.0.0.1:8790",
+		VisionProvider:  mockVis,
+		Cache:           cache.NewLRU(10),
+		ListenAddr:      "127.0.0.1:8790",
+		Log:             slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	})
+}
+
+func TestNewHandler_DoesNotPanicOnDifferentPort(t *testing.T) {
+	mockVis := &mockVisionProvider{desc: "test"}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("unexpected panic for different port: %v", r)
+		}
+	}()
+	_ = NewHandler(HandlerDeps{
+		UpstreamBaseURL: "http://127.0.0.1:8080",
+		VisionProvider:  mockVis,
+		Cache:           cache.NewLRU(10),
+		ListenAddr:      "127.0.0.1:8790",
+		Log:             slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	})
+}
+
+func TestNewHandler_DoesNotPanicWithoutListenAddr(t *testing.T) {
+	mockVis := &mockVisionProvider{desc: "test"}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("unexpected panic without ListenAddr: %v", r)
+		}
+	}()
+	// Empty ListenAddr = skip self-reference check (backward compat)
+	_ = NewHandler(HandlerDeps{
+		UpstreamBaseURL: "http://127.0.0.1:8790",
+		VisionProvider:  mockVis,
+		Cache:           cache.NewLRU(10),
+		ListenAddr:      "",
+		Log:             slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	})
+}
+
+func TestHandler_SelfReferentialRuntimeGuard(t *testing.T) {
+	// Test the runtime guard in handleMessages: if ListenAddr is set but the
+	// upstream URL somehow matches, the handler should return 508 Loop Detected
+	// instead of forwarding.
+	mockVis := &mockVisionProvider{desc: "test"}
+	c := cache.NewLRU(10)
+
+	// Use a real upstream server that will be the target
+	var upstreamGot []byte
+	up := fakeUpstream(t, &upstreamGot)
+	defer up.Close()
+
+	// Test 1: non-self-referential → should work
+	deps := HandlerDeps{
+		UpstreamBaseURL:     strings.TrimSuffix(up.URL, "/"),
+		VisionProvider:      mockVis,
+		Cache:               c,
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		ListenAddr:          "127.0.0.1:8790",
+		Log:                 slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+	h := NewHandler(deps)
+
+	body := `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`
+	req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("non-self-referential: want 200, got %d", rr.Code)
+	}
+}
+
+func TestHandler_SelfReferentialReturns508(t *testing.T) {
+	// Test the runtime guard in handleMessages: directly construct a
+	// requestHandler with a self-referential config (bypassing NewHandler,
+	// which would panic at construction). The runtime guard should catch
+	// this and return 508 Loop Detected instead of forwarding.
+	//
+	// This simulates a scenario where the config is mutated after handler
+	// construction, or where NewHandler's check is somehow bypassed.
+	mockVis := &mockVisionProvider{desc: "test"}
+
+	// Capture logs to verify the error is logged
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	deps := HandlerDeps{
+		UpstreamBaseURL:     "http://127.0.0.1:8790",
+		VisionProvider:      mockVis,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		MaxBodyBytes:        20 << 20, // 20MB, required for body read
+		ListenAddr:          "127.0.0.1:8790",
+		Log:                 logger,
+		// Mark "deepseek-chat" as vision-capable → passthrough mode,
+		// skipping image processing (which would need AdaptiveConcurrency).
+		// The runtime guard runs AFTER image processing, before forwarding,
+		// so passthrough still exercises the guard.
+		VisionCapableModels: map[string]bool{"deepseek-chat": true},
+	}
+
+	// Directly construct requestHandler, bypassing NewHandler's constructor
+	// check. This is the only way to reach the runtime guard.
+	h := &requestHandler{
+		deps:   deps,
+		client: &http.Client{},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages", h.handleMessages)
+
+	// Send a text-only request (no images needed to hit the runtime guard,
+	// which runs before upstream forwarding).
+	body := `{"model":"deepseek-chat","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`
+	req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	// Verify: 508 Loop Detected
+	if rr.Code != http.StatusLoopDetected {
+		t.Fatalf("self-referential request: want status %d (Loop Detected), got %d", http.StatusLoopDetected, rr.Code)
+	}
+
+	// Verify: error message is clear and actionable
+	respBody := rr.Body.String()
+	if !strings.Contains(respBody, "loop detected") {
+		t.Errorf("response body should mention 'loop detected', got: %s", respBody)
+	}
+	if !strings.Contains(respBody, "upstream.base_url") {
+		t.Errorf("response body should mention 'upstream.base_url' config, got: %s", respBody)
+	}
+
+	// Verify: error is logged with relevant context
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "upstream URL points to proxy itself") {
+		t.Errorf("log should contain 'upstream URL points to proxy itself', got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "127.0.0.1:8790") {
+		t.Errorf("log should contain the listen address, got: %s", logOutput)
+	}
+
+	// Verify: vision provider was NOT called (request rejected before forwarding)
+	if mockVis.calls != 0 {
+		t.Errorf("vision provider should not be called on self-referential rejection, got %d calls", mockVis.calls)
+	}
+}
+
+func TestHandler_SelfReferentialLocalhostVariant(t *testing.T) {
+	// Variant: upstream uses "localhost" while proxy listens on "127.0.0.1".
+	// Should still be detected as self-referential (host normalization).
+	mockVis := &mockVisionProvider{desc: "test"}
+
+	deps := HandlerDeps{
+		UpstreamBaseURL:     "http://localhost:8790",
+		VisionProvider:      mockVis,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		MaxBodyBytes:        20 << 20,
+		ListenAddr:          "127.0.0.1:8790",
+		Log:                 slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		VisionCapableModels: map[string]bool{"m": true},
+	}
+
+	h := &requestHandler{
+		deps:   deps,
+		client: &http.Client{},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages", h.handleMessages)
+
+	body := `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
+	req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusLoopDetected {
+		t.Errorf("localhost variant: want %d, got %d", http.StatusLoopDetected, rr.Code)
+	}
+}
+
+func TestHandler_SelfReferentialDifferentPort(t *testing.T) {
+	// Negative test: upstream on a different port should NOT trigger 508.
+	// Use a real upstream server to confirm the request is forwarded normally.
+	var upstreamGot []byte
+	up := fakeUpstream(t, &upstreamGot)
+	defer up.Close()
+
+	mockVis := &mockVisionProvider{desc: "test"}
+
+	// Extract port from up.URL to use as ListenAddr (different from upstream port)
+	// up.URL is like http://127.0.0.1:RANDOM_PORT
+	listenAddr := "127.0.0.1:8790" // different from upstream's random port
+
+	deps := HandlerDeps{
+		UpstreamBaseURL:     strings.TrimSuffix(up.URL, "/"),
+		VisionProvider:      mockVis,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		ListenAddr:          listenAddr,
+		Log:                 slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+	h := NewHandler(deps)
+
+	body := `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`
+	req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code == http.StatusLoopDetected {
+		t.Error("different port should NOT trigger 508 Loop Detected")
+	}
+	if rr.Code != http.StatusOK {
+		t.Errorf("different port: want 200, got %d", rr.Code)
+	}
+}
+
+// fakeCountTokensUpstream returns a 200 with a JSON token-count response
+// (mirroring Anthropic's /v1/messages/count_tokens) and records the received
+// body and path. Used to verify handleCountTokens forwards verbatim.
+func fakeCountTokensUpstream(t *testing.T, gotBody *[]byte, gotPath *string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		*gotBody = b
+		*gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"input_tokens":42}`))
+	}))
+}
+
+// TestHandler_CountTokens_SelfReferential_Returns508 verifies the runtime
+// self-loop guard in handleCountTokens: when UpstreamBaseURL points to the
+// proxy's own listen address, the handler must return 508 Loop Detected
+// instead of forwarding (which would cause infinite recursion).
+//
+// NewHandler panics on this config, so we directly construct a
+// requestHandler to reach the runtime guard — simulating a scenario where
+// config is mutated after construction.
+func TestHandler_CountTokens_SelfReferential_Returns508(t *testing.T) {
+	mockVis := &mockVisionProvider{desc: "test"}
+
+	deps := HandlerDeps{
+		UpstreamBaseURL:     "http://127.0.0.1:8790",
+		VisionProvider:      mockVis,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		MaxBodyBytes:        20 << 20,
+		ListenAddr:          "127.0.0.1:8790",
+		Log:                 slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+
+	// Bypass NewHandler (which would panic) to reach the runtime guard.
+	h := &requestHandler{
+		deps:   deps,
+		client: &http.Client{},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages/count_tokens", h.handleCountTokens)
+
+	body := `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`
+	req, _ := http.NewRequest("POST", "/v1/messages/count_tokens", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusLoopDetected {
+		t.Fatalf("self-referential count_tokens: want %d (Loop Detected), got %d; body=%s",
+			http.StatusLoopDetected, rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "loop detected") {
+		t.Errorf("response body should mention 'loop detected', got: %s", rr.Body.String())
+	}
+}
+
+// TestHandler_CountTokens_Normal_Forwards verifies that a non-self-referential
+// count_tokens request is forwarded to upstream verbatim and the response is
+// copied back unchanged.
+func TestHandler_CountTokens_Normal_Forwards(t *testing.T) {
+	var gotBody []byte
+	var gotPath string
+	up := fakeCountTokensUpstream(t, &gotBody, &gotPath)
+	defer up.Close()
+
+	mockVis := &mockVisionProvider{desc: "test"}
+	deps := HandlerDeps{
+		UpstreamBaseURL:     strings.TrimSuffix(up.URL, "/"),
+		VisionProvider:      mockVis,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		ListenAddr:          "127.0.0.1:8790",
+		Log:                 slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+	h := NewHandler(deps)
+
+	body := `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`
+	req, _ := http.NewRequest("POST", "/v1/messages/count_tokens", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("normal count_tokens: want 200, got %d; body=%s", rr.Code, rr.Body.String())
+	}
+	if gotPath != "/v1/messages/count_tokens" {
+		t.Errorf("upstream path: got %q, want /v1/messages/count_tokens", gotPath)
+	}
+	if string(gotBody) != body {
+		t.Errorf("upstream body: got %q, want %q", gotBody, body)
+	}
+	if rr.Body.String() != `{"input_tokens":42}` {
+		t.Errorf("response body should be forwarded verbatim, got: %s", rr.Body.String())
+	}
+}
+
+// TestHandler_CountTokens_NoListenAddr_AllowForward verifies backward
+// compatibility: when ListenAddr is empty (e.g. older configs or tests that
+// don't set it), the runtime guard is skipped and the request is forwarded
+// normally — even if the URL happens to be self-referential. This preserves
+// the pre-guard behavior.
+func TestHandler_CountTokens_NoListenAddr_AllowForward(t *testing.T) {
+	var gotBody []byte
+	var gotPath string
+	up := fakeCountTokensUpstream(t, &gotBody, &gotPath)
+	defer up.Close()
+
+	mockVis := &mockVisionProvider{desc: "test"}
+	// ListenAddr intentionally empty — guard disabled
+	deps := HandlerDeps{
+		UpstreamBaseURL:     strings.TrimSuffix(up.URL, "/"),
+		VisionProvider:      mockVis,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		ListenAddr:          "",
+		Log:                 slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+	h := NewHandler(deps)
+
+	body := `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`
+	req, _ := http.NewRequest("POST", "/v1/messages/count_tokens", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code == http.StatusLoopDetected {
+		t.Fatalf("empty ListenAddr: should NOT trigger 508, got %d", rr.Code)
+	}
+	if rr.Code != http.StatusOK {
+		t.Errorf("empty ListenAddr: want 200, got %d; body=%s", rr.Code, rr.Body.String())
+	}
+	if string(gotBody) != body {
+		t.Errorf("upstream body: got %q, want %q", gotBody, body)
+	}
+}
+
+// TestHandler_CountTokens_DifferentPort_Forwards verifies that an upstream on
+// the same host but a different port than the proxy's listen address is NOT
+// flagged as self-referential — the request must be forwarded normally.
+func TestHandler_CountTokens_DifferentPort_Forwards(t *testing.T) {
+	var gotBody []byte
+	var gotPath string
+	up := fakeCountTokensUpstream(t, &gotBody, &gotPath)
+	defer up.Close()
+
+	mockVis := &mockVisionProvider{desc: "test"}
+	// ListenAddr is 127.0.0.1:8790; upstream is on a random port (different)
+	deps := HandlerDeps{
+		UpstreamBaseURL:     strings.TrimSuffix(up.URL, "/"),
+		VisionProvider:      mockVis,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		ListenAddr:          "127.0.0.1:8790",
+		Log:                 slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+	h := NewHandler(deps)
+
+	body := `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`
+	req, _ := http.NewRequest("POST", "/v1/messages/count_tokens", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code == http.StatusLoopDetected {
+		t.Fatalf("different port: should NOT trigger 508, got %d", rr.Code)
+	}
+	if rr.Code != http.StatusOK {
+		t.Errorf("different port: want 200, got %d; body=%s", rr.Code, rr.Body.String())
+	}
+	if string(gotBody) != body {
+		t.Errorf("upstream body: got %q, want %q", gotBody, body)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// P1: NewHandler constructor panic edge cases (host aliases / URL decorations)
+// ──────────────────────────────────────────────────────────────────────────
+
+// assertNewHandlerPanics is a helper that asserts NewHandler panics for the
+// given self-referential config. The panic message should mention both the
+// upstream URL and the listen address for actionable diagnostics.
+func assertNewHandlerPanics(t *testing.T, upstreamURL, listenAddr, label string) {
+	t.Helper()
+	mockVis := &mockVisionProvider{desc: "test"}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("%s: expected panic for upstream=%q listen=%q, but handler was created",
+				label, upstreamURL, listenAddr)
+		}
+		msg, _ := r.(string)
+		if !strings.Contains(msg, upstreamURL) {
+			t.Errorf("%s: panic message should contain upstream URL %q, got: %v", label, upstreamURL, r)
+		}
+		if !strings.Contains(msg, listenAddr) {
+			t.Errorf("%s: panic message should contain listen addr %q, got: %v", label, listenAddr, r)
+		}
+	}()
+	_ = NewHandler(HandlerDeps{
+		UpstreamBaseURL: upstreamURL,
+		VisionProvider:  mockVis,
+		Cache:           cache.NewLRU(10),
+		ListenAddr:      listenAddr,
+		Log:             slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	})
+}
+
+// P1-1: localhost alias should trigger panic at construction.
+func TestNewHandler_PanicsOnLocalhostAlias(t *testing.T) {
+	assertNewHandlerPanics(t, "http://localhost:8790", "127.0.0.1:8790", "localhost-alias")
+}
+
+// P1-2: 0.0.0.0 alias should trigger panic at construction.
+func TestNewHandler_PanicsOnZeroBindAlias(t *testing.T) {
+	assertNewHandlerPanics(t, "http://127.0.0.1:8790", "0.0.0.0:8790", "zero-bind-alias")
+}
+
+// P1-3: ::1 IPv6 loopback should trigger panic at construction.
+func TestNewHandler_PanicsOnIPv6Loopback(t *testing.T) {
+	assertNewHandlerPanics(t, "http://[::1]:8790", "127.0.0.1:8790", "ipv6-loopback")
+}
+
+// P1-4: URL with a path component should still trigger panic — the self-loop
+// check must not be confused by a trailing path like /anthropic/v1/messages.
+func TestNewHandler_PanicsOnURLWithPath(t *testing.T) {
+	assertNewHandlerPanics(t, "http://127.0.0.1:8790/anthropic/v1/messages", "127.0.0.1:8790", "url-with-path")
+}
+
+// P1-5: HTTPS scheme on the same port should trigger panic — scheme is
+// irrelevant for self-loop detection (same host:port = loop regardless).
+func TestNewHandler_PanicsOnHTTPSSamePort(t *testing.T) {
+	assertNewHandlerPanics(t, "https://127.0.0.1:8790", "127.0.0.1:8790", "https-same-port")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// P1: handleMessages runtime guard edge cases (host aliases / URL decorations / logs)
+// ──────────────────────────────────────────────────────────────────────────
+
+// buildSelfRefRuntimeHandler constructs a requestHandler directly (bypassing
+// NewHandler, which would panic) with the given self-referential config. This
+// is the only way to reach the runtime guard in handleMessages.
+//
+// The vision-capable model map makes the handler skip image processing
+// (which would require AdaptiveConcurrency) and go straight to the runtime
+// guard before upstream forwarding.
+func buildSelfRefRuntimeHandler(t *testing.T, upstreamURL, listenAddr string, logBuf *bytes.Buffer) *requestHandler {
+	t.Helper()
+	return buildSelfRefRuntimeHandlerWithVision(t, upstreamURL, listenAddr, logBuf, &mockVisionProvider{desc: "test"})
+}
+
+// buildSelfRefRuntimeHandlerWithVision is like buildSelfRefRuntimeHandler but
+// accepts an externally-owned mockVisionProvider so the caller can inspect
+// call counts after the request.
+func buildSelfRefRuntimeHandlerWithVision(t *testing.T, upstreamURL, listenAddr string, logBuf *bytes.Buffer, mockVis *mockVisionProvider) *requestHandler {
+	t.Helper()
+	var logger *slog.Logger
+	if logBuf != nil {
+		logger = slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	} else {
+		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	}
+	deps := HandlerDeps{
+		UpstreamBaseURL:     upstreamURL,
+		VisionProvider:      mockVis,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		MaxBodyBytes:        20 << 20,
+		ListenAddr:          listenAddr,
+		Log:                 logger,
+		VisionCapableModels: map[string]bool{"deepseek-chat": true},
+	}
+	return &requestHandler{
+		deps:   deps,
+		client: &http.Client{},
+	}
+}
+
+// sendSelfRefMessagesRequest dispatches a text-only /v1/messages POST to the
+// handler and returns the response recorder.
+func sendSelfRefMessagesRequest(h *requestHandler) *httptest.ResponseRecorder {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages", h.handleMessages)
+	body := `{"model":"deepseek-chat","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`
+	req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	return rr
+}
+
+// P1-6: handleMessages runtime guard catches localhost alias.
+func TestHandler_MessagesRuntimeGuard_LocalhostAlias(t *testing.T) {
+	h := buildSelfRefRuntimeHandler(t, "http://localhost:8790", "127.0.0.1:8790", nil)
+	rr := sendSelfRefMessagesRequest(h)
+	if rr.Code != http.StatusLoopDetected {
+		t.Fatalf("localhost alias: want 508, got %d; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// P1-7: handleMessages runtime guard catches 0.0.0.0 alias.
+func TestHandler_MessagesRuntimeGuard_ZeroBindAlias(t *testing.T) {
+	h := buildSelfRefRuntimeHandler(t, "http://127.0.0.1:8790", "0.0.0.0:8790", nil)
+	rr := sendSelfRefMessagesRequest(h)
+	if rr.Code != http.StatusLoopDetected {
+		t.Fatalf("0.0.0.0 alias: want 508, got %d; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// P1-8: handleMessages runtime guard catches URLs with path components.
+func TestHandler_MessagesRuntimeGuard_URLWithPath(t *testing.T) {
+	h := buildSelfRefRuntimeHandler(t, "http://127.0.0.1:8790/anthropic/v1/messages", "127.0.0.1:8790", nil)
+	rr := sendSelfRefMessagesRequest(h)
+	if rr.Code != http.StatusLoopDetected {
+		t.Fatalf("URL with path: want 508, got %d; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// P1-9: handleMessages runtime guard logs structured fields (stage, status,
+// upstream_url, listen_addr) for observability — required by logging conventions.
+func TestHandler_MessagesRuntimeGuard_LogFields(t *testing.T) {
+	var logBuf bytes.Buffer
+	h := buildSelfRefRuntimeHandler(t, "http://127.0.0.1:8790", "127.0.0.1:8790", &logBuf)
+	_ = sendSelfRefMessagesRequest(h)
+
+	logOut := logBuf.String()
+	// JSON handler emits structured fields; verify the key fields are present.
+	requiredFields := []string{
+		`"stage"`,
+		`"status"`,
+		`"upstream_url"`,
+		`"listen_addr"`,
+		`"upstream_request_start"`, // stage value
+		`"error"`,                  // status value
+	}
+	for _, f := range requiredFields {
+		if !strings.Contains(logOut, f) {
+			t.Errorf("log output missing field %s, got: %s", f, logOut)
+		}
+	}
+}
+
+// P1-10: when the runtime guard fires (508), the vision provider must NOT be
+// called — the request is rejected before any image processing or forwarding.
+// This guards against wasteful vision API calls on misconfigured loops.
+func TestHandler_MessagesRuntimeGuard_VisionNotCalled(t *testing.T) {
+	mockVis := &mockVisionProvider{desc: "test"}
+	h := buildSelfRefRuntimeHandlerWithVision(t, "http://127.0.0.1:8790", "127.0.0.1:8790", nil, mockVis)
+	rr := sendSelfRefMessagesRequest(h)
+	if rr.Code != http.StatusLoopDetected {
+		t.Fatalf("want 508, got %d", rr.Code)
+	}
+	if mockVis.calls != 0 {
+		t.Errorf("vision provider should NOT be called on 508, got %d calls", mockVis.calls)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// P1: handleCountTokens runtime guard edge cases (host aliases / URL decorations / headers)
+// ──────────────────────────────────────────────────────────────────────────
+
+// buildSelfRefCountTokensHandler constructs a requestHandler directly
+// (bypassing NewHandler) with a self-referential count_tokens config.
+func buildSelfRefCountTokensHandler(t *testing.T, upstreamURL, listenAddr string) *requestHandler {
+	t.Helper()
+	deps := HandlerDeps{
+		UpstreamBaseURL:     upstreamURL,
+		VisionProvider:      &mockVisionProvider{desc: "test"},
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		MaxBodyBytes:        20 << 20,
+		ListenAddr:          listenAddr,
+		Log:                 slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+	return &requestHandler{
+		deps:   deps,
+		client: &http.Client{},
+	}
+}
+
+// sendCountTokensRequest dispatches a POST /v1/messages/count_tokens to the
+// handler and returns the response recorder.
+func sendCountTokensRequest(h *requestHandler) *httptest.ResponseRecorder {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages/count_tokens", h.handleCountTokens)
+	body := `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`
+	req, _ := http.NewRequest("POST", "/v1/messages/count_tokens", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	return rr
+}
+
+// P1-11: count_tokens runtime guard catches localhost alias.
+func TestHandler_CountTokens_LocalhostAlias_Returns508(t *testing.T) {
+	h := buildSelfRefCountTokensHandler(t, "http://localhost:8790", "127.0.0.1:8790")
+	rr := sendCountTokensRequest(h)
+	if rr.Code != http.StatusLoopDetected {
+		t.Fatalf("localhost alias: want 508, got %d; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// P1-12: count_tokens runtime guard catches URLs with path components.
+func TestHandler_CountTokens_URLWithPath_Returns508(t *testing.T) {
+	h := buildSelfRefCountTokensHandler(t, "http://127.0.0.1:8790/anthropic", "127.0.0.1:8790")
+	rr := sendCountTokensRequest(h)
+	if rr.Code != http.StatusLoopDetected {
+		t.Fatalf("URL with path: want 508, got %d; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// P1-13: count_tokens 508 response should use text/plain charset=utf-8
+// (the default Content-Type set by http.Error) — not application/json, which
+// could confuse clients expecting a JSON error structure.
+func TestHandler_CountTokens_508_ContentType(t *testing.T) {
+	h := buildSelfRefCountTokensHandler(t, "http://127.0.0.1:8790", "127.0.0.1:8790")
+	rr := sendCountTokensRequest(h)
+	if rr.Code != http.StatusLoopDetected {
+		t.Fatalf("want 508, got %d", rr.Code)
+	}
+	ct := rr.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("508 Content-Type: got %q, want text/plain*", ct)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// P2: Concurrent request edge cases
+// ──────────────────────────────────────────────────────────────────────────
+
+// P2-7: concurrent self-referential /v1/messages requests should all return
+// 508 — the runtime guard is stateless and must be safe under concurrency.
+// Run with -race to catch any data races in the guard path.
+func TestHandler_MessagesRuntimeGuard_ConcurrentRequests(t *testing.T) {
+	h := buildSelfRefRuntimeHandler(t, "http://127.0.0.1:8790", "127.0.0.1:8790", nil)
+
+	const n = 20
+	var wg sync.WaitGroup
+	wg.Add(n)
+	results := make([]int, n)
+	for i := 0; i < n; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			rr := sendSelfRefMessagesRequest(h)
+			results[idx] = rr.Code
+		}(i)
+	}
+	wg.Wait()
+
+	for i, code := range results {
+		if code != http.StatusLoopDetected {
+			t.Errorf("goroutine %d: want 508, got %d", i, code)
+		}
+	}
+}
+
+// P2-8: concurrent self-referential count_tokens requests should all return
+// 508 — same as P2-7 but for the count_tokens path.
+func TestHandler_CountTokens_ConcurrentRequests(t *testing.T) {
+	h := buildSelfRefCountTokensHandler(t, "http://127.0.0.1:8790", "127.0.0.1:8790")
+
+	const n = 20
+	var wg sync.WaitGroup
+	wg.Add(n)
+	results := make([]int, n)
+	for i := 0; i < n; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			rr := sendCountTokensRequest(h)
+			results[idx] = rr.Code
+		}(i)
+	}
+	wg.Wait()
+
+	for i, code := range results {
+		if code != http.StatusLoopDetected {
+			t.Errorf("goroutine %d: want 508, got %d", i, code)
+		}
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// P3: NewHandler defensive (no-panic) cases
+// ──────────────────────────────────────────────────────────────────────────
+
+// P3-5: when ListenAddr is empty, NewHandler should NOT panic even if the
+// upstream URL happens to be self-referential — the guard is skipped to
+// preserve backward compatibility (older configs may not set ListenAddr).
+func TestNewHandler_EmptyListen_NoPanic(t *testing.T) {
+	mockVis := &mockVisionProvider{desc: "test"}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("NewHandler should NOT panic with empty ListenAddr, got: %v", r)
+		}
+	}()
+	_ = NewHandler(HandlerDeps{
+		UpstreamBaseURL: "http://127.0.0.1:8790", // would be self-referential if ListenAddr were set
+		VisionProvider:  mockVis,
+		Cache:           cache.NewLRU(10),
+		ListenAddr:      "", // empty → guard skipped
+		Log:             slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	})
+}
+
+// P3-6: when upstream URL is on a completely different host, NewHandler
+// should NOT panic — the self-loop guard only fires on host:port match.
+func TestNewHandler_DifferentHost_NoPanic(t *testing.T) {
+	mockVis := &mockVisionProvider{desc: "test"}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("NewHandler should NOT panic with different host, got: %v", r)
+		}
+	}()
+	_ = NewHandler(HandlerDeps{
+		UpstreamBaseURL: "https://api.deepseek.com/anthropic",
+		VisionProvider:  mockVis,
+		Cache:           cache.NewLRU(10),
+		ListenAddr:      "127.0.0.1:8790",
+		Log:             slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	})
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// P0: Vision base_url self-loop detection (NEW — previously uncovered)
+// ──────────────────────────────────────────────────────────────────────────
+
+// P0-V1: NewHandler should panic when VisionProvider's base_url points to
+// the proxy's own listen address (via BaseURLAware interface).
+func TestNewHandler_PanicsOnSelfReferentialVisionBaseURL(t *testing.T) {
+	mockVis := &mockVisionProviderWithBaseURL{
+		baseURL: "http://127.0.0.1:8790/anthropic",
+	}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for self-referential vision base_url, but handler was created")
+		}
+		msg, _ := r.(string)
+		if !strings.Contains(msg, "VisionProvider base_url") {
+			t.Errorf("panic message should mention VisionProvider base_url, got: %v", r)
+		}
+		if !strings.Contains(msg, "127.0.0.1:8790") {
+			t.Errorf("panic message should contain listen addr, got: %v", r)
+		}
+	}()
+	_ = NewHandler(HandlerDeps{
+		UpstreamBaseURL: "https://api.deepseek.com/anthropic",
+		VisionProvider:  mockVis,
+		Cache:           cache.NewLRU(10),
+		ListenAddr:      "127.0.0.1:8790",
+		Log:             slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	})
+}
+
+// P0-V2: NewHandler should NOT panic when VisionProvider's base_url is on a
+// different host (valid external vision API).
+func TestNewHandler_VisionDifferentHost_NoPanic(t *testing.T) {
+	mockVis := &mockVisionProviderWithBaseURL{
+		baseURL: "https://api.xiaomimimo.com/anthropic",
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("NewHandler should NOT panic with different vision host, got: %v", r)
+		}
+	}()
+	_ = NewHandler(HandlerDeps{
+		UpstreamBaseURL: "https://api.deepseek.com/anthropic",
+		VisionProvider:  mockVis,
+		Cache:           cache.NewLRU(10),
+		ListenAddr:      "127.0.0.1:8790",
+		Log:             slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	})
+}
+
+// P0-V3: NewHandler should NOT panic when VisionProvider doesn't implement
+// BaseURLAware (e.g. mock providers) — the check is skipped, falling back
+// to doctor/setup config-time detection.
+func TestNewHandler_VisionNotBaseURLAware_NoPanic(t *testing.T) {
+	mockVis := &mockVisionProvider{desc: "test"} // no GetBaseURL method
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("NewHandler should NOT panic when vision provider is not BaseURLAware, got: %v", r)
+		}
+	}()
+	_ = NewHandler(HandlerDeps{
+		UpstreamBaseURL: "https://api.deepseek.com/anthropic",
+		VisionProvider:  mockVis,
+		Cache:           cache.NewLRU(10),
+		ListenAddr:      "127.0.0.1:8790",
+		Log:             slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	})
+}
+
+// P0-V4: runtime self-loop guard should fire when VisionProvider's base_url
+// points to the proxy itself — the vision call returns an error instead of
+// causing an infinite loop. This test bypasses NewHandler (which would panic)
+// and directly constructs a requestHandler with a self-referential vision URL.
+func TestHandler_VisionRuntimeGuard_SelfReferential(t *testing.T) {
+	mockVis := &mockVisionProviderWithBaseURL{
+		baseURL: "http://127.0.0.1:8790/anthropic",
+	}
+
+	// Use a fake upstream that returns a minimal valid SSE response.
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("event: message_start\ndata: {}\n\n"))
+	}))
+	defer up.Close()
+
+	deps := HandlerDeps{
+		UpstreamBaseURL:     up.URL,
+		VisionProvider:      mockVis,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		MaxBodyBytes:        20 << 20,
+		ListenAddr:          "127.0.0.1:8790",
+		Log:                 slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		AdaptiveConcurrency: NewAdaptiveConcurrency(AdaptiveConcurrencyCfg{Enabled: false}, nil, nil),
+		// Do NOT set VisionCapableModels — force image processing path.
+	}
+	h := &requestHandler{
+		deps:   deps,
+		client: &http.Client{},
+	}
+
+	// Send a request with an image — the runtime guard should fire before
+	// the vision call, returning an error via errgroup.
+	body := `{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}}]}]}`
+	req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages", h.handleMessages)
+	mux.ServeHTTP(rr, req)
+
+	// The vision guard returns an error from the image-processing goroutine.
+	// With FailOpen=true, the proxy should still return 200 (graceful
+	// degradation), but the vision provider must NOT have been called.
+	if mockVis.calls != 0 {
+		t.Errorf("vision provider should NOT be called on self-loop guard, got %d calls", mockVis.calls)
+	}
+}
+
+// P0-V5: runtime self-loop guard should NOT fire when VisionProvider's
+// base_url is on a different host — the vision call proceeds normally.
+func TestHandler_VisionRuntimeGuard_DifferentHost(t *testing.T) {
+	mockVis := &mockVisionProviderWithBaseURL{
+		baseURL: "https://api.xiaomimimo.com/anthropic",
+	}
+
+	// Use a fake upstream that returns a minimal valid SSE response.
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("event: message_start\ndata: {}\n\n"))
+	}))
+	defer up.Close()
+
+	deps := HandlerDeps{
+		UpstreamBaseURL:     up.URL,
+		VisionProvider:      mockVis,
+		Cache:               cache.NewLRU(10),
+		FailOpen:            true,
+		LargeImageThreshold: 1_000_000,
+		MaxBodyBytes:        20 << 20,
+		ListenAddr:          "127.0.0.1:8790",
+		Log:                 slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		AdaptiveConcurrency: NewAdaptiveConcurrency(AdaptiveConcurrencyCfg{Enabled: false}, nil, nil),
+	}
+	h := &requestHandler{
+		deps:   deps,
+		client: &http.Client{},
+	}
+
+	body := `{"model":"m","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}}]}]}`
+	req, _ := http.NewRequest("POST", "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages", h.handleMessages)
+	mux.ServeHTTP(rr, req)
+
+	// Vision provider should have been called (no self-loop guard firing).
+	if mockVis.calls == 0 {
+		t.Errorf("vision provider should be called when base_url is external")
+	}
 }
