@@ -17,6 +17,11 @@ type TwoTier struct {
 	hot  *LRU
 	cold *SQLite
 	log  *slog.Logger
+	// Recorder is the optional tier lookup hook. When set, TwoTier itself
+	// records tier=hot/cold events; the nested hot LRU and cold SQLite
+	// Recorders are NOT touched by TwoTier — so callers who want granular
+	// per-backend metrics can set hot.Recorder and cold.Recorder separately.
+	Recorder TierRecorder
 
 	// shards serialize the Get "query cold → backfill hot" step per-key to
 	// prevent a thundering herd of concurrent waiters all backfilling the same
@@ -54,19 +59,42 @@ func (t *TwoTier) shard(key string) *sync.Mutex {
 }
 
 func (t *TwoTier) Get(key string) (string, bool) {
-	// 1) hot layer
-	if v, ok := t.hot.Get(key); ok {
+	// 1) hot layer. Avoid counting via t.hot's internal LRU recorder (which
+	// would be tier="lru") by not setting it — instead we record tier="hot"
+	// at the TwoTier level so operators see "hot" and "cold" as a unified
+	// pair that sum to 100% of TwoTier lookups.
+	t.hot.mu.Lock()
+	if e, ok := t.hot.items[key]; ok {
+		t.hot.ll.MoveToFront(e)
+		v := e.Value.(*entry).value
+		t.hot.mu.Unlock()
+		if t.Recorder != nil {
+			t.Recorder.OnLookup("hot", "hit")
+		}
 		return v, true
 	}
+	t.hot.mu.Unlock()
+	if t.Recorder != nil {
+		t.Recorder.OnLookup("hot", "miss")
+	}
+
 	// 2) cold layer + backfill (sharded lock to avoid herd without
-	// serializing unrelated keys)
+	// serializing unrelated keys). Cold SQLite Get hook emits tier=cold via
+	// its own Recorder if set, so we skip double-counting at this level.
 	mu := t.shard(key)
 	mu.Lock()
 	defer mu.Unlock()
 	// double-check: another goroutine may have just backfilled hot.
-	if v, ok := t.hot.Get(key); ok {
+	t.hot.mu.Lock()
+	if e, ok := t.hot.items[key]; ok {
+		t.hot.ll.MoveToFront(e)
+		v := e.Value.(*entry).value
+		t.hot.mu.Unlock()
+		// Don't emit another hot/hit — this is a re-check after hot miss was
+		// already logged above; re-counting would make hot hits > cold misses.
 		return v, true
 	}
+	t.hot.mu.Unlock()
 	desc, ok := t.cold.Get(key)
 	if !ok {
 		return "", false
@@ -79,3 +107,12 @@ func (t *TwoTier) Put(key, value string) {
 	t.hot.Put(key, value)
 	t.cold.Put(key, value) // best-effort; Put logs internally on error
 }
+
+// ColdRecorder returns the current cold SQLite Recorder. Used by the proxy
+// metrics adapter to attach a SAME tier-recorder to the SQLite cold layer
+// as the TwoTier hot layer, so operators get a unified hot+cold pair where
+// cold events are also visible.
+func (t *TwoTier) ColdRecorder() TierRecorder { return t.cold.Recorder }
+
+// SetColdRecorder sets the cold SQLite Recorder. nil clears.
+func (t *TwoTier) SetColdRecorder(r TierRecorder) { t.cold.Recorder = r }

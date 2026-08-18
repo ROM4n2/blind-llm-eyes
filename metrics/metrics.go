@@ -36,6 +36,42 @@ type Metrics struct {
 	ProviderDuration    *prometheus.HistogramVec
 	CircuitBreakerState *prometheus.GaugeVec
 	FailoverEventsTotal prometheus.Counter
+
+	// ── v1.3.0 P0: cache tiered observability + circuit breaker transitions ──
+	// CacheHitsTotal counts per-tier hit/miss lookups so operators can compute
+	// tier-specific hit ratios and detect cold-layer thrash (high cold miss →
+	// LRU size too small for working set, or SQLite DB missing).
+	// Labels:
+	//   tier   = "hot"  (TwoTier in-memory LRU)
+	//          | "cold" (TwoTier SQLite persistence)
+	//          | "lru"  (single-tier LRU, no cold layer)
+	//   result = "hit" | "miss"
+	CacheHitsTotal *prometheus.CounterVec
+
+	// CacheRowCount reports the number of rows in each durable cache backend.
+	// Currently only backend="sqlite" emits a value; LRU-only deployments leave
+	// this gauge absent (no labels set). Helps operators size SQLite vacuum
+	// intervals and detect unbounded growth when TTL is disabled.
+	CacheRowCount *prometheus.GaugeVec
+
+	// CacheDriftPct is the drift between the in-memory SQLite row counter
+	// (MemoryCount) and the true DB row count (ActualCount) expressed as a
+	// percentage. 0% = perfect sync. Positive % = memory counter overcounts
+	// vs reality (e.g. external DELETE or evict CAS racing). Values > ~5% for
+	// sustained periods warrant investigation (trigger DB reconciliation in
+	// a future release).
+	// This gauge is ONLY set when a cache health check (or doctor) runs both
+	// counts; it is not updated on the hot path to avoid O(N) queries.
+	CacheDriftPct prometheus.Gauge
+
+	// CBTransitions counts every circuit breaker state change with the full
+	// (provider, from, to) triple. Complements CircuitBreakerState gauge which
+	// only reports the current value per provider — this counter lets
+	// dashboards show churning rate (CB flapping = upstream provider is
+	// oscillating between healthy/dead, consider raising failure_threshold or
+	// lowering provider priority).
+	// Labels: provider, from ∈ {closed, open, half_open}, to ∈ same set.
+	CBTransitions *prometheus.CounterVec
 }
 
 // NewMetrics 创建并注册所有指标。
@@ -163,6 +199,38 @@ func NewMetrics() *Metrics {
 				Name: "blind_llm_eyes_failover_events_total",
 				Help: "Total number of provider failover events (a provider failed and the next was tried).",
 			},
+		),
+
+		// ── v1.3.0 P0 metrics ──
+		CacheHitsTotal: promauto.With(reg).NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "blind_llm_eyes_cache_hits_total",
+				Help: "Per-tier cache lookups (hit/miss). tier=hot|cold|lru; allows dashboards to compute TwoTier hit ratios per layer.",
+			},
+			[]string{"tier", "result"},
+		),
+
+		CacheRowCount: promauto.With(reg).NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "blind_llm_eyes_cache_row_count",
+				Help: "Current durable-cache row count by backend. Only 'sqlite' backend emits; LRU-only deployments have no samples.",
+			},
+			[]string{"backend"},
+		),
+
+		CacheDriftPct: promauto.With(reg).NewGauge(
+			prometheus.GaugeOpts{
+				Name: "blind_llm_eyes_cache_drift_pct",
+				Help: "SQLite in-memory counter drift vs actual DB count, as a percentage. Set only by cache/doctor health probes (not hot path).",
+			},
+		),
+
+		CBTransitions: promauto.With(reg).NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "blind_llm_eyes_circuit_breaker_transitions_total",
+				Help: "All circuit breaker state transitions, labeled by provider, from-state and to-state. Detect flapping providers via rate(this[5m]).",
+			},
+			[]string{"provider", "from", "to"},
 		),
 	}
 

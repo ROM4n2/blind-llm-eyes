@@ -9,6 +9,19 @@ type Cache interface {
 	Put(key, value string)
 }
 
+// TierRecorder is the optional observability hook for cache implementations.
+// On each Get, implementations call OnLookup(tier, result) so a single
+// counter (metrics.CacheHitsTotal) can be partitioned by tier + outcome
+// without making the cache package directly depend on the metrics package
+// (which would cause a circular import through proxy).
+//
+// Zero-value (nil) = no recording; hot-path overhead is a single nil-check.
+type TierRecorder interface {
+	// OnLookup fires exactly once per logical tier access.
+	// tier ∈ {"hot", "cold", "lru"}; result ∈ {"hit", "miss"}.
+	OnLookup(tier, result string)
+}
+
 // Compile-time assertions that concrete types satisfy the Cache interface.
 var (
 	_ Cache = (*LRU)(nil)

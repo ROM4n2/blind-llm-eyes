@@ -162,6 +162,13 @@ func (p *Pool) describeImageInternal(ctx context.Context, base64Data, mediaType 
 				"consecutive_fails", statsAfterAllow.ConsecutiveFails,
 				"failure_threshold", statsAfterAllow.FailureThreshold,
 			)
+			if p.m != nil && p.m.CBTransitions != nil {
+				p.m.CBTransitions.WithLabelValues(
+					entry.Name,
+					statsBefore.State.String(),
+					statsAfterAllow.State.String(),
+				).Inc()
+			}
 		}
 
 		// 2. 日志：provider 调用开始 — 记录调用前的上下文
@@ -207,6 +214,13 @@ func (p *Pool) describeImageInternal(ctx context.Context, base64Data, mediaType 
 					"from_state", statsBeforeRecord.State.String(),
 					"to_state", statsAfterRecord.State.String(),
 				)
+				if p.m != nil && p.m.CBTransitions != nil {
+					p.m.CBTransitions.WithLabelValues(
+						entry.Name,
+						statsBeforeRecord.State.String(),
+						statsAfterRecord.State.String(),
+					).Inc()
+				}
 			}
 
 			log.Info("provider succeeded",
@@ -253,6 +267,13 @@ func (p *Pool) describeImageInternal(ctx context.Context, base64Data, mediaType 
 				"failure_threshold", statsAfterRecord.FailureThreshold,
 				"reset_timeout_ms", statsAfterRecord.ResetTimeout.Milliseconds(),
 			)
+			if p.m != nil && p.m.CBTransitions != nil {
+				p.m.CBTransitions.WithLabelValues(
+					entry.Name,
+					statsBeforeRecord.State.String(),
+					statsAfterRecord.State.String(),
+				).Inc()
+			}
 		}
 
 		isLast := i == len(p.providers)-1

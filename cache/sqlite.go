@@ -21,6 +21,7 @@ type SQLite struct {
 	log        *slog.Logger
 	count      atomic.Int64 // in-memory row counter; avoids per-Put COUNT(*)
 	evicting   atomic.Bool  // CAS guard: at most one evict in flight at a time
+	Recorder   TierRecorder // optional; nil = no tier metrics (cold events)
 }
 
 const (
@@ -199,11 +200,20 @@ func (s *SQLite) Get(key string) (string, bool) {
 	var desc string
 	err := s.db.QueryRow(sqlGet, key).Scan(&desc)
 	if err == sql.ErrNoRows {
+		if s.Recorder != nil {
+			s.Recorder.OnLookup("cold", "miss")
+		}
 		return "", false
 	}
 	if err != nil {
-		s.log.Warn("sqlite get", "err", err, "key", key)
+		s.log.Warn("sqlite get", "key", key, "err", err)
+		// Errors (corrupt, locked) look like a miss to callers. Don't report to
+		// recorder so cold-miss ratios aren't polluted by infrastructure
+		// faults — operators see those via logs/errors_total.
 		return "", false
+	}
+	if s.Recorder != nil {
+		s.Recorder.OnLookup("cold", "hit")
 	}
 	// Touch access time (best-effort; failure does not invalidate the hit).
 	if _, err := s.db.Exec(sqlTouchAccess, nowMillis(), key); err != nil {

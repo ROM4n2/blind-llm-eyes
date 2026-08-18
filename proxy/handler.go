@@ -110,6 +110,27 @@ func NewHandler(deps HandlerDeps) http.Handler {
 	if deps.Cache == nil {
 		deps.Cache = cache.NewLRU(1000)
 	}
+	// Wire cache tier lookup metrics (P0). Use a small adapter that maps
+	// cache.TierRecorder.OnLookup → metrics.CacheHitsTotal.Inc(). The adapter
+	// is only attached when deps.Metrics is non-nil to preserve test zero-
+	// value behavior (nil Recorder = per-call single nil check, no allocation).
+	if deps.Metrics != nil {
+		rec := &cacheMetricsRecorder{m: deps.Metrics}
+		switch c := deps.Cache.(type) {
+		case *cache.LRU:
+			c.Recorder = rec
+		case *cache.TwoTier:
+			c.Recorder = rec
+			// For TwoTier we also want tier=cold events at SQLite level.
+			// Using the SAME adapter lets users see hot+cold summed. If we
+			// ever need backend-specific split (e.g. to measure SQLite cold
+			// query latency vs hot), separate recorders can be attached.
+			if c.ColdRecorder() == nil {
+				c.SetColdRecorder(rec)
+			}
+		// Unknown Cache implementations (e.g. mocks in tests) — no hook.
+		}
+	}
 	if deps.AdaptiveConcurrency == nil {
 		deps.AdaptiveConcurrency = NewAdaptiveConcurrency(AdaptiveConcurrencyCfg{
 			Enabled:      false,
@@ -171,6 +192,24 @@ type requestHandler struct {
 	sf     singleflight.Group // 进程级 in-flight 去重，跨请求合并同 hash vision 调用
 	client *http.Client       // 上游 HTTP 客户端，带连接超时和连接池
 }
+
+// cacheMetricsRecorder adapts metrics.CacheHitsTotal to satisfy cache.TierRecorder.
+// A single zero-allocation interface value (pointer to struct) plugs into LRU,
+// TwoTier, and SQLite Recorder fields.
+type cacheMetricsRecorder struct {
+	m *metrics.Metrics
+}
+
+// OnLookup emits cache_hits_total{tier,result}. Increments once per logical
+// tier lookup — see metrics.go for label cardinality and value constraints.
+func (c *cacheMetricsRecorder) OnLookup(tier, result string) {
+	if c == nil || c.m == nil || c.m.CacheHitsTotal == nil {
+		return
+	}
+	c.m.CacheHitsTotal.WithLabelValues(tier, result).Inc()
+}
+
+var _ cache.TierRecorder = (*cacheMetricsRecorder)(nil)
 
 // handleCountTokens forwards POST /v1/messages/count_tokens to upstream
 // verbatim — no image rewriting, no vision calls, no caching. Claude Code

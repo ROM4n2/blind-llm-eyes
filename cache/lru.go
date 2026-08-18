@@ -7,10 +7,11 @@ import (
 
 // LRU 是线程安全的 hash→描述 缓存。零值不可用，用 NewLRU。
 type LRU struct {
-	mu    sync.Mutex
-	cap   int
-	ll    *list.List // 最近用的在 front
-	items map[string]*list.Element
+	mu       sync.Mutex
+	cap      int
+	ll       *list.List // 最近用的在 front
+	items    map[string]*list.Element
+	Recorder TierRecorder // 可选指标回调；nil = 不埋点
 }
 
 type entry struct {
@@ -31,7 +32,13 @@ func (c *LRU) Get(key string) (string, bool) {
 	defer c.mu.Unlock()
 	if e, ok := c.items[key]; ok {
 		c.ll.MoveToFront(e)
+		if c.Recorder != nil {
+			c.Recorder.OnLookup("lru", "hit")
+		}
 		return e.Value.(*entry).value, true
+	}
+	if c.Recorder != nil {
+		c.Recorder.OnLookup("lru", "miss")
 	}
 	return "", false
 }
