@@ -1,6 +1,6 @@
 # Changelog
 
-## [v1.3.0] — 2026-08-XX
+## [v1.3.0] — 2026-08-18
 
 **迭代范围**：2026-08-18 设计，约 6 周，≈12 commits。Plan A Balanced Ops: 3×P0 + 5×P1，
 遵循可观测性与运维增强主题。零破坏性变更；所有 v1.2.0 配置文件无需修改即兼容。
@@ -93,7 +93,7 @@ vision_capable_models / metrics_auth_token / debug_pprof_enabled 字段块和 *i
 
 ---
 
-**版本状态**：待发布（等待 Release Gate §0.1.3 逐项打勾后 tag `v1.3.0`）。
+**版本状态**：v1.3.0 GA 已发布（2026-08-18）。Release Gate 全部通过，tag `v1.3.0` 已打。
 
 ## [v1.2.0] — 2026-08-18
 
