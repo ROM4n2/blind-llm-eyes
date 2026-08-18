@@ -1,13 +1,18 @@
 // Package admin implements the POST /admin/shutdown endpoint used by the
-// "blind-llm-eyes stop" subcommand to trigger a graceful server shutdown.
+// "blind-llm-eyes stop" subcommand to trigger a graceful server shutdown,
+// and POST /admin/reload used by "blind-llm-eyes reload" and SIGHUP to
+// hot-reload the configuration without restarting the process.
 package admin
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"net/http"
 	"sync"
+
+	"github.com/ROM4n2/blind-llm-eyes/config"
 )
 
 // ShutdownHandler validates the X-Admin-Token header and, on match, signals
@@ -43,7 +48,7 @@ func (h *ShutdownHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if r.Header.Get("X-Admin-Token") != h.token {
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Admin-Token")), []byte(h.token)) != 1 {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -60,4 +65,59 @@ func MustGenerateToken(n int) string {
 		panic(fmt.Sprintf("admin: generate token: %v", err))
 	}
 	return hex.EncodeToString(b)
+}
+
+// ReloadHandler validates the X-Admin-Token header and, on match, calls
+// ReloadableConfig.Reload() to atomically swap to a new config snapshot.
+// It is safe for concurrent use (ReloadableConfig has its own internal mutex).
+// Unlike ShutdownHandler, reload can be triggered multiple times — each call
+// re-reads the yaml file and attempts a swap.
+type ReloadHandler struct {
+	token string
+	cfg   *config.ReloadableConfig
+}
+
+// NewReloadHandler creates a handler bound to the given token and config.
+// token is the SAME admin token used by ShutdownHandler (shared via pidfile).
+// cfg must be non-nil and should have been initialized with the yaml path
+// so Reload() can re-read the file.
+func NewReloadHandler(token string, cfg *config.ReloadableConfig) *ReloadHandler {
+	return &ReloadHandler{token: token, cfg: cfg}
+}
+
+// Token returns the admin token (for symmetry with ShutdownHandler; not
+// strictly needed since the token is shared, but useful for tests).
+func (h *ReloadHandler) Token() string { return h.token }
+
+// ServeHTTP implements http.Handler.
+//   - POST with matching X-Admin-Token → 200 + JSON body with old/new fingerprint
+//   - POST with wrong/missing token → 403
+//   - POST when Reload() fails (yaml error, non-reloadable field change) → 500
+//   - Other methods → 405
+func (h *ReloadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Admin-Token")), []byte(h.token)) != 1 {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	prev, next, err := h.cfg.Reload()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "reload failed: %v\n", err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	prevFp := "unknown"
+	nextFp := "unknown"
+	if prev != nil {
+		prevFp = prev.VersionFingerprint()
+	}
+	if next != nil {
+		nextFp = next.VersionFingerprint()
+	}
+	fmt.Fprintf(w, `{"status":"ok","prev_fingerprint":%q,"next_fingerprint":%q}`+"\n", prevFp, nextFp)
 }

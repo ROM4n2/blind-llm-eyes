@@ -55,6 +55,11 @@ func runServer(args []string) {
 		os.Exit(1)
 	}
 
+	// Wrap cfg in ReloadableConfig for SIGHUP + /admin/reload hot-reload.
+	// The initial snapshot is the freshly-loaded cfg; subsequent Reload()
+	// calls re-read *configPath and atomically swap the pointer.
+	rcfg := config.NewReloadableConfig(cfg, *configPath)
+
 	// 使用 JSON 结构化异步日志
 	logger, logWriter := logging.NewLogger(cfg.LogLevel)
 	defer logWriter.Close()
@@ -228,6 +233,8 @@ func runServer(args []string) {
 	adminToken := admin.MustGenerateToken(32)
 	adminH := admin.NewShutdownHandler(adminToken)
 	mux.Handle("/admin/shutdown", adminH)
+	reloadH := admin.NewReloadHandler(adminToken, rcfg)
+	mux.Handle("/admin/reload", reloadH)
 	pid := os.Getpid()
 	if err := cli.WritePidfile(pidfilePath, cli.PidfileData{
 		PID:       pid,
@@ -255,7 +262,7 @@ func runServer(args []string) {
 	}()
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
 	// gracefulShutdown stops accepting new requests, drains in-flight work, then
 	// returns so the deferred pidfile removal + log flush run. Shared by the
@@ -275,16 +282,51 @@ func runServer(args []string) {
 		logger.Info("all in-flight requests completed, shutting down")
 	}
 
-	select {
-	case err := <-errCh:
-		logger.Error("server failed", "err", err)
-		os.Remove(pidfilePath) // defers don't run before os.Exit
-		logWriter.Close()
-		os.Exit(1)
-	case sig := <-sigCh:
-		gracefulShutdown(fmt.Sprintf("signal %s", sig))
-	case <-adminH.Done():
-		gracefulShutdown("admin request")
+	// doReload wraps rcfg.Reload with structured logging. Returns true if the
+	// config was successfully swapped.
+	doReload := func(source string) bool {
+		prev, next, err := rcfg.Reload()
+		if err != nil {
+			logger.Error("config reload failed",
+				"source", source,
+				"err", err,
+			)
+			return false
+		}
+		prevFp := "unknown"
+		nextFp := "unknown"
+		if prev != nil {
+			prevFp = prev.VersionFingerprint()
+		}
+		if next != nil {
+			nextFp = next.VersionFingerprint()
+		}
+		logger.Info("config reloaded",
+			"source", source,
+			"prev_fingerprint", prevFp,
+			"next_fingerprint", nextFp,
+		)
+		return true
+	}
+
+	for {
+		select {
+		case err := <-errCh:
+			logger.Error("server failed", "err", err)
+			os.Remove(pidfilePath) // defers don't run before os.Exit
+			logWriter.Close()
+			os.Exit(1)
+		case sig := <-sigCh:
+			if sig == syscall.SIGHUP {
+				doReload("SIGHUP")
+				continue // don't shut down; keep serving
+			}
+			gracefulShutdown(fmt.Sprintf("signal %s", sig))
+			return
+		case <-adminH.Done():
+			gracefulShutdown("admin request")
+			return
+		}
 	}
 }
 
