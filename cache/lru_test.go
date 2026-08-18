@@ -34,3 +34,19 @@ func TestLRU_GetPromotes(t *testing.T) {
 		t.Errorf("a should survive")
 	}
 }
+
+// TestLRU_Close_NoOp confirms the in-memory LRU has no backing resources:
+// Close returns nil and is effectively a no-op (subsequent Get still works
+// since nothing was released). This satisfies the Cache interface contract
+// used by the shutdown / reload swap paths.
+func TestLRU_Close_NoOp(t *testing.T) {
+	c := NewLRU(2)
+	c.Put("k", "v")
+	if err := c.Close(); err != nil {
+		t.Fatalf("LRU.Close returned error: %v", err)
+	}
+	// In-memory state is untouched by the no-op Close.
+	if got, ok := c.Get("k"); !ok || got != "v" {
+		t.Errorf("after Close: Get(k) = (%q,%v), want (v,true)", got, ok)
+	}
+}

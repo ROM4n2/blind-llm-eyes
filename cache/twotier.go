@@ -108,6 +108,12 @@ func (t *TwoTier) Put(key, value string) {
 	t.cold.Put(key, value) // best-effort; Put logs internally on error
 }
 
+// Close releases the cold-layer resources (the SQLite file handle). The hot
+// LRU's Close is a no-op. Calling Close renders the TwoTier unusable for
+// further Get/Put (cold queries will error); it is intended for the
+// graceful-shutdown and config-reload swap paths.
+func (t *TwoTier) Close() error { return t.cold.Close() }
+
 // ColdRecorder returns the current cold SQLite Recorder. Used by the proxy
 // metrics adapter to attach a SAME tier-recorder to the SQLite cold layer
 // as the TwoTier hot layer, so operators get a unified hot+cold pair where

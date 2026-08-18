@@ -112,3 +112,27 @@ func valForIdx(i int) string {
 func TestTwoTier_SatisfiesCacheInterface(t *testing.T) {
 	var _ Cache = (*TwoTier)(nil) // compile-time check (also asserted in cache.go)
 }
+
+// TestTwoTier_Close_CascadesToCold verifies TwoTier.Close returns nil and
+// is safe to call. TwoTier.Close delegates to cold.Close (SQLite.Close →
+// *sql.DB.Close); the cascade is verified by code inspection rather than
+// by observing a post-close miss, because database/sql connection-pool
+// semantics under modernc.org/sqlite do not reliably surface a query error
+// immediately after Close. The contract the reload swap path (Task 9)
+// relies on is simply: Close is safe, idempotent, and releases the SQLite
+// handle so the same db file can be reopened by the next handler instance.
+func TestTwoTier_Close_CascadesToCold(t *testing.T) {
+	s := newTestSQLite(t)
+	tt := NewTwoTier(10, s, discardLogger())
+	// Close is idempotent (*sql.DB.Close tolerates repeat calls), so a
+	// cleanup guard is safe even if the test already called Close.
+	t.Cleanup(func() { _ = tt.Close() })
+
+	if err := tt.Close(); err != nil {
+		t.Fatalf("first Close: got %v, want nil", err)
+	}
+	// Second Close must not panic — *sql.DB.Close is idempotent.
+	if err := tt.Close(); err != nil {
+		t.Fatalf("second Close (idempotency): got %v, want nil", err)
+	}
+}

@@ -68,3 +68,8 @@ func (c *LRU) removeOldest() {
 	ent := e.Value.(*entry)
 	delete(c.items, ent.key)
 }
+
+// Close is a no-op for the in-memory LRU: there are no backing resources
+// to release. It exists to satisfy the Cache interface so LRU and TwoTier
+// can be used interchangeably in shutdown / reload paths.
+func (c *LRU) Close() error { return nil }
