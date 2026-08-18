@@ -1,9 +1,14 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -347,5 +352,106 @@ func Load(path string) (*Config, error) {
 	if len(c.VisionProviders) == 0 && c.Vision.BaseURL == "" {
 		return nil, fmt.Errorf("vision.base_url or vision_providers is required")
 	}
+	if err := validate(&c); err != nil {
+		return nil, fmt.Errorf("validate: %w", err)
+	}
 	return &c, nil
+}
+
+// validate checks Config invariants that apply both at startup and reload.
+// Returns nil when valid. Non-nil causes Load (startup) or Reload (runtime)
+// to abort with the descriptive message.
+func validate(c *Config) error {
+	if strings.TrimSpace(c.Listen) == "" {
+		return fmt.Errorf("config.listen: must not be empty")
+	}
+	if c.ConcurrencyLimit < 1 {
+		c.ConcurrencyLimit = 4
+	}
+	return nil
+}
+
+// ReloadableConfig holds the current *Config snapshot, atomically swap-able.
+// Callers MUST call Load() once per request/tick scope into a local variable,
+// then read all fields off that frozen snapshot — never call Load() multiple
+// times in the same logical scope because fields could straddle two versions.
+type ReloadableConfig struct {
+	current atomic.Pointer[Config]
+	mu      sync.Mutex // serializes concurrent Reload() calls (SIGHUP vs HTTP)
+	path    string     // config.yaml source path (for reload file read)
+}
+
+// NewReloadableConfig wraps the given initial Config with atomic swap semantics.
+// path is informational (for Reload() to know what yaml to re-read); empty OK.
+func NewReloadableConfig(cfg *Config, path string) *ReloadableConfig {
+	r := &ReloadableConfig{path: path}
+	r.current.Store(cfg)
+	return r
+}
+
+// Load returns the *Config snapshot. Never nil after NewReloadableConfig().
+// The caller MUST NOT mutate the returned struct.
+func (r *ReloadableConfig) Load() *Config {
+	return r.current.Load()
+}
+
+// Reload re-reads r.path as yaml, validates it, then atomically swaps to the
+// new Config. Returns (prev, next, err). On any validation error the swap is
+// NOT performed — prev == next == old config, err is descriptive.
+// Process-wide mutex serializes overlapping reloads from SIGHUP vs HTTP.
+func (r *ReloadableConfig) Reload() (prev, next *Config, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	prev = r.current.Load()
+	next, err = Load(r.path) // reuse existing loader + validate
+	if err != nil {
+		return prev, prev, err // ROLLBACK: keep old
+	}
+	// Non-reloadable field guard (spec §2.2): refuse changes to fields that
+	// require restart. This prevents silent misconfiguration.
+	if prev.Listen != next.Listen {
+		return prev, prev, fmt.Errorf("field 'listen' is non-reloadable (restart required)")
+	}
+	if prev.Upstream.BaseURL != next.Upstream.BaseURL {
+		return prev, prev, fmt.Errorf("field 'upstream.base_url' is non-reloadable (restart required)")
+	}
+	if prev.Upstream.APIKey != next.Upstream.APIKey {
+		return prev, prev, fmt.Errorf("field 'upstream.api_key' is non-reloadable (restart required)")
+	}
+	if prev.MetricsAuthToken != next.MetricsAuthToken {
+		return prev, prev, fmt.Errorf("field 'metrics_auth_token' is non-reloadable (restart required)")
+	}
+	if prev.Cache.DBPath != next.Cache.DBPath {
+		return prev, prev, fmt.Errorf("field 'cache.db_path' is non-reloadable (restart required)")
+	}
+	r.current.Store(next)
+	return prev, next, nil
+}
+
+// TestReloadFromConfig skips yaml parsing and swaps directly to `next` after
+// validate(). Used only in unit tests to avoid writing temp yaml files for
+// every test. NOT safe for production code because it bypasses the
+// non-reloadable field boundary checks — those are handled by Reload() which
+// wraps Load().
+func (r *ReloadableConfig) TestReloadFromConfig(next *Config) (prev, after *Config, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	prev = r.current.Load()
+	if err = validate(next); err != nil {
+		return prev, prev, err
+	}
+	r.current.Store(next)
+	return prev, next, nil
+}
+
+// VersionFingerprint returns a short deterministic hash of the current Config
+// for log diffing (e.g. "applied reload v1→v2"). Uses the yaml-marshaled form
+// so any semantic change → different hash. Non-cryptographic length (16 hex).
+func (c *Config) VersionFingerprint() string {
+	b, err := yaml.Marshal(c)
+	if err != nil {
+		return "err:" + err.Error()
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])[:16]
 }

@@ -3,9 +3,74 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
+
+func TestReloadableConfig_LoadAfterSwap(t *testing.T) {
+	cfg1 := &Config{Listen: "127.0.0.1:8790", LogLevel: "info"}
+	rcfg := NewReloadableConfig(cfg1, "config.yaml")
+	if got := rcfg.Load(); got.Listen != cfg1.Listen {
+		t.Fatalf("initial load mismatch: %v != %v", got.Listen, cfg1.Listen)
+	}
+	cfg2 := &Config{Listen: "127.0.0.1:8790", LogLevel: "debug"} // same non-reloadable fields
+	_, _, err := rcfg.TestReloadFromConfig(cfg2) // test-internal helper bypasses yaml
+	if err != nil {
+		t.Fatalf("reload err: %v", err)
+	}
+	if got := rcfg.Load(); got.LogLevel != "debug" {
+		t.Fatalf("after reload want debug, got %v", got.LogLevel)
+	}
+}
+
+func TestReloadableConfig_ConcurrentLoadNoRace(t *testing.T) {
+	rcfg := NewReloadableConfig(&Config{Listen: "127.0.0.1:8790"}, "config.yaml")
+	// Atomic swap every ms, 100 goroutines doing Load
+	done := make(chan struct{})
+	for i := 0; i < 100; i++ {
+		go func() {
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					_ = rcfg.Load()
+					runtime.Gosched() // yield to prevent scheduler starvation
+				}
+			}
+		}()
+	}
+	for i := 0; i < 50; i++ {
+		time.Sleep(time.Millisecond)
+		_, _, _ = rcfg.TestReloadFromConfig(&Config{Listen: "127.0.0.1:8790", LogLevel: "info"})
+		_, _, _ = rcfg.TestReloadFromConfig(&Config{Listen: "127.0.0.1:8790", LogLevel: "warn"})
+	}
+	close(done)
+	// If we reach here with the -race detector clean, it passes.
+}
+
+func TestReloadableConfig_ReloadRollbackOnInvalidField(t *testing.T) {
+	cfg1 := &Config{Listen: "127.0.0.1:8790", LogLevel: "info"}
+	rcfg := NewReloadableConfig(cfg1, "config.yaml")
+	bad := &Config{Listen: ""} // invalid: validate() must reject empty listen
+	_, _, err := rcfg.TestReloadFromConfig(bad)
+	if err == nil {
+		t.Fatalf("expected validation error for empty listen")
+	}
+	// Old config kept — LogLevel must stay "info"
+	if rcfg.Load().LogLevel != "info" {
+		t.Fatalf("rollback failed — cfg mutated despite validation err")
+	}
+}
+
+func TestReloadableConfig_VersionFingerprintChanges(t *testing.T) {
+	cfg1 := &Config{Listen: "127.0.0.1:8790", LogLevel: "info"}
+	cfg2 := &Config{Listen: "127.0.0.1:8790", LogLevel: "debug"}
+	if cfg1.VersionFingerprint() == cfg2.VersionFingerprint() {
+		t.Fatalf("different configs must have different fingerprints")
+	}
+}
 
 func writeConfigYAML(t *testing.T, content string) string {
 	t.Helper()
