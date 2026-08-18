@@ -40,7 +40,8 @@ DeepSeek has no vision. Using it from Claude Code means pasting a screenshot get
 - **Multi-provider pool with circuit breakers** — `vision_providers` defines a priority-ordered list; failed providers trip a circuit breaker and traffic fails over automatically.
 - **Single static binary** — no runtime dependencies, ~10 MB.
 - **Model name sanitization** — automatically strips vendor context-length suffixes before forwarding to upstream (`deepseek-chat[1m]` → `deepseek-chat`); applied both on the request path and during cc-switch import (double-safe).
-- **CLI lifecycle** — 9 subcommands cover the full lifecycle: `setup` (interactive config + doctor), `doctor` (connectivity self-check), `connect`/`disconnect` (Claude Code settings.json wiring), `start`, `status`, `stop`, `version`, `cache` (inspect/clear the persistent cache).
+- **CLI lifecycle** — 10 subcommands cover the full lifecycle: `setup` (interactive config + doctor), `doctor` (connectivity self-check), `connect`/`disconnect` (Claude Code settings.json wiring), `start`, `status`, `stop`, `reload` (hot-reload config without restart), `version`, `cache` (inspect/clear the persistent cache).
+- **Config hot reload (v1.3.0+)** — SIGHUP, `POST /admin/reload`, or `blind-llm-eyes reload` triggers atomic config swap via `atomic.Pointer[Config]`; non-reloadable fields (`listen`, `upstream.base_url`) are validated and rejected. Cache instances are swapped safely with old `Close()` + new `OpenSQLite()`.
 - **cc-switch one-click import** — reads providers directly from the cc-switch SQLite database (best-effort: falls back to temp-copy on DB lock, falls back to manual input on any error).
 - **Safe settings management** — `connect` rewrites Claude Code's `settings.json` with a full-file backup taken exactly once (repeat `connect` never overwrites the backup); `disconnect` restores byte-for-byte from the backup via atomic writes.
 
@@ -130,7 +131,8 @@ Manage the running proxy:
 ```bash
 blind-llm-eyes status     # pidfile + GET /healthz → RUNNING / STALE
 blind-llm-eyes stop       # POST /admin/shutdown (token-authed) → graceful drain
-blind-llm-eyes doctor     # full connectivity self-check (upstream + each vision provider)
+blind-llm-eyes doctor     # full connectivity self-check (upstream + vision + db_writable + upstream_reachable + vision_model_exists)
+blind-llm-eyes reload     # hot-reload config (also: SIGHUP or POST /admin/reload)
 ```
 
 ### 5. Verify
@@ -220,6 +222,8 @@ Each subcommand accepts `-config <path>` (default `config.yaml`). `stats` / `lis
 - **Pidfile permissions** — on Windows the pidfile directory defaults to `%AppData%\blind-llm-eyes\` (user-only ACLs inherited from `AppData`). Don't share `%AppData%` across accounts or put it on a world-readable share.
 - **`connect` backup** — `~/.claude/.bak-before-connect` is a verbatim copy of your original `settings.json`. It contains whatever secrets `settings.json` held (e.g. `ANTHROPIC_API_KEY`). Treat it the same as the real file.
 - **Pre-commit hooks** — the repo ships with `pre-commit` (bash) and `pre-commit.ps1` (PowerShell) hooks that block hard-coded API keys (`sk-*`, `AKIA*`, `ghp_*`) from reaching git history. Run `git config core.hooksPath .githooks` once after cloning to activate.
+- **Config hot reload security** — `/admin/reload` POST is guarded by the per-process admin token written only to the pidfile (same admin auth scheme as /admin/stop). Never expose the pidfile directory on shared accounts or world-readable filesystems; the admin token also grants process stop. SIGHUP is safe because only the process owner or root can send it on Unix. On Windows the SIGHUP path does not fire; reload is CLI-only.
+- **`/debug/pprof/*` access control (v1.3.0+)** — 3-layer: Layer 1 `debug_pprof_enabled: false` returns 404 (endpoint not mounted, no hints); Layer 2 when `metrics_auth_token` is set, constant-time `subtle.ConstantTimeCompare` for token via query or `X-Metrics-Token` header (same token as /metrics); Layer 3 when token is empty, restricted to loopback IPs via `net.ParseIP().IsLoopback()` — scans from external IPs receive 403. Mutex and block profiles remain at Go defaults (off = 0 sampling cost); enable only when profiling with env `BLIND_PPROF_MUTEX_RATE`.
 
 ## Configuration reference
 
@@ -249,6 +253,7 @@ Each subcommand accepts `-config <path>` (default `config.yaml`). `stats` / `lis
 | `fail_open` | `false` | Vision failure → placeholder instead of 502 |
 | `log_level` | `info` | `debug`/`info`/`warn`/`error` |
 | `metrics_auth_token` | — (no auth) | Optional bearer token for `/metrics`. Set via env var `BLIND_METRICS_AUTH_TOKEN` to avoid storing secrets in YAML. |
+| `debug_pprof_enabled` | `true` (nil default) | If false, `/debug/pprof/*` returns 404 globally (endpoint hidden). v1.3.0+. Set via env not supported (rarely changed). |
 | `max_body_bytes` | `20971520` (20 MB) | Max request body size; larger requests are rejected with 413 |
 
 ### Adaptive concurrency
@@ -289,7 +294,7 @@ The core concurrency follows Go's practical model rather than the slogan: channe
 ## Observability
 
 - **JSON logs** — every stage logged with `stage`, `node_name`, `request_id`, and timing fields. Vision calls break down `sf_total_ms` / `fn_exec_ms` / `sf_wait_ms` so you can see dedup wait vs. actual upstream time.
-- **`/metrics`** — Prometheus: HTTP requests/durations, images processed, vision calls/durations, upstream requests, cache hit ratio, adaptive-limit gauges.
+- **`/metrics`** — Prometheus: HTTP requests/durations, images processed, vision calls/durations, upstream requests, cache hit ratio (hot/cold tier), cache row-count drift gauge, adaptive-limit gauges, singleflight exec/wait counters + merged-request count, image ingress bytes per format, request/response body size histograms, SSE event counters (message/error/other), provider call counters, circuit breaker transition counters.
 - **`/healthz`** — liveness probe.
 - **`X-Blind-Llm-Eyes` header** — `rewritten=N cached=M` per response.
 
@@ -334,6 +339,35 @@ git config core.hooksPath .githooks
 # If hooksPath doesn't support .ps1, use:
 Copy-Item .githooks/pre-commit.ps1 .git/hooks/pre-commit
 ```
+
+### Doctor checks (run `blind-llm-eyes doctor`)
+
+| Check | Status | Meaning |
+|-------|--------|---------|
+| `config_valid` | PASS/FAIL | YAML parses + validate() succeeds |
+| `self_ref_urls` | PASS/FAIL | upstream & vision base URLs not proxying to self listen addr |
+| `db_writable` (twotier only) | PASS/FAIL/SKIP | Opens SQLite → PRAGMA quick_check → INSERT+DELETE probe row. SKIP if `cache.type=lru`. FAIL = persistent store cannot accept writes. |
+| `upstream_reachable` | PASS/FAIL | 5s HEAD to `<base_url>/v1/models`. Any HTTP response (even 401/404) = PASS. Connect / DNS / TLS failure = FAIL. |
+| `vision_model_exists` | PASS/WARN/FAIL | Per vision provider: 5s ProviderPing. Ping 401 = FAIL (hard auth). Ping OK then optional `/v1/models`: endpoint missing or model absent in returned list = WARN only (exit still 0). Some providers don't expose `/models`. |
+
+Exit code: `0` = no FAILs (WARNs are OK). `1` = ≥1 FAIL.
+
+### Prometheus scraping (optional)
+
+If `metrics_auth_token` is set, add to your `scrape_configs`:
+
+```yaml
+scrape_configs:
+  - job_name: blind-llm-eyes
+    static_configs:
+      - targets: ['127.0.0.1:8790']
+    params:
+      token: ['${BLIND_METRICS_AUTH_TOKEN}']
+    metrics_path: /metrics
+    scrape_interval: 15s
+```
+
+Without a token: Prometheus must run on the same host; requests come from loopback IP. `/debug/pprof/*` is NOT scraped by Prometheus (debug endpoints are for human operators via `go tool pprof`).
 
 ## Roadmap
 
