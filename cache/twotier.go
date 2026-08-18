@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"hash/fnv"
 	"log/slog"
 	"sync"
 )
@@ -37,11 +36,21 @@ func NewTwoTier(lruCap int, cold *SQLite, logger *slog.Logger) *TwoTier {
 }
 
 // shard returns the mutex for the given key, using FNV-32a hash for
-// even distribution across shards.
+// even distribution across shards. The hash is computed inline (no
+// allocation) rather than via hash/fnv's New32a() which allocates a hash.Hash
+// interface box per call on the hot path.
 func (t *TwoTier) shard(key string) *sync.Mutex {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return &t.shards[h.Sum32()%shardCount]
+	// FNV-32a: https://datatracker.ietf.org/doc/html/draft-eastlake-fnv
+	const (
+		offsetBasis uint32 = 2166136261
+		prime      uint32 = 16777619
+	)
+	h := offsetBasis
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= prime
+	}
+	return &t.shards[h%shardCount]
 }
 
 func (t *TwoTier) Get(key string) (string, bool) {

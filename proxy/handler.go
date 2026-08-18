@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ROM4n2/blind-llm-eyes/cache"
 	"github.com/ROM4n2/blind-llm-eyes/logging"
@@ -1209,11 +1210,14 @@ func isSelfReferentialURL(urlStr, proxyListenAddr string) bool {
 // normalizeHost normalizes host aliases for self-reference detection.
 // Uses net.ParseIP to cover the entire 127.0.0.0/8 loopback range, all IPv6
 // loopback forms (::1, 0:0:0:0:0:0:0:1, [::1]), and unspecified addresses
-// (0.0.0.0, ::).
+// (0.0.0.0, ::). Also strips trailing dots (DNS FQDN form, e.g. "127.0.0.1.")
+// so that such URLs are still recognized as self-referential.
 func normalizeHost(host string) string {
 	h := strings.ToLower(strings.TrimSpace(host))
 	// Strip IPv6 brackets
 	h = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
+	// Strip trailing dot (DNS FQDN form like "127.0.0.1.")
+	h = strings.TrimRight(h, ".")
 
 	// Check if it's an IP address
 	if ip := net.ParseIP(h); ip != nil {
@@ -1263,12 +1267,19 @@ func defaultPort(scheme string) string {
 	return ""
 }
 
-// truncatePreview returns the first maxLen characters of s, appending "..." if
+// truncatePreview returns the first maxLen bytes of s, appending "..." if
 // truncation occurred. Used for logging context text without leaking full
-// conversation history.
+// conversation history. Truncation aligns to UTF-8 rune boundaries: if maxLen
+// would split a multi-byte rune (common in Chinese text), it is backed off
+// to the preceding rune start so the result is always valid UTF-8.
 func truncatePreview(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
+	}
+	// Back off to the previous rune boundary so we don't split a multi-byte
+	// UTF-8 sequence (e.g. a 3-byte Chinese character).
+	for maxLen > 0 && !utf8.RuneStart(s[maxLen]) {
+		maxLen--
 	}
 	return s[:maxLen] + "..."
 }

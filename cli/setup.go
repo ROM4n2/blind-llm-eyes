@@ -118,7 +118,7 @@ func runSetupCore(stdin io.Reader, stdout, stderr io.Writer, deps *setupDeps) in
 		}
 		if IsSelfReferentialURL(upstreamBaseURL, defaultListen) {
 			fmt.Fprintln(stdout, "")
-			fmt.Fprintf(stderr, "WARNING: upstream base_url %q points to the proxy itself (127.0.0.1:8790).\n", upstreamBaseURL)
+			fmt.Fprintf(stderr, "WARNING: upstream base_url %q points to the proxy itself (%s).\n", upstreamBaseURL, defaultListen)
 			fmt.Fprintf(stderr, "  This will cause an infinite self-forwarding loop.\n")
 			fmt.Fprintf(stderr, "  Please use a real upstream API endpoint instead.\n")
 			upstreamBaseURL = prompt("Enter a valid upstream base URL: ")
@@ -176,7 +176,7 @@ func runSetupCore(stdin io.Reader, stdout, stderr io.Writer, deps *setupDeps) in
 			// MiMo Client calls /v1/messages (same as proxy path) → infinite loop.
 			if IsSelfReferentialURL(visionBaseURL, defaultListen) {
 				fmt.Fprintln(stdout, "")
-				fmt.Fprintf(stderr, "WARNING: vision base_url %q points to the proxy itself (127.0.0.1:8790).\n", visionBaseURL)
+				fmt.Fprintf(stderr, "WARNING: vision base_url %q points to the proxy itself (%s).\n", visionBaseURL, defaultListen)
 				fmt.Fprintf(stderr, "  This will cause an infinite self-forwarding loop (vision calls /v1/messages on the proxy).\n")
 				fmt.Fprintf(stderr, "  Please use a real vision API endpoint instead.\n")
 				visionBaseURL = prompt("Enter a valid vision base URL: ")
