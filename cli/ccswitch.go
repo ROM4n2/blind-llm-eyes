@@ -4,8 +4,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/ROM4n2/blind-llm-eyes/modelutil"
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, no cgo
@@ -21,12 +25,17 @@ type CcSwitchProvider struct {
 }
 
 // ImportFromCcSwitch opens the cc-switch SQLite database at dbPath, queries all
-// Claude Code providers (app_type='claude'), and returns their parsed config.
+// Claude Code providers (app_type='claude'), filters out any that point back to
+// the proxy itself (self-referential), and returns the parsed config.
 //
 // The database is opened read-only. If the file is locked (cc-switch GUI is
 // running), it falls back to copying the DB to a temp file. Malformed rows are
 // silently skipped.
-func ImportFromCcSwitch(dbPath string) ([]CcSwitchProvider, error) {
+//
+// proxyListenAddr is the proxy's own listen address (e.g. "127.0.0.1:8790").
+// Providers whose base_url points to this address are filtered out to prevent
+// infinite self-forwarding loops. Pass "" to skip filtering.
+func ImportFromCcSwitch(dbPath, proxyListenAddr string) ([]CcSwitchProvider, error) {
 	db, err := openCcSwitchDB(dbPath)
 	if err != nil {
 		return nil, err
@@ -48,6 +57,9 @@ func ImportFromCcSwitch(dbPath string) ([]CcSwitchProvider, error) {
 		p, ok := parseCcSwitchSettings(name, settingsConfig)
 		if !ok {
 			continue // skip rows without env or base_url
+		}
+		if proxyListenAddr != "" && IsSelfReferentialURL(p.BaseURL, proxyListenAddr) {
+			continue // skip self-referential providers to prevent infinite loops
 		}
 		result = append(result, p)
 	}
@@ -145,4 +157,74 @@ func defaultCcSwitchDBPath() (string, error) {
 		return "", fmt.Errorf("find home dir: %w", err)
 	}
 	return filepath.Join(home, ".cc-switch", "cc-switch.db"), nil
+}
+
+// IsSelfReferentialURL checks if urlStr points to the proxy's own listen
+// address. This prevents infinite self-forwarding loops where a misconfigured
+// upstream.base_url points back to the proxy itself.
+//
+// Comparison is done by extracting host:port from both URLs and comparing
+// them after normalization (localhost ↔ 127.0.0.1 ↔ 0.0.0.0). Ports are
+// compared as integers so that leading-zero variants (e.g. "08790") don't
+// bypass the check — Go's net/http parses "08790" as 8790, so a string
+// comparison alone would miss the loop. If the URL cannot be parsed or lacks
+// a port, it returns false (safe default).
+func IsSelfReferentialURL(urlStr, proxyListenAddr string) bool {
+	if urlStr == "" || proxyListenAddr == "" {
+		return false
+	}
+	parsed, err := url.Parse(urlStr)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	proxyHost, proxyPort, err := net.SplitHostPort(proxyListenAddr)
+	if err != nil {
+		return false
+	}
+	urlHost, urlPort, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		urlPort = portFromScheme(parsed.Scheme)
+		urlHost = parsed.Host
+	}
+	return normalizeHost(urlHost) == normalizeHost(proxyHost) && portsEqual(urlPort, proxyPort)
+}
+
+// normalizeHost normalizes host aliases: localhost, 127.0.0.1, 0.0.0.0, ::1
+// are all treated as equivalent for self-reference detection. A trailing dot
+// (the DNS fully-qualified-name marker, e.g. "127.0.0.1.") is stripped so that
+// "127.0.0.1." is recognized as the loopback address — Go's resolver treats
+// "127.0.0.1." as 127.0.0.1, so without stripping the check would miss the loop.
+func normalizeHost(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	h = strings.TrimRight(h, ".")
+	switch h {
+	case "localhost", "127.0.0.1", "0.0.0.0", "::1", "::":
+		return "127.0.0.1"
+	}
+	return h
+}
+
+// portsEqual compares two port strings. Numeric ports are parsed and compared
+// as integers so that leading-zero forms ("08790") match their canonical form
+// ("8790"). If either port is non-numeric, it falls back to exact string
+// comparison (so "abc" never equals "8790", preserving the safe-default
+// behavior for malformed ports).
+func portsEqual(a, b string) bool {
+	an, aerr := strconv.Atoi(a)
+	bn, berr := strconv.Atoi(b)
+	if aerr == nil && berr == nil {
+		return an == bn
+	}
+	return a == b
+}
+
+// portFromScheme returns the default port for a URL scheme.
+func portFromScheme(scheme string) string {
+	switch scheme {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	}
+	return ""
 }

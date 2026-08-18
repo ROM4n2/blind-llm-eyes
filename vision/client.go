@@ -61,6 +61,11 @@ func (c *Client) DescribeImage(ctx context.Context, base64Data, mediaType string
 	return c.describeImageInternal(ctx, base64Data, mediaType, imageSize, "")
 }
 
+// GetBaseURL returns the configured BaseURL, implementing the BaseURLAware
+// interface. The proxy's runtime self-loop guard uses this to reject vision
+// calls that would loop back to the proxy itself.
+func (c *Client) GetBaseURL() string { return c.BaseURL }
+
 // DescribeImageWithContext 带对话上下文描述图片，实现 ContextualVisionProvider 接口。
 // contextText 为 "" 时行为完全等价于 DescribeImage。
 func (c *Client) DescribeImageWithContext(ctx context.Context, base64Data, mediaType string, imageSize int64, contextText string) (string, error) {

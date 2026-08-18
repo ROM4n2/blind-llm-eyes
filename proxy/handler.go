@@ -13,11 +13,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ROM4n2/blind-llm-eyes/cache"
 	"github.com/ROM4n2/blind-llm-eyes/logging"
@@ -51,12 +53,21 @@ type HandlerDeps struct {
 	// a vision API call and latency. Match is case-insensitive. nil/empty =
 	// never skip (always rewrite, the default behavior).
 	VisionCapableModels map[string]bool
+	// ListenAddr is the proxy's own listen address (e.g. "127.0.0.1:8790").
+	// Used to detect and reject self-referential upstream URLs that would
+	// cause infinite forwarding loops.
+	ListenAddr string
 }
 
 // NewHandler 返回一个标准 http.Handler，处理 /v1/messages 所有请求。
 func NewHandler(deps HandlerDeps) http.Handler {
 	if deps.UpstreamBaseURL == "" {
 		panic("NewHandler: UpstreamBaseURL must not be empty")
+	}
+	// Self-loop protection: reject upstream URLs that point back to the proxy
+	// itself. If ListenAddr is set, validate at construction time.
+	if deps.ListenAddr != "" && isSelfReferentialURL(deps.UpstreamBaseURL, deps.ListenAddr) {
+		panic(fmt.Sprintf("NewHandler: UpstreamBaseURL (%s) points to the proxy's own listen address (%s). This causes infinite self-forwarding loops. Use a real upstream API endpoint.", deps.UpstreamBaseURL, deps.ListenAddr))
 	}
 	if deps.WG == nil {
 		deps.WG = &sync.WaitGroup{}
@@ -70,8 +81,7 @@ func NewHandler(deps HandlerDeps) http.Handler {
 	if deps.LargeImageThreshold <= 0 {
 		deps.LargeImageThreshold = 1 << 20 // 1MB
 	}
-	// ContextRounds：仅当 >0 时启用上下文感知（config 中写 -1 或 0 都会被 handler 视为禁用）
-	// 注意：config loader 默认 3，如用户在 yaml 中写 -1 会被传为 -1，这里不改动
+	// ContextRounds：0 = 禁用上下文感知；正数 = N 轮；负数规范化为 0（兼容 yaml 写 -1）
 	if deps.ContextRounds < 0 {
 		deps.ContextRounds = 0 // 规范化：负数统一视为 0（禁用），避免 ExtractConversationContext 参数混淆
 	}
@@ -83,6 +93,19 @@ func NewHandler(deps HandlerDeps) http.Handler {
 	}
 	if deps.VisionProvider == nil {
 		panic("NewHandler: VisionProvider must not be nil")
+	}
+	// Self-loop protection: reject vision provider base_urls that point back
+	// to the proxy itself. MiMo Client calls /v1/messages (same as proxy path),
+	// so a self-referential vision base_url causes infinite forwarding loops.
+	// The check uses the optional BaseURLAware interface; providers that don't
+	// implement it skip this check (falling back to doctor/setup detection).
+	if deps.ListenAddr != "" {
+		if ba, ok := deps.VisionProvider.(vision.BaseURLAware); ok {
+			visionURL := ba.GetBaseURL()
+			if isSelfReferentialURL(visionURL, deps.ListenAddr) {
+				panic(fmt.Sprintf("NewHandler: VisionProvider base_url (%s) points to the proxy's own listen address (%s). This causes infinite self-forwarding loops (vision calls /v1/messages on the proxy). Use a real vision API endpoint.", visionURL, deps.ListenAddr))
+			}
+		}
 	}
 	if deps.Cache == nil {
 		deps.Cache = cache.NewLRU(1000)
@@ -167,6 +190,13 @@ func (h *requestHandler) handleCountTokens(w http.ResponseWriter, r *http.Reques
 	}
 
 	upstreamURL := h.deps.UpstreamBaseURL + "/v1/messages/count_tokens"
+	// Runtime self-loop guard: if the constructor check was bypassed (e.g.
+	// ListenAddr was empty at construction), catch self-referential URLs
+	// before they cause infinite forwarding.
+	if h.deps.ListenAddr != "" && isSelfReferentialURL(upstreamURL, h.deps.ListenAddr) {
+		http.Error(w, "upstream URL points to the proxy itself (loop detected). Check your upstream.base_url config.", http.StatusLoopDetected)
+		return
+	}
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "build request: "+err.Error(), http.StatusInternalServerError)
@@ -175,8 +205,7 @@ func (h *requestHandler) handleCountTokens(w http.ResponseWriter, r *http.Reques
 
 	// Forward headers (strip sensitive ones, same as handleMessages).
 	for k, vs := range r.Header {
-		switch k {
-		case "Host", "Authorization", "Proxy-Authorization", "Cookie":
+		if shouldStripHeader(k, h.deps.UpstreamAPIKey != "") {
 			continue
 		}
 		for _, v := range vs {
@@ -568,6 +597,25 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 						"timeout_override", isLarge,
 					)
 
+					// Runtime self-loop guard: if the vision provider's base_url
+					// points back to the proxy itself (e.g. ListenAddr was empty
+					// at construction or config was hot-reloaded), reject the
+					// vision call with 508 instead of causing an infinite loop.
+					// MiMo Client calls /v1/messages (same as proxy path).
+					if h.deps.ListenAddr != "" {
+						if ba, ok := h.deps.VisionProvider.(vision.BaseURLAware); ok {
+							if isSelfReferentialURL(ba.GetBaseURL(), h.deps.ListenAddr) {
+								log.Error("vision provider base_url points to proxy itself (loop detected)",
+									"stage", "vision_self_loop_detected",
+									"status", "error",
+									"vision_base_url", ba.GetBaseURL(),
+									"listen_addr", h.deps.ListenAddr,
+								)
+								return fmt.Errorf("vision provider base_url (%s) points to the proxy itself (loop detected). Check your vision.base_url config", ba.GetBaseURL())
+							}
+						}
+					}
+
 					vStart := time.Now()
 					// singleflight：同 hash 并发调用合并为一次 vision 请求
 					// fn 内部用独立 ctx（context.Background + WithCancel），避免某个调用者
@@ -592,7 +640,7 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 								"method", "DescribeImageWithContext",
 								"has_context", contextText != "",
 								"context_chars", len(contextText),
-								"context_text", contextText,
+								"context_preview", truncatePreview(contextText, 80),
 								"image_size_bytes", imageSize,
 								"is_large", isLarge,
 							)
@@ -806,6 +854,22 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	// 6) 转发给上游 (DeepSeek)
 	upstreamURL := h.deps.UpstreamBaseURL + "/v1/messages"
 
+	// Runtime self-loop guard: if the constructor check was bypassed (e.g.
+	// ListenAddr was empty at construction), catch self-referential URLs
+	// before they cause infinite forwarding.
+	if h.deps.ListenAddr != "" && isSelfReferentialURL(upstreamURL, h.deps.ListenAddr) {
+		log.Error("upstream URL points to proxy itself, rejecting to prevent infinite loop",
+			"stage", "upstream_request_start",
+			"status", "error",
+			"upstream_url", upstreamURL,
+			"listen_addr", h.deps.ListenAddr,
+		)
+		statusCode = http.StatusLoopDetected
+		http.Error(w, "upstream URL points to the proxy itself (loop detected). Check your upstream.base_url config.", http.StatusLoopDetected)
+		h.recordRequestMetrics(r.Method, route, statusCode, requestStart)
+		return
+	}
+
 	// ── stage: upstream_request_start ──
 	log.Info("forwarding request to upstream",
 		"stage", "upstream_request_start",
@@ -838,13 +902,12 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 
 	// Header 处理：显式过滤安全头，防止敏感信息泄露
 	for k, vs := range r.Header {
-		switch {
-		case k == "Host":
-			continue
-		case k == "Authorization", k == "Proxy-Authorization", k == "Cookie":
-			log.Debug("stripping sensitive header before forwarding",
-				"header", k,
-			)
+		if shouldStripHeader(k, h.deps.UpstreamAPIKey != "") {
+			if k != "Host" {
+				log.Debug("stripping sensitive header before forwarding",
+					"header", k,
+				)
+			}
 			continue
 		}
 		for _, v := range vs {
@@ -1117,4 +1180,106 @@ func truncateBytes(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "..."
+}
+
+// isSelfReferentialURL checks if urlStr points to the proxy's own listen
+// address. This prevents infinite self-forwarding loops.
+//
+// Comparison normalizes host aliases: localhost, 127.0.0.1, 0.0.0.0, ::1
+// are all treated as equivalent. Returns false for unparseable URLs (safe default).
+func isSelfReferentialURL(urlStr, proxyListenAddr string) bool {
+	if urlStr == "" || proxyListenAddr == "" {
+		return false
+	}
+	parsed, err := url.Parse(urlStr)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	proxyHost, proxyPort, err := net.SplitHostPort(proxyListenAddr)
+	if err != nil {
+		return false
+	}
+	urlHost, urlPort, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		urlPort = defaultPort(parsed.Scheme)
+		urlHost = parsed.Host
+	}
+	return normalizeHost(urlHost) == normalizeHost(proxyHost) && urlPort == proxyPort
+}
+
+// normalizeHost normalizes host aliases for self-reference detection.
+// Uses net.ParseIP to cover the entire 127.0.0.0/8 loopback range, all IPv6
+// loopback forms (::1, 0:0:0:0:0:0:0:1, [::1]), and unspecified addresses
+// (0.0.0.0, ::). Also strips trailing dots (DNS FQDN form, e.g. "127.0.0.1.")
+// so that such URLs are still recognized as self-referential.
+func normalizeHost(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	// Strip IPv6 brackets
+	h = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
+	// Strip trailing dot (DNS FQDN form like "127.0.0.1.")
+	h = strings.TrimRight(h, ".")
+
+	// Check if it's an IP address
+	if ip := net.ParseIP(h); ip != nil {
+		if ip.IsLoopback() {
+			return "127.0.0.1"
+		}
+		if ip.IsUnspecified() { // 0.0.0.0 or ::
+			return "127.0.0.1"
+		}
+		return ip.String() // canonical form
+	}
+
+	// Hostname aliases
+	switch h {
+	case "localhost":
+		return "127.0.0.1"
+	}
+	return h
+}
+
+// shouldStripHeader returns true if the header must not be forwarded to the
+// upstream API. Sensitive headers (Authorization, Proxy-Authorization, Cookie)
+// are stripped only when the proxy injects its own Authorization (i.e.,
+// UpstreamAPIKey is configured). When UpstreamAPIKey is empty, the proxy
+// acts as a transparent forwarder and MUST pass the client's Authorization
+// to the upstream — otherwise the upstream returns 401 and passthrough mode
+// (vision_capable_models) breaks. Host is always stripped (set by
+// http.NewRequestWithContext).
+func shouldStripHeader(k string, hasUpstreamKey bool) bool {
+	switch k {
+	case "Host":
+		return true
+	case "Authorization", "Proxy-Authorization", "Cookie":
+		return hasUpstreamKey
+	}
+	return false
+}
+
+// defaultPort returns the default port for a URL scheme.
+func defaultPort(scheme string) string {
+	switch scheme {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	}
+	return ""
+}
+
+// truncatePreview returns the first maxLen bytes of s, appending "..." if
+// truncation occurred. Used for logging context text without leaking full
+// conversation history. Truncation aligns to UTF-8 rune boundaries: if maxLen
+// would split a multi-byte rune (common in Chinese text), it is backed off
+// to the preceding rune start so the result is always valid UTF-8.
+func truncatePreview(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	// Back off to the previous rune boundary so we don't split a multi-byte
+	// UTF-8 sequence (e.g. a 3-byte Chinese character).
+	for maxLen > 0 && !utf8.RuneStart(s[maxLen]) {
+		maxLen--
+	}
+	return s[:maxLen] + "..."
 }

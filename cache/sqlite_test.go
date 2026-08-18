@@ -312,3 +312,57 @@ func TestSQLite_EvictNoThunderingHerd(t *testing.T) {
 		t.Fatalf("counter %d != db rows %d after convergence", s.count.Load(), dbN)
 	}
 }
+
+// TestSQLite_ActualCountAndMemoryCount verifies the exported observability
+// methods used by the CLI `cache stats` command for drift detection.
+// MemoryCount reads the in-memory atomic counter; ActualCount queries the
+// DB. After a sequence of Put operations they must agree. After a manual
+// DELETE (simulating an external writer or counter drift), they diverge.
+func TestSQLite_ActualCountAndMemoryCount(t *testing.T) {
+	s := newTestSQLite(t)
+	defer s.Close()
+
+	// Initial state: 0 entries, memory and actual agree.
+	if got := s.MemoryCount(); got != 0 {
+		t.Fatalf("initial MemoryCount = %d, want 0", got)
+	}
+	actual, err := s.ActualCount()
+	if err != nil {
+		t.Fatalf("ActualCount: %v", err)
+	}
+	if actual != 0 {
+		t.Fatalf("initial ActualCount = %d, want 0", actual)
+	}
+
+	// Insert 3 entries; memory counter is maintained incrementally.
+	s.Put("h1", "v1")
+	s.Put("h2", "v2")
+	s.Put("h3", "v3")
+	if got := s.MemoryCount(); got != 3 {
+		t.Fatalf("after 3 puts MemoryCount = %d, want 3", got)
+	}
+	actual, err = s.ActualCount()
+	if err != nil {
+		t.Fatalf("ActualCount: %v", err)
+	}
+	if actual != 3 {
+		t.Fatalf("after 3 puts ActualCount = %d, want 3", actual)
+	}
+
+	// Simulate drift: external DELETE that bypasses the counter.
+	if _, err := s.db.Exec("DELETE FROM cache WHERE hash = ?", "h1"); err != nil {
+		t.Fatalf("external delete: %v", err)
+	}
+	// MemoryCount still reflects the pre-delete state (drift!).
+	if got := s.MemoryCount(); got != 3 {
+		t.Fatalf("after external delete MemoryCount = %d, want 3 (drift)", got)
+	}
+	// ActualCount reflects the true DB state.
+	actual, err = s.ActualCount()
+	if err != nil {
+		t.Fatalf("ActualCount: %v", err)
+	}
+	if actual != 2 {
+		t.Fatalf("after external delete ActualCount = %d, want 2", actual)
+	}
+}

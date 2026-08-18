@@ -26,6 +26,9 @@ type Config struct {
 	// skips image rewriting and forwards the body verbatim. Empty = always
 	// rewrite (default).
 	VisionCapableModels []string `yaml:"vision_capable_models"`
+	// MetricsAuthToken, if set, requires /metrics requests to carry this token
+	// via the "token" query parameter or "X-Metrics-Token" header. Empty = no auth.
+	MetricsAuthToken string `yaml:"metrics_auth_token"`
 }
 
 type AdaptiveConcurrencyCfg struct {
@@ -57,7 +60,7 @@ type VisionCfg struct {
 	LargeImageThreshold int64         `yaml:"large_image_threshold"` // bytes; images >= this use large timeout
 	DescriptionCap      int           `yaml:"description_cap"`
 	SupportedFormats    []string      `yaml:"supported_formats"`
-	ContextRounds       int           `yaml:"context_rounds"`    // 最近 N 轮对话传给 vision；0 = 禁用上下文感知
+	ContextRounds       *int          `yaml:"context_rounds"`    // nil = 默认 3 轮; 0 = 禁用; 正数 = N 轮
 	ContextMaxChars     int           `yaml:"context_max_chars"` // 上下文文本最大字符数；超出时整轮次截断早期历史
 }
 
@@ -136,12 +139,13 @@ func Load(path string) (*Config, error) {
 		c.Vision.DescriptionCap = 1000
 	}
 	// ContextRounds 处理：
-	//   - 用户写正数：实际传入的对话轮数
-	//   - 未设置（yaml 无此字段，Go 零值 0）：兜底默认 3 轮
-	//   - 用户写 0：按上述处理也是兜底 3 轮，无法区分未设置和显式 0
-	//   - 用户写负数（推荐 -1）：handler 层视为禁用
-	if c.Vision.ContextRounds == 0 {
-		c.Vision.ContextRounds = 3
+	//   - nil（yaml 无此字段）：兜底默认 3 轮
+	//   - 0：显式禁用上下文感知
+	//   - 正数：实际传入的对话轮数
+	//   - 负数：handler 层规范化为 0（禁用）
+	if c.Vision.ContextRounds == nil {
+		defaultRounds := 3
+		c.Vision.ContextRounds = &defaultRounds
 	}
 	if c.Vision.ContextMaxChars <= 0 {
 		c.Vision.ContextMaxChars = 2000
@@ -188,13 +192,16 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("BLIND_VISION_CONTEXT_ROUNDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
-			c.Vision.ContextRounds = n
+			c.Vision.ContextRounds = &n
 		}
 	}
 	if v := os.Getenv("BLIND_VISION_CONTEXT_MAX_CHARS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Vision.ContextMaxChars = n
 		}
+	}
+	if v := os.Getenv("BLIND_METRICS_AUTH_TOKEN"); v != "" {
+		c.MetricsAuthToken = v
 	}
 
 	// ── adaptive_concurrency 默认值（即使用户只写 enabled: true 也能跑） ──

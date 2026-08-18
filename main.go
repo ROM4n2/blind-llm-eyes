@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"flag"
 	"fmt"
 	"net/http"
@@ -72,9 +73,9 @@ func runServer(args []string) {
 		"adaptive_range", fmt.Sprintf("[%d, %d]", cfg.AdaptiveConcurrency.MinLimit, cfg.AdaptiveConcurrency.MaxLimit),
 		"adaptive_threshold_ms", fmt.Sprintf("fast=%d slow=%d",
 			cfg.AdaptiveConcurrency.FastThresholdMs, cfg.AdaptiveConcurrency.SlowThresholdMs),
-		"context_rounds", cfg.Vision.ContextRounds,
+		"context_rounds", ptrDeref(cfg.Vision.ContextRounds, 3),
 		"context_max_chars", cfg.Vision.ContextMaxChars,
-		"context_enabled", cfg.Vision.ContextRounds > 0,
+		"context_enabled", ptrDeref(cfg.Vision.ContextRounds, 3) > 0,
 	)
 
 	// 初始化 Prometheus Metrics
@@ -160,11 +161,12 @@ func runServer(args []string) {
 		MaxBodyBytes:        cfg.MaxBodyBytes,
 		ConcurrencyLimit:    cfg.ConcurrencyLimit,
 		AdaptiveConcurrency: ac,
-		ContextRounds:       cfg.Vision.ContextRounds,
+		ContextRounds:       ptrDeref(cfg.Vision.ContextRounds, 3),
 		ContextMaxChars:     cfg.Vision.ContextMaxChars,
 		Log:                 logger,
 		WG:                  &wg,
 		Metrics:             m,
+		ListenAddr:          cfg.Listen,
 	}
 	// Build vision-capable model set for passthrough (skip rewrite when
 	// upstream model natively supports images). NewHandler normalizes to
@@ -179,9 +181,14 @@ func runServer(args []string) {
 	// 主路由：代理 + metrics
 	mux := http.NewServeMux()
 	mux.Handle("/v1/messages", proxy.NewHandler(deps))
-	mux.Handle("/metrics", promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{
+	metricsHandler := promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{
 		EnableOpenMetrics: true,
-	}))
+	})
+	if cfg.MetricsAuthToken != "" {
+		metricsHandler = withMetricsAuth(metricsHandler, cfg.MetricsAuthToken)
+		logger.Info("metrics endpoint requires token authentication")
+	}
+	mux.Handle("/metrics", metricsHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
@@ -256,4 +263,31 @@ func runServer(args []string) {
 	case <-adminH.Done():
 		gracefulShutdown("admin request")
 	}
+}
+
+// ptrDeref dereferences an *int, returning fallback if nil.
+func ptrDeref(p *int, fallback int) int {
+	if p == nil {
+		return fallback
+	}
+	return *p
+}
+
+// withMetricsAuth wraps an http.Handler with token-based authentication.
+// The token can be provided via the "token" query parameter or the
+// "X-Metrics-Token" header. Comparison uses crypto/subtle.ConstantTimeCompare
+// to prevent timing attacks that could recover the token byte-by-byte.
+func withMetricsAuth(next http.Handler, token string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		provided := r.URL.Query().Get("token")
+		if provided == "" {
+			provided = r.Header.Get("X-Metrics-Token")
+		}
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte("unauthorized"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

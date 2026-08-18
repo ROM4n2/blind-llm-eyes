@@ -6,9 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 
+	"github.com/ROM4n2/blind-llm-eyes/cache"
 	"github.com/ROM4n2/blind-llm-eyes/config"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, registered via database/sql
@@ -74,6 +76,12 @@ func runCachePath(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 // runCacheStats prints summary statistics from the SQLite cold layer:
 // entry count, total bytes, oldest/newest access timestamps, db file size,
 // and the journal mode. Exits 1 if cache is LRU-only (no persistent store).
+//
+// Drift observation: memory_count (the in-memory atomic counter, initialized
+// from COUNT(*) at OpenSQLite time) is displayed alongside actual_count (a
+// fresh SELECT COUNT(*)). A >5% divergence is logged as a WARN to stderr,
+// indicating either concurrent writes by a running proxy or counter drift
+// from failed evictions.
 func runCacheStats(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("cache stats", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -93,22 +101,31 @@ func runCacheStats(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	dbPath := resolveDBPath(cfg)
-	db, err := openCacheDB(dbPath)
+	// Open via cache.OpenSQLite (not openCacheDB) so the in-memory counter
+	// is initialized via initCount(), giving us a memory_count baseline.
+	s, err := cache.OpenSQLite(dbPath, 0, 0, slog.Default())
 	if err != nil {
 		fmt.Fprintf(stderr, "open db: %v\n", err)
 		return 1
 	}
-	defer db.Close()
+	defer s.Close()
+	db := s.DB()
 
-	var n, total int64
-	if err := db.QueryRow("SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM cache").Scan(&n, &total); err != nil {
-		fmt.Fprintf(stderr, "query stats: %v\n", err)
+	memCount := s.MemoryCount()
+	actualCount, err := s.ActualCount()
+	if err != nil {
+		fmt.Fprintf(stderr, "query actual count: %v\n", err)
 		return 1
 	}
+
+	var total int64
+	_ = db.QueryRow("SELECT COALESCE(SUM(size_bytes),0) FROM cache").Scan(&total)
 	var oldest, newest sql.NullInt64
 	_ = db.QueryRow("SELECT MIN(last_accessed), MAX(last_accessed) FROM cache").Scan(&oldest, &newest)
 
-	fmt.Fprintf(stdout, "entries: %d\n", n)
+	fmt.Fprintf(stdout, "memory_count: %d\n", memCount)
+	fmt.Fprintf(stdout, "actual_count: %d\n", actualCount)
+	fmt.Fprintf(stdout, "entries: %d\n", actualCount) // backward-compat alias
 	fmt.Fprintf(stdout, "total_bytes: %d\n", total)
 	if oldest.Valid {
 		fmt.Fprintf(stdout, "oldest_access_ms: %d\n", oldest.Int64)
@@ -122,6 +139,19 @@ func runCacheStats(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 	var journalMode string
 	_ = db.QueryRow("PRAGMA journal_mode").Scan(&journalMode)
 	fmt.Fprintf(stdout, "journal_mode: %s\n", journalMode)
+
+	// Drift WARN: >5% divergence between in-memory counter and actual DB rows.
+	// Causes: concurrent writes by a running proxy (benign), failed evict
+	// DELETE not decrementing counter (bug), or external DB modification.
+	if actualCount > 0 {
+		diff := memCount - actualCount
+		if diff < 0 {
+			diff = -diff
+		}
+		if float64(diff)/float64(actualCount) > 0.05 {
+			fmt.Fprintf(stderr, "WARN: memory_count (%d) drifts from actual_count (%d) by >5%%\n", memCount, actualCount)
+		}
+	}
 	return 0
 }
 

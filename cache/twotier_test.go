@@ -79,6 +79,36 @@ func TestTwoTier_ConcurrentGetNoThunderingHerd(t *testing.T) {
 	wg.Wait()
 }
 
+func TestTwoTier_ConcurrentDifferentKeysNoBlock(t *testing.T) {
+	tt := newTestTwoTier(t)
+	// Write 16 different keys to cold, clear hot to force cold path.
+	for i := 0; i < 16; i++ {
+		tt.cold.Put(keyForIdx(i), valForIdx(i))
+	}
+	tt.hot = NewLRU(100)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			got, ok := tt.Get(keyForIdx(idx))
+			if !ok || got != valForIdx(idx) {
+				t.Errorf("key %d: got (%q,%v)", idx, got, ok)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func keyForIdx(i int) string {
+	return "key-" + string(rune('a'+i))
+}
+
+func valForIdx(i int) string {
+	return "val-" + string(rune('a'+i))
+}
+
 func TestTwoTier_SatisfiesCacheInterface(t *testing.T) {
 	var _ Cache = (*TwoTier)(nil) // compile-time check (also asserted in cache.go)
 }

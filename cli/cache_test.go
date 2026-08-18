@@ -166,6 +166,19 @@ func TestRunCache_Stats_TwoTier(t *testing.T) {
 	if !strings.Contains(out.String(), "total_bytes: 4") {
 		t.Errorf("out: %s", out.String())
 	}
+	// Drift observation fields: memory_count (in-memory counter initialized
+	// from COUNT(*) at OpenSQLite time) and actual_count (fresh COUNT(*)).
+	// With no concurrent writer they must agree.
+	if !strings.Contains(out.String(), "memory_count: 2") {
+		t.Errorf("want memory_count: 2, out: %s", out.String())
+	}
+	if !strings.Contains(out.String(), "actual_count: 2") {
+		t.Errorf("want actual_count: 2, out: %s", out.String())
+	}
+	// No drift WARN expected when counts agree.
+	if strings.Contains(errB.String(), "WARN") {
+		t.Errorf("unexpected drift WARN: %s", errB.String())
+	}
 }
 
 func TestRunCache_Stats_TwoTierEmpty(t *testing.T) {
