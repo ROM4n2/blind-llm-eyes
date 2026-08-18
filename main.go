@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/ROM4n2/blind-llm-eyes/cache"
 	"github.com/ROM4n2/blind-llm-eyes/cli"
 	"github.com/ROM4n2/blind-llm-eyes/config"
+	"github.com/ROM4n2/blind-llm-eyes/internal/pprofsec"
 	"github.com/ROM4n2/blind-llm-eyes/logging"
 	"github.com/ROM4n2/blind-llm-eyes/metrics"
 	"github.com/ROM4n2/blind-llm-eyes/proxy"
@@ -76,6 +78,7 @@ func runServer(args []string) {
 		"context_rounds", ptrDeref(cfg.Vision.ContextRounds, 3),
 		"context_max_chars", cfg.Vision.ContextMaxChars,
 		"context_enabled", ptrDeref(cfg.Vision.ContextRounds, 3) > 0,
+		"debug_pprof_enabled", ptrBoolDeref(cfg.DebugPprofEnabled, true),
 	)
 
 	// 初始化 Prometheus Metrics
@@ -194,6 +197,26 @@ func runServer(args []string) {
 		w.Write([]byte("ok"))
 	})
 
+	// Debug pprof endpoints: mounted through pprofsec.Wrap 3-layer policy
+	// (enabled-flag → token auth → loopback restriction). Uses a custom mux
+	// (not DefaultServeMux) to avoid auto-registering pprof globally.
+	pprofCfg := pprofsec.Config{
+		Enabled:   ptrBoolDeref(cfg.DebugPprofEnabled, true),
+		AuthToken: cfg.MetricsAuthToken, // reuse same shared secret as /metrics
+	}
+	mux.Handle("/debug/pprof/", pprofsec.Wrap(http.HandlerFunc(pprof.Index), pprofCfg))
+	mux.Handle("/debug/pprof/cmdline", pprofsec.Wrap(http.HandlerFunc(pprof.Cmdline), pprofCfg))
+	mux.Handle("/debug/pprof/profile", pprofsec.Wrap(http.HandlerFunc(pprof.Profile), pprofCfg))
+	mux.Handle("/debug/pprof/symbol", pprofsec.Wrap(http.HandlerFunc(pprof.Symbol), pprofCfg))
+	mux.Handle("/debug/pprof/trace", pprofsec.Wrap(http.HandlerFunc(pprof.Trace), pprofCfg))
+	if pprofCfg.Enabled {
+		logger.Info("debug pprof endpoints mounted",
+			"path", "/debug/pprof/",
+			"token_auth", cfg.MetricsAuthToken != "",
+			"loopback_only", cfg.MetricsAuthToken == "",
+		)
+	}
+
 	// Admin shutdown endpoint + pidfile (used by the status/stop subcommands).
 	// The token is generated per-start and written to the pidfile so "stop" can
 	// authenticate. bind 127.0.0.1 (default listen) keeps the endpoint local.
@@ -267,6 +290,14 @@ func runServer(args []string) {
 
 // ptrDeref dereferences an *int, returning fallback if nil.
 func ptrDeref(p *int, fallback int) int {
+	if p == nil {
+		return fallback
+	}
+	return *p
+}
+
+// ptrBoolDeref dereferences a *bool, returning fallback if nil.
+func ptrBoolDeref(p *bool, fallback bool) bool {
 	if p == nil {
 		return fallback
 	}

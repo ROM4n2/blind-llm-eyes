@@ -34,6 +34,13 @@ type Config struct {
 	// MetricsAuthToken, if set, requires /metrics requests to carry this token
 	// via the "token" query parameter or "X-Metrics-Token" header. Empty = no auth.
 	MetricsAuthToken string `yaml:"metrics_auth_token"`
+	// DebugPprofEnabled controls whether /debug/pprof/* endpoints are mounted.
+	// nil (key absent in YAML) → default enabled (true).
+	// Non-nil *p=false → user explicitly disabled.
+	// Non-nil *p=true  → user explicitly enabled.
+	// This *bool convention mirrors Vision.ContextRounds and is the project-wide
+	// pattern for "default true but allow explicit false" flags.
+	DebugPprofEnabled *bool `yaml:"debug_pprof_enabled"`
 }
 
 type AdaptiveConcurrencyCfg struct {
@@ -207,6 +214,18 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("BLIND_METRICS_AUTH_TOKEN"); v != "" {
 		c.MetricsAuthToken = v
+	}
+	// debug_pprof_enabled: default enabled (true) when key absent. *bool pattern
+	// follows the project convention (see Vision.ContextRounds *int).
+	if c.DebugPprofEnabled == nil {
+		def := true
+		c.DebugPprofEnabled = &def
+	}
+	if v := os.Getenv("BLIND_DEBUG_PPROF_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err == nil {
+			c.DebugPprofEnabled = &b
+		}
 	}
 
 	// ── adaptive_concurrency 默认值（即使用户只写 enabled: true 也能跑） ──
