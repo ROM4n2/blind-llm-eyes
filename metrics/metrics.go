@@ -72,6 +72,57 @@ type Metrics struct {
 	// lowering provider priority).
 	// Labels: provider, from ∈ {closed, open, half_open}, to ∈ same set.
 	CBTransitions *prometheus.CounterVec
+
+	// ── v1.3.0 P1: singleflight dedup observability ──
+	// SFTotal splits singleflight.Do callers by the phase they experienced:
+	//   phase="exec" — the one goroutine that actually ran the vision fn
+	//                   (singleflight.Do returned shared=false)
+	//   phase="wait" — all other goroutines deduplicated and waited on the
+	//                   exec goroutine's result (shared=true)
+	// Summing exec + wait gives the total caller count; exec/(exec+wait) is
+	// the dedup density (1 = no concurrent duplicates → SF did nothing).
+	SFTotal *prometheus.CounterVec
+
+	// SFMerged counts how many duplicate in-flight callers were saved from
+	// re-executing the vision call. Each shared=true caller increments this
+	// once. SFMerged == sum of phase=wait in SFTotal; provided as a plain
+	// counter so dashboards can write a simpler "dedup total" panel without
+	// filtering a label.
+	SFMerged prometheus.Counter
+
+	// ── v1.3.0 P1: ingress bytes ──
+	// ImagesBytesIn tracks cumulative decoded image input bytes per media
+	// type (i.e. the raw byte length AFTER base64 decode). This is the
+	// actual payload the vision provider receives / the image hash is
+	// computed over. Operators use this to identify bursts of large images
+	// (correlated with latency spikes) and to attribute cost across formats
+	// (JPEG vs PNG vs WebP volume).
+	ImagesBytesIn *prometheus.CounterVec
+
+	// ── v1.3.0 P1: payload size histograms + SSE events ──
+	// ReqBodyBytes is the HTTP request body size in bytes (after MaxBytes
+	// cap; observed only on successful read). 8 buckets from 1KB to 20MB
+	// cover the typical range: 1KB tiny text-only, 1–5MB multi-image,
+	// 5–20MB extremely large. >20MB bucket catches the rare oversized.
+	ReqBodyBytes prometheus.Histogram
+
+	// RespBodyBytes is the total HTTP response body size written to the
+	// client in bytes (SSE stream total or non-SSE response). Same buckets
+	// as ReqBodyBytes. Paired with request content-length from upstream,
+	// this lets operators detect proxy amplification/reshaping issues.
+	RespBodyBytes prometheus.Histogram
+
+	// SSEEvents counts Server-Sent Events parsed from the streamed
+	// response body as it is written. Classification:
+	//   event="message" — either no event: line (default SSE event name) or
+	//                      explicit event:message.
+	//   event="error"   — event:error lines (provider error streams).
+	//   event="other"   — any other event: name.
+	// Scanned line-by-line during streaming write; scans only the bytes
+	// being written (no backtracking). Lines without an event: prefix are
+	// counted as "message". Useful for spotting error-only streams,
+	// truncation, or unexpected event types.
+	SSEEvents *prometheus.CounterVec
 }
 
 // NewMetrics 创建并注册所有指标。
@@ -232,7 +283,51 @@ func NewMetrics() *Metrics {
 			},
 			[]string{"provider", "from", "to"},
 		),
+
+		// ── v1.3.0 P1 metrics ──
+		SFTotal: promauto.With(reg).NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "blind_llm_eyes_singleflight_total",
+				Help: "Singleflight phases per vision dedup call. phase='exec' = the goroutine that ran the vision fn; phase='wait' = goroutines deduped and waiting on the exec result.",
+			},
+			[]string{"phase"},
+		),
+		SFMerged: promauto.With(reg).NewCounter(
+			prometheus.CounterOpts{
+				Name: "blind_llm_eyes_singleflight_merged_requests_total",
+				Help: "Total singleflight waiters merged into one exec call (i.e. duplicate in-flight calls saved). Equals sum of phase=wait in SFTotal.",
+			},
+		),
+		ImagesBytesIn: promauto.With(reg).NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "blind_llm_eyes_images_bytes_in_total",
+				Help: "Cumulative bytes of decoded image input per media type, counted after base64 decode (this is the actual vision-provider payload size).",
+			},
+			[]string{"format"},
+		),
 	}
+
+	// Payload size buckets chosen to cover the typical request/response
+	// envelope: 1KB tiny text-only requests → 100KB average multi-image →
+	// 5MB large request with several big images → 20MB extreme catch-all.
+	sizeBuckets := []float64{1e3, 1e4, 5e4, 1e5, 5e5, 1e6, 5e6, 2e7}
+	m.ReqBodyBytes = promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
+		Name:    "blind_llm_eyes_request_body_bytes",
+		Help:    "HTTP request body size in bytes. Observed only after a successful MaxBytes-bounded ReadAll.",
+		Buckets: sizeBuckets,
+	})
+	m.RespBodyBytes = promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
+		Name:    "blind_llm_eyes_response_body_bytes",
+		Help:    "HTTP response body size in bytes written to client (SSE stream total, or non-SSE response).",
+		Buckets: sizeBuckets,
+	})
+	m.SSEEvents = promauto.With(reg).NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "blind_llm_eyes_sse_events_total",
+			Help: "SSE events parsed from streamed response. event='message' covers default (no event:) or event:message; 'error' = event:error; 'other' = any other event name.",
+		},
+		[]string{"event"},
+	)
 
 	return m
 }

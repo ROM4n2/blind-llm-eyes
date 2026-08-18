@@ -177,6 +177,88 @@ func Shutdown(deps HandlerDeps) {
 	}
 }
 
+// countWriter wraps an http.ResponseWriter to count total bytes written and
+// scan SSE event: lines on the fly for metrics (RespBodyBytes + SSEEvents).
+// Implements http.ResponseWriter and http.Flusher (if the wrapped writer
+// does). Note that if the upstream response is not SSE, SSEEvents won't be
+// incremented; RespBodyBytes still counts regardless.
+type countWriter struct {
+	http.ResponseWriter
+	bytesWritten atomic.Int64
+	metrics      *metrics.Metrics
+}
+
+func newCountWriter(w http.ResponseWriter, m *metrics.Metrics) *countWriter {
+	return &countWriter{ResponseWriter: w, metrics: m}
+}
+
+func (cw *countWriter) Write(p []byte) (int, error) {
+	n, err := cw.ResponseWriter.Write(p)
+	if n > 0 {
+		cw.bytesWritten.Add(int64(n))
+		// Scan for SSE events only if metrics are configured (avoids byte
+		// scanning in tests that don't set up a Metrics instance).
+		if cw.metrics != nil {
+			scanSSEEvents(p[:n], cw.metrics)
+		}
+	}
+	return n, err
+}
+
+// Flush forwards to the underlying writer when it supports http.Flusher.
+// CopyResponse calls Flush() after every chunk for SSE streaming.
+func (cw *countWriter) Flush() {
+	if f, ok := cw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// total returns the final byte count for use after streaming completes.
+func (cw *countWriter) total() int64 { return cw.bytesWritten.Load() }
+
+// scanSSEEvents parses a byte buffer for SSE event lines and increments the
+// appropriate counter. Lines are separated by '\n' or '\r\n'. A line that
+// starts with "event:" is classified:
+//   - "event: message" (case-insensitive, trimmed) or NO event line at all
+//     within the event block → event="message"
+//   - "event: error" → event="error"
+//   - any other event value → event="other"
+//
+// SSE spec says a "default event name" of "message" applies when no event:
+// line is present. Since we scan at the line level (not block-level), we
+// treat any "data:" line or blank line (i.e. an event separator) that is
+// NOT preceded by a known event: in this same chunk as event="message".
+// This is a pragmatic approximation; we avoid backtracking across Write
+// boundaries because SSE providers generally write full event blocks at
+// once (the "data:" and "event:" lines arrive in the same CopyResponse
+// buf read).
+func scanSSEEvents(p []byte, m *metrics.Metrics) {
+	// Track whether we've already assigned an event label to the current
+	// event block within this single write call.
+	gotEventLabel := false
+	for _, rawLine := range bytes.Split(p, []byte("\n")) {
+		line := bytes.TrimSpace(rawLine)
+		if len(line) == 0 {
+			// Blank line = end of current SSE event block. Reset so the
+			// next block starts fresh.
+			gotEventLabel = false
+			continue
+		}
+		if !gotEventLabel && bytes.HasPrefix(line, []byte("event:")) {
+			val := string(bytes.TrimSpace(bytes.TrimPrefix(line, []byte("event:"))))
+			switch val {
+			case "message":
+				m.SSEEvents.WithLabelValues("message").Inc()
+			case "error":
+				m.SSEEvents.WithLabelValues("error").Inc()
+			default:
+				m.SSEEvents.WithLabelValues("other").Inc()
+			}
+			gotEventLabel = true
+		}
+	}
+}
+
 // visionResult 封装 singleflight vision 调用的返回值，
 // 将耗时数据（FnStart/FnEnd）与业务数据（Desc/Err）一起传递，
 // 消除 singleflight executor 与 waiter 之间的数据竞争。
@@ -227,6 +309,9 @@ func (h *requestHandler) handleCountTokens(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if h.deps.Metrics != nil {
+		h.deps.Metrics.ReqBodyBytes.Observe(float64(len(body)))
+	}
 
 	upstreamURL := h.deps.UpstreamBaseURL + "/v1/messages/count_tokens"
 	// Runtime self-loop guard: if the constructor check was bypassed (e.g.
@@ -270,7 +355,12 @@ func (h *requestHandler) handleCountTokens(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	// Wrap w for response byte counting (consistent with /v1/messages path).
+	cw := newCountWriter(w, h.deps.Metrics)
+	io.Copy(cw, resp.Body)
+	if h.deps.Metrics != nil {
+		h.deps.Metrics.RespBodyBytes.Observe(float64(cw.total()))
+	}
 }
 
 func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -340,6 +430,9 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 		"max_body_bytes", h.deps.MaxBodyBytes,
 		"read_elapsed_ms", time.Since(readStart).Milliseconds(),
 	)
+	if h.deps.Metrics != nil {
+		h.deps.Metrics.ReqBodyBytes.Observe(float64(len(rawBody)))
+	}
 
 	// 2) 解析 JSON
 	var req messages.Request
@@ -457,6 +550,9 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 			decodeErrors := make([]error, len(imgs))
 			for idx, blk := range imgs {
 				decodedImages[idx], decodeErrors[idx] = base64.StdEncoding.DecodeString(blk.Source.Data)
+				if decodeErrors[idx] == nil && h.deps.Metrics != nil {
+					h.deps.Metrics.ImagesBytesIn.WithLabelValues(blk.Source.MediaType).Add(float64(len(decodedImages[idx])))
+				}
 				totalImageBytes += int64(len(decodedImages[idx]))
 			}
 			// toolResultCount 已在 json_parse_complete 阶段统计，无需重复遍历
@@ -718,6 +814,17 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 					sfWaitMs := int64(0)
 					if shared {
 						sfWaitMs = visionMs // 等待者全程在等待
+					}
+
+					// ── P1 metrics: singleflight ──
+					// Classify this caller as exec or wait based on the shared flag.
+					if h.deps.Metrics != nil {
+						if !shared {
+							h.deps.Metrics.SFTotal.WithLabelValues("exec").Inc()
+						} else {
+							h.deps.Metrics.SFTotal.WithLabelValues("wait").Inc()
+							h.deps.Metrics.SFMerged.Inc()
+						}
 					}
 
 					log.Info("singleflight Do completed",
@@ -1108,9 +1215,17 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	upstreamResp.Header.Set("X-Blind-Llm-Eyes", hdr)
 
 	// 8) SSE 原样透传
+	// Wrap w with countWriter so we can observe total response bytes written
+	// and scan SSE events during streaming. countWriter.Flush forwards to the
+	// underlying ResponseWriter so CopyResponse's Flush() works correctly.
+	cw := newCountWriter(w, h.deps.Metrics)
 	streamStart := time.Now()
-	if err := CopyResponse(w, upstreamResp); err != nil {
+	if err := CopyResponse(cw, upstreamResp); err != nil {
 		streamMs := time.Since(streamStart).Milliseconds()
+		// Observe bytes even on partial failure (some bytes were written).
+		if h.deps.Metrics != nil {
+			h.deps.Metrics.RespBodyBytes.Observe(float64(cw.total()))
+		}
 		log.Error("copy response to client failed",
 			"stage", "upstream_error",
 			"status", "error",
@@ -1122,6 +1237,9 @@ func (h *requestHandler) handleMessages(w http.ResponseWriter, r *http.Request) 
 	} else {
 		streamMs := time.Since(streamStart).Milliseconds()
 		totalMs := time.Since(requestStart).Milliseconds()
+		if h.deps.Metrics != nil {
+			h.deps.Metrics.RespBodyBytes.Observe(float64(cw.total()))
+		}
 		// ── stage: upstream_complete ──
 		log.Info("upstream response streamed to client",
 			"stage", "upstream_complete",

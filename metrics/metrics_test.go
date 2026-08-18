@@ -270,3 +270,138 @@ func TestMetrics_CircuitBreakerTransitions(t *testing.T) {
 		}
 	}
 }
+
+// ── v1.3.0 P1 metrics: singleflight + ingress bytes + payload histograms + SSE events ──
+
+func TestSingleflightCounters(t *testing.T) {
+	m := NewMetrics()
+	// phase=exec: the one goroutine that runs the vision call inside sf.Do
+	m.SFTotal.WithLabelValues("exec").Inc()
+	// phase=wait: goroutines that were deduped and waited on the exec goroutine
+	m.SFTotal.WithLabelValues("wait").Inc()
+	m.SFTotal.WithLabelValues("wait").Inc()
+	// SFMerged counts how many duplicate in-flight calls were merged total
+	m.SFMerged.Inc()
+	m.SFMerged.Inc()
+
+	fams, err := m.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	names := make(map[string]bool)
+	for _, mf := range fams {
+		names[mf.GetName()] = true
+	}
+	for _, need := range []string{
+		"blind_llm_eyes_singleflight_total",
+		"blind_llm_eyes_singleflight_merged_requests_total",
+	} {
+		if !names[need] {
+			t.Fatalf("expected P1 metric %q not registered in Gather output", need)
+		}
+	}
+}
+
+func TestImagesBytesInCounter(t *testing.T) {
+	m := NewMetrics()
+	// Per-format decoded image bytes (after base64 decode, the actual payload
+	// size the vision provider will receive / that hash is computed over).
+	m.ImagesBytesIn.WithLabelValues("image/png").Add(123456)
+	m.ImagesBytesIn.WithLabelValues("image/jpeg").Add(1_234_567)
+
+	fams, err := m.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range fams {
+		if mf.GetName() == "blind_llm_eyes_images_bytes_in_total" {
+			// Verify both label sets produced distinct counters.
+			found := map[string]float64{}
+			for _, metric := range mf.GetMetric() {
+				fmt := getLabelValue(metric.GetLabel(), "format")
+				found[fmt] = metric.GetCounter().GetValue()
+			}
+			if found["image/png"] != 123456 {
+				t.Errorf("images_bytes_in{format=image/png}: want 123456, got %v", found["image/png"])
+			}
+			if found["image/jpeg"] != 1_234_567 {
+				t.Errorf("images_bytes_in{format=image/jpeg}: want 1234567, got %v", found["image/jpeg"])
+			}
+			return
+		}
+	}
+	t.Fatalf("metric blind_llm_eyes_images_bytes_in_total not registered")
+}
+
+func TestPayloadHistograms(t *testing.T) {
+	m := NewMetrics()
+	// Size buckets: [1e3, 1e4, 5e4, 1e5, 5e5, 1e6, 5e6, 2e7]
+	m.ReqBodyBytes.Observe(250_000)    // lands in the 1e5–5e5 bucket
+	m.ReqBodyBytes.Observe(500)        // below smallest bucket (Inf side)
+	m.RespBodyBytes.Observe(5_000_000) // lands in the 1e6–5e6 bucket
+	m.RespBodyBytes.Observe(25_000_000) // above largest bucket
+
+	fams, err := m.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	names := make(map[string]bool)
+	sampleCounts := map[string]uint64{}
+	for _, mf := range fams {
+		names[mf.GetName()] = true
+		for _, metric := range mf.GetMetric() {
+			if h := metric.GetHistogram(); h != nil {
+				sampleCounts[mf.GetName()] = h.GetSampleCount()
+			}
+		}
+	}
+	for _, need := range []string{
+		"blind_llm_eyes_request_body_bytes",
+		"blind_llm_eyes_response_body_bytes",
+	} {
+		if !names[need] {
+			t.Fatalf("expected P1 metric %q not registered", need)
+		}
+	}
+	if got := sampleCounts["blind_llm_eyes_request_body_bytes"]; got != 2 {
+		t.Errorf("req_body_bytes sample count: want 2, got %d", got)
+	}
+	if got := sampleCounts["blind_llm_eyes_response_body_bytes"]; got != 2 {
+		t.Errorf("resp_body_bytes sample count: want 2, got %d", got)
+	}
+}
+
+func TestSSEEventsCounter(t *testing.T) {
+	m := NewMetrics()
+	// event=message covers both the no-event default and explicit event:message
+	m.SSEEvents.WithLabelValues("message").Add(100)
+	// event=error is surfaced in SSE error streams
+	m.SSEEvents.WithLabelValues("error").Inc()
+	// event=other captures every other event: name the provider emits
+	m.SSEEvents.WithLabelValues("other").Add(2)
+
+	fams, err := m.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range fams {
+		if mf.GetName() == "blind_llm_eyes_sse_events_total" {
+			found := map[string]float64{}
+			for _, metric := range mf.GetMetric() {
+				ev := getLabelValue(metric.GetLabel(), "event")
+				found[ev] = metric.GetCounter().GetValue()
+			}
+			if found["message"] != 100 {
+				t.Errorf("sse_events{event=message}: want 100, got %v", found["message"])
+			}
+			if found["error"] != 1 {
+				t.Errorf("sse_events{event=error}: want 1, got %v", found["error"])
+			}
+			if found["other"] != 2 {
+				t.Errorf("sse_events{event=other}: want 2, got %v", found["other"])
+			}
+			return
+		}
+	}
+	t.Fatalf("metric blind_llm_eyes_sse_events_total not registered")
+}
