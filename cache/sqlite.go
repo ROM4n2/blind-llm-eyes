@@ -174,6 +174,27 @@ func (s *SQLite) initCount() error {
 
 func (s *SQLite) Close() error { return s.db.Close() }
 
+// DB returns the underlying *sql.DB handle. Used by CLI tooling for ad-hoc
+// inspection queries (PRAGMA journal_mode, SUM(size_bytes), MIN/MAX access).
+// Callers must not Close the returned handle; use SQLite.Close instead.
+func (s *SQLite) DB() *sql.DB { return s.db }
+
+// MemoryCount returns the in-memory atomic row counter. This is maintained
+// incrementally on Put/evict and may drift from ActualCount if a DELETE
+// fails or an external writer modifies the DB. Use ActualCount to reconcile.
+func (s *SQLite) MemoryCount() int64 { return s.count.Load() }
+
+// ActualCount queries the DB for the real row count (SELECT COUNT(*)). This
+// is an O(N) full table scan and should only be used for diagnostics, not
+// on the hot path. Compare with MemoryCount to observe counter drift.
+func (s *SQLite) ActualCount() (int64, error) {
+	var n int64
+	if err := s.db.QueryRow(sqlCount).Scan(&n); err != nil {
+		return 0, fmt.Errorf("actual count: %w", err)
+	}
+	return n, nil
+}
+
 func (s *SQLite) Get(key string) (string, bool) {
 	var desc string
 	err := s.db.QueryRow(sqlGet, key).Scan(&desc)
