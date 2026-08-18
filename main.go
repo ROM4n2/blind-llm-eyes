@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"flag"
 	"fmt"
 	"net/http"
@@ -274,14 +275,15 @@ func ptrDeref(p *int, fallback int) int {
 
 // withMetricsAuth wraps an http.Handler with token-based authentication.
 // The token can be provided via the "token" query parameter or the
-// "X-Metrics-Token" header.
+// "X-Metrics-Token" header. Comparison uses crypto/subtle.ConstantTimeCompare
+// to prevent timing attacks that could recover the token byte-by-byte.
 func withMetricsAuth(next http.Handler, token string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		provided := r.URL.Query().Get("token")
 		if provided == "" {
 			provided = r.Header.Get("X-Metrics-Token")
 		}
-		if provided != token {
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte("unauthorized"))
 			return

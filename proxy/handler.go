@@ -1236,15 +1236,18 @@ func normalizeHost(host string) string {
 
 // shouldStripHeader returns true if the header must not be forwarded to the
 // upstream API. Sensitive headers (Authorization, Proxy-Authorization, Cookie)
-// are ALWAYS stripped to prevent leaking client credentials to the upstream,
-// regardless of whether the proxy injects its own Authorization. The
-// hasUpstreamKey parameter is retained for callers that conditionally set
-// their own Authorization after stripping; it does not affect the strip
-// decision itself.
-func shouldStripHeader(k string, _ bool) bool {
+// are stripped only when the proxy injects its own Authorization (i.e.,
+// UpstreamAPIKey is configured). When UpstreamAPIKey is empty, the proxy
+// acts as a transparent forwarder and MUST pass the client's Authorization
+// to the upstream — otherwise the upstream returns 401 and passthrough mode
+// (vision_capable_models) breaks. Host is always stripped (set by
+// http.NewRequestWithContext).
+func shouldStripHeader(k string, hasUpstreamKey bool) bool {
 	switch k {
-	case "Host", "Authorization", "Proxy-Authorization", "Cookie":
+	case "Host":
 		return true
+	case "Authorization", "Proxy-Authorization", "Cookie":
+		return hasUpstreamKey
 	}
 	return false
 }

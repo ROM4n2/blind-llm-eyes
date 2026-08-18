@@ -447,8 +447,12 @@ func TestFix5_AuthorizationHeader_Stripped(t *testing.T) {
 	t.Logf("Authorization: client key stripped, server key set; Cookie stripped")
 }
 
-// TestFix5_NoUpstreamKey_AuthorizationStillStripped 验证 UpstreamAPIKey 为空时也不转发客户端 key
-func TestFix5_NoUpstreamKey_AuthorizationStillStripped(t *testing.T) {
+// TestFix5_NoUpstreamKey_ClientAuthForwarded 验证 UpstreamAPIKey 为空时，
+// 客户端的 Authorization 必须转发给上游。代理在此模式下是透明转发器
+// （passthrough），上游需要客户端的凭证进行认证，否则返回 401。
+// 这与 "Client Authorization must not be forwarded when UpstreamAPIKey
+// is configured" 的约束一致 —— 仅在 proxy 注入自己的 key 时才剥离客户端 key。
+func TestFix5_NoUpstreamKey_ClientAuthForwarded(t *testing.T) {
 	up := newRecordingUpstream()
 	defer up.Close()
 
@@ -459,7 +463,7 @@ func TestFix5_NoUpstreamKey_AuthorizationStillStripped(t *testing.T) {
 		Cache:               cache.NewLRU(10),
 		FailOpen:            true,
 		LargeImageThreshold: 1_000_000,
-		UpstreamAPIKey:      "", // 服务端未配置上游 key
+		UpstreamAPIKey:      "", // 服务端未配置上游 key → 透明转发模式
 		Log:                 silentLogger(),
 	}
 	h := NewHandler(deps)
@@ -479,12 +483,12 @@ func TestFix5_NoUpstreamKey_AuthorizationStillStripped(t *testing.T) {
 	upstreamHeaders := up.Headers()
 	authHeader := upstreamHeaders.Get("Authorization")
 
-	// 即使服务端没配 key，客户端的 key 也不应被转发
-	if strings.Contains(authHeader, "sk-client-secret-key-67890") {
-		t.Errorf("client Authorization leaked to upstream even without UpstreamAPIKey: %q", authHeader)
+	// UpstreamAPIKey 为空时，客户端 Authorization 必须被转发给上游
+	if authHeader != "Bearer sk-client-secret-key-67890" {
+		t.Errorf("client Authorization should be forwarded when UpstreamAPIKey is empty, got %q", authHeader)
 	}
 
-	t.Logf("UpstreamAPIKey empty → Authorization = %q (client key not forwarded)", authHeader)
+	t.Logf("UpstreamAPIKey empty → Authorization = %q (client key forwarded for upstream auth)", authHeader)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
