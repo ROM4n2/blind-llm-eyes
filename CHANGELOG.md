@@ -1,5 +1,128 @@
 # Changelog
 
+## [v1.2.0] — 2026-08-18
+
+**迭代范围**：2026-08-18，共 6 个提交（`9db77b3..4346cf4`），基于只读审计报告
+识别的 10 项潜在 Bug 与高危因素 + 聚焦复审发现的 6 项新引入风险，全部修复。
+
+**迭代目标**：通过系统性安全审计与修复，消除 v1.1.0 中存在的安全漏洞（API key
+泄露、时序攻击、凭证转发缺陷）、并发瓶颈（全局锁串行化）、跨平台兼容性问题
+（Windows PowerShell hook 失效）、自指循环防护缺失，以及可观测性不足（count
+漂移不可见）。同时引入 CI 工作流和可选 metrics 认证作为预防性加固。
+
+### Security
+
+#### 日志隐私泄露修复（P0）
+
+- `proxy/handler.go`：日志中的 `context_text` 字段泄露完整对话历史，替换为
+  `truncatePreview` 截断的 `context_preview`（80 字节，对齐 UTF-8 rune 边界，
+  避免切断中文多字节字符）
+
+#### 时序攻击防护（High）
+
+- `main.go`：`withMetricsAuth` 中间件用 `!=` 比较 token 存在时序攻击风险，
+  改用 `crypto/subtle.ConstantTimeCompare` 防止逐字节提取 token
+
+#### Authorization 转发语义修正（High）
+
+- `proxy/handler.go`：`shouldStripHeader` 始终剥离 Authorization 会破坏
+  passthrough 模式（`vision_capable_models` 命中 + 无 `UpstreamAPIKey` →
+  上游 401）。恢复为仅在 `hasUpstreamKey=true` 时剥离（proxy 注入自己的
+  Authorization）；未配置时透明转发客户端凭证给上游
+
+#### 可选 metrics 认证（Fix 9）
+
+- `config/loader.go` + `main.go`：新增 `MetricsAuthToken` 配置（YAML
+  `metrics_auth_token` / 环境变量 `BLIND_METRICS_AUTH_TOKEN`），设置后
+  `/metrics` 端点通过 `?token=xxx` 或 `X-Metrics-Token` header 鉴权。
+  空值 = 无认证（向后兼容）
+
+#### 跨平台 pre-commit hook（Fix 1）
+
+- `.githooks/pre-commit.ps1`：原 bash-only hook 在 Windows 原生 PowerShell
+  下静默失败，导致 API key 泄露防护失效。新增 PowerShell 版本复刻相同
+  正则扫描逻辑（`sk-`/`AKIA`/`ghp_` 模式）
+
+### Reliability
+
+#### 自指循环防护（Fix 6）
+
+- `proxy/handler.go` + `cli/ccswitch.go` + `cli/doctor.go` + `cli/setup.go`：
+  upstream/vision base_url 指向 proxy 自身监听地址会导致无限自转发循环、
+  CPU 耗尽、静默失败。新增 `IsSelfReferentialURL()` 基于 `net.ParseIP` 的
+  host 规范化，覆盖整个 127.0.0.0/8、IPv6 loopback、unspecified 地址、
+  localhost 别名、DNS FQDN 形式（`127.0.0.1.`）。5 层防护：
+  1. cc-switch 导入过滤自指 provider
+  2. setup 向导拒绝自指手动输入
+  3. doctor 报告 FAIL
+  4. `NewHandler` 构造期 panic
+  5. 运行时返回 508 Loop Detected
+
+#### TwoTier 分片锁重构（Fix 5）
+
+- `cache/twotier.go`：全局 mutex 序列化 cold-layer 查询，不同 key 的并发
+  Get 被无谓串行化。重构为 16-shard mutex（FNV-32a hash，内联计算零分配），
+  不同 key 可并行查询，同 key 仍由分片锁 + double-check 防止 thundering herd
+
+#### SQLite count 漂移可观测（Fix 7）
+
+- `cache/sqlite.go` + `cli/cache.go`：内存计数器可能与实际行数漂移
+  （DELETE 失败或外部写入）。新增 `ActualCount()` 和 `MemoryCount()` 方法，
+  `cache stats` CLI 同时显示两者，>5% 偏差输出 WARN
+
+### Compatibility
+
+#### ContextRounds 指针语义（Fix 4）
+
+- `config/loader.go` + `main.go`：`ContextRounds` 从 `int` 改为 `*int`，
+  区分 "未设置"（nil → 默认 3）与 "显式 0"（禁用）。原 zero-value 语义模糊：
+  写 `context_rounds: 0` 想禁用却得到默认 3
+
+#### normalizeHost FQDN 支持（Low）
+
+- `proxy/handler.go`：`normalizeHost` 缺少 `strings.TrimRight(h, ".")`，
+  DNS FQDN 形式（`127.0.0.1.`）绕过自循环检测。已与 `cli/ccswitch.go`
+  版本对齐
+
+### Engineering
+
+#### CI 工作流（Fix 11）
+
+- `.github/workflows/ci.yml`：README 声称 `make test` 是 "CI gate" 但
+  无 CI 工作流。新增 ubuntu/macos/windows 矩阵运行 `go vet` +
+  `go test -race` + `go build`，在每个 push/PR 时触发
+
+#### defaultListen 单一来源（Fix 10）
+
+- `cli/setup.go`：8 处硬编码 `"127.0.0.1:8790"` 提取为 `defaultListen`
+  常量，错误消息也使用 `%s` 格式引用，避免将来修改监听地址时消息误导
+
+### 验证
+
+```
+go test -race -count=1 ./...  →  12 packages PASS
+go vet ./...                   →  clean
+go build ./...                 →  clean
+```
+
+### 提交清单
+
+| SHA | Type | Summary |
+|-----|------|---------|
+| `9db77b3` | chore | add cross-platform pre-commit hook and CI workflow |
+| `3bf6d3f` | fix(cache) | sharded mutex for TwoTier and count drift observability |
+| `c988240` | fix(proxy) | prevent self-referential loops and harden header forwarding |
+| `6001950` | feat(config) | pointer-based context_rounds and optional metrics auth |
+| `7afc8f6` | fix(proxy) | use constant-time token compare and restore passthrough auth forwarding |
+| `4346cf4` | fix(proxy) | harden normalizeHost, truncatePreview, shard hash, and setup messages |
+| `a0e492d` | merge | Merge pull request #1 from ROM4n2/fix/audit-high-risk-fixes |
+
+---
+
+**版本状态**：v1.2.0 GA 已发布（2026-08-18）。GitHub Release 6 平台
+archives + checksums 已就绪：
+https://github.com/ROM4n2/blind-llm-eyes/releases/tag/v1.2.0
+
 ## [v1.1.0] — 2026-08-17
 
 **迭代范围**：2026-08-15 ~ 2026-08-17，共 21 个提交（`0758431..3c17240`），对应
