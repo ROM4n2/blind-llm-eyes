@@ -304,6 +304,24 @@ Releasing is tag-driven: push a `v*` tag and the `release` workflow runs `gorele
 
 The test suite covers parsing/rewrite round-trips (including preserving unknown fields), LRU behavior, vision client against a mock server, the full handler pipeline with mock vision + upstream, concurrency bounds, `singleflight` dedup across requests, and adaptive-limit behavior.
 
+### Git Hooks
+
+A pre-commit hook blocks hard-coded API keys (`sk-*` and other patterns) from entering git history.
+
+**Linux/macOS/Git Bash:**
+```bash
+git config core.hooksPath .githooks
+```
+
+**Windows (PowerShell):**
+If you use Git Bash, the bash hook works automatically. For native PowerShell,
+copy the PowerShell version and ensure the execution policy allows local scripts:
+```powershell
+git config core.hooksPath .githooks
+# If hooksPath doesn't support .ps1, use:
+Copy-Item .githooks/pre-commit.ps1 .git/hooks/pre-commit
+```
+
 ## Roadmap
 
 - Global cross-request concurrency / upstream rate limiting
