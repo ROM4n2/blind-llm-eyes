@@ -8,6 +8,34 @@ import (
 	"time"
 )
 
+func TestLoad_ExampleYAML_Defaults(t *testing.T) {
+	// Copy example.yaml → temp dir; ensure Load() succeeds without errors
+	// and that the new v1.3.0 defaults (debug_pprof_enabled=true, context_rounds=3)
+	// kick in for an unmodified config template.
+	data, err := os.ReadFile("../config.example.yaml")
+	if err != nil {
+		t.Skipf("cannot read ../config.example.yaml (skipping; likely running from wrong cwd): %v", err)
+	}
+	tmp := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		t.Fatalf("write tmp yaml: %v", err)
+	}
+	cfg, err := Load(tmp)
+	if err != nil {
+		t.Fatalf("Load(config.example.yaml) err: %v", err)
+	}
+	// Defaults from *int / *bool pointer nil-modes
+	if cfg.Vision.ContextRounds == nil || *cfg.Vision.ContextRounds != 3 {
+		t.Errorf("context_rounds default: want *3, got %v", cfg.Vision.ContextRounds)
+	}
+	if cfg.DebugPprofEnabled == nil || *cfg.DebugPprofEnabled != true {
+		t.Errorf("debug_pprof_enabled default: want *true, got %v", cfg.DebugPprofEnabled)
+	}
+	if cfg.LogLevel != "info" {
+		t.Errorf("log_level: want info, got %s", cfg.LogLevel)
+	}
+}
+
 func TestReloadableConfig_LoadAfterSwap(t *testing.T) {
 	cfg1 := &Config{Listen: "127.0.0.1:8790", LogLevel: "info"}
 	rcfg := NewReloadableConfig(cfg1, "config.yaml")

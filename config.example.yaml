@@ -9,7 +9,12 @@ vision:
   timeout: "60s"
   description_cap: 1000                            # max_tokens；thinking 已禁用，实测生成 1000-1300 chars，1000 足够
   # ── P5 上下文感知描述（默认 3 轮 / 2000 字） ──
-  context_rounds: 3                                # 最近 N 轮对话传给 vision provider。0/不写 → 默认 3；写 -1 → 显式禁用
+  # 此字段使用 *int 三态模式（与 v1.2.0 一致）：
+  #   - 不写（nil）  → 自动兜底 3 轮
+  #   - 写 0         → 显式禁用上下文感知（vision provider 看不到对话历史）
+  #   - 写正数 N     → 最近 N 轮对话传给 vision provider
+  # 环境变量覆盖：BLIND_VISION_CONTEXT_ROUNDS=0
+  context_rounds: 3                                # 最近 N 轮对话传给 vision provider
   context_max_chars: 2000                          # 上下文最大字符数（约 500 tokens），超出时整轮次截断早期对话，保留最新
 cache:
   # ── 缓存类型（v1.1.0 新增） ──
@@ -43,6 +48,13 @@ adaptive_concurrency:
   error_threshold: 0.10               # 错误率 > 10% → 触发降并发
 fail_open: true                                     # 视觉失败 → 替换为占位文字，不阻塞主链路
 log_level: "info"                                   # debug / info / warn / error
+
+# ── 安全 / 调试开关（v1.3.0 新增） ──
+# metrics_auth_token: "your-shared-secret"          # 配置后 /metrics 和 /debug/pprof/* 需要 ?token= 或 X-Metrics-Token header
+                                                     # 未配置：/metrics 不鉴权；/debug/pprof/* 仅允许 127.0.0.1/::1 本地访问
+# debug_pprof_enabled: true                         # true(默认)/false：是否挂载 /debug/pprof/* pprof 调试端点
+                                                     # 一般运维场景保持默认即可；0.0.0.0 对外且未配 metrics_auth_token 时，建议显式设为 false
+# 环境变量覆盖：BLIND_DEBUG_PPROF_ENABLED=false
 
 # ── 视觉能力模型白名单（v1.0.1 新增） ──
 # 列出上游已原生支持图片输入的模型名。请求的 model 匹配此列表时（大小写不敏感，
